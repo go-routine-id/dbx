@@ -9,6 +9,8 @@ MySQL first, multi-database ready by design (SQL and NoSQL).
 See [docs/architecture.md](docs/architecture.md).
 
 Screen references (S1, S2a, …) point to [docs/screens.md](docs/screens.md).
+Known traps are catalogued in [docs/pitfalls.md](docs/pitfalls.md) — revisit
+it at each milestone's "done when".
 
 ---
 
@@ -47,7 +49,7 @@ open table data (paged) → `F1` shows DDL.
 |---|------|--------|
 | 1.1 | `Driver` trait + capability model | Per docs/architecture.md: `info`, `capabilities`, `ping`, `namespaces`, `collections`, `collection_meta`, `records`, `execute`, `definition`; `Record`/`Page`/`CollectionMeta` types |
 | 1.2 | `MySqlDriver` | sqlx MySQL impl: metadata from `information_schema`, paged `SELECT` (`LIMIT/OFFSET` — see backlog for keyset pagination), type → `Record` conversion incl. exotic types (`DECIMAL`, unsigned `BIGINT`, `JSON`, `GEOMETRY`) |
-| 1.3 | Config: saved connections | `~/.config/dbx/config.toml` load/save; secrets via `$ENV:` reference or prompt; parse-error screen (S5) |
+| 1.3 | Config: saved connections | `~/.config/dbx/config.toml` load/save (mode `0600`, atomic write); secrets via `$ENV:` reference or prompt; unix `socket` connections supported; parse-error screen (S5) |
 | 1.4 | Connection picker (S1) + form (P5) | List, test connection (spinner per row), add/edit/delete |
 | 1.5 | Explorer tree (S2a) | schema → table → columns/indexes; collapse, `/` filter, `r` refresh |
 | 1.6 | Metadata cache | In-memory cache per connection feeding tree + (later) autocomplete |
@@ -80,6 +82,7 @@ history, rich result grid.
 | 2.7 | Autocomplete — **scoped in two tiers** | **Tier 1 (M2):** keywords + table/column names from metadata cache, trigger after `.` only when the left side is an unambiguous table/alias name (simple heuristic). **Tier 2 (stretch/M2.5):** true alias-aware resolution via [`sqlparser-rs`](https://github.com/apache/datafusion-sqlparser-rs) on partial queries. Don't hand-roll a SQL parser |
 | 2.8 | Context menu (P4) | `ctrl+o` on table: Open data / Generate SELECT / Copy name / Show DDL |
 | 2.9 | **Tests** | Tokenizer edge cases (strings, comments, delimiters); integration: run/cancel query against Docker MySQL, verify `KILL QUERY` actually frees the server |
+| 2.10 | **Destructive statement guard** | Tokenizer detects `DROP` / `TRUNCATE` / `DELETE` without `WHERE` → confirm dialog (FR-3.13). Console executes arbitrary SQL, so this is M2 scope |
 
 **Done when:** write `SELECT u.email FROM users u WHERE u.` and the popup
 suggests columns (tier 1 heuristic); run with `ctrl+enter`, spinner runs,

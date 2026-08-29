@@ -18,6 +18,7 @@ to [ROADMAP.md](../ROADMAP.md).
 | FR-1.4 | Add/edit/delete connection via form (P5) | M |
 | FR-1.5 | `--config <path>` CLI override | S |
 | FR-1.6 | In-app connection switch (`ctrl+d`) | C (backlog) |
+| FR-1.7 | Unix socket connections (`socket` field) — must work without host/port | M |
 
 ### FR-2 Browsing (M1)
 
@@ -28,7 +29,11 @@ to [ROADMAP.md](../ROADMAP.md).
 | FR-2.3 | Data tab per table (S3): paged, read-only grid | M |
 | FR-2.4 | Paging via `LIMIT/OFFSET`; smooth at 100k+ rows (page fetch < 300ms) | M |
 | FR-2.5 | DDL popup `F1` (P1) + copy to clipboard | M |
-| FR-2.6 | Exotic MySQL types display sanely (DECIMAL, unsigned BIGINT, JSON, GEOMETRY as hex/text) | M |
+| FR-2.6 | Exotic MySQL types display sanely (DECIMAL as exact string — never f64; unsigned BIGINT; JSON; GEOMETRY) | M |
+| FR-2.7 | `NULL` rendered as dim `NULL`, distinct from empty string `""` | M |
+| FR-2.8 | `BLOB`/binary rendered as `<blob N bytes>` + hex preview popup — never raw bytes to terminal | M |
+| FR-2.9 | Row counts from `information_schema` shown as estimate (`~12k rows`) — InnoDB stats are approximate | M |
+| FR-2.10 | Raw server datetime values shown as-is; no implicit timezone conversion | M |
 
 ### FR-3 Query (M2)
 
@@ -39,13 +44,15 @@ to [ROADMAP.md](../ROADMAP.md).
 | FR-3.3 | Run statement at cursor (`ctrl+enter`); split via tokenizer, not naive `;` | M |
 | FR-3.4 | Async run: spinner + elapsed; `esc` cancels server-side via admin conn + `KILL QUERY` | M |
 | FR-3.5 | Result grid (S2c): paging, column sort, client-side filter, large-value popup | M |
-| FR-3.6 | CSV export (`ctrl+s`) | M |
+| FR-3.6 | CSV export (`ctrl+s`) — **streams** row batches to file, never buffers full result in RAM | M |
 | FR-3.7 | Error panel: MySQL message + jump to error line when position known | M |
-| FR-3.8 | Per-connection query history, `ctrl+e` popup (P3) | M |
+| FR-3.8 | Per-connection query history, `ctrl+e` popup (P3) — stores query text only, never connection strings/credentials | M |
 | FR-3.9 | Autocomplete tier 1: keywords + table/column names, `.`-trigger heuristic | M |
 | FR-3.10 | Autocomplete tier 2: alias-aware via `sqlparser-rs` | C (M2.5) |
 | FR-3.11 | Explorer context menu (P4): open data / generate SELECT / copy name / DDL | M |
 | FR-3.12 | `EXPLAIN` viewer | C (backlog) |
+| FR-3.13 | **Destructive statement guard**: `DROP` / `TRUNCATE` / `DELETE`-without-`WHERE` (tokenizer-detected) → confirm dialog before execution. Console runs arbitrary SQL, so this ships in M2 — not deferred to write-ops phase | M |
+| FR-3.14 | All driver-generated identifiers backtick-quoted with escaping (no raw interpolation from tree/config into SQL) | M |
 
 ### FR-4 ERD (M3)
 
@@ -84,8 +91,11 @@ to [ROADMAP.md](../ROADMAP.md).
 | NFR-6 | Terminal support | iTerm2, kitty, WezTerm, Alacritty, tmux; truecolor with 256 fallback |
 | NFR-7 | Platforms (v0.1) | macOS arm64/x64, Linux x64 |
 | NFR-8 | MySQL compat | 5.7+ and 8.x (`information_schema` differences handled) |
-| NFR-9 | Crash safety | panic hook restores terminal; never corrupt config/scratch files (atomic write) |
+| NFR-9 | Crash safety | panic hook restores terminal; never corrupt config/scratch files (atomic write: tmp + rename) |
 | NFR-10 | License | GPL-3.0-or-later (flowmaid dependency) |
+| NFR-11 | Credential hygiene | logs/toasts never contain passwords or full connection strings (host only); config file mode `0600` |
+| NFR-12 | Transaction hygiene | all queries autocommit; never hold a transaction open across UI frames (InnoDB metadata locks block DDL server-wide) |
+| NFR-13 | Connection lifecycle | one pool per connection + one admin conn (for `KILL QUERY`); stale connections detected via `ping`, auto-reconnect; pools closed on tab close |
 
 ---
 
