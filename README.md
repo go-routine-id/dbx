@@ -2,7 +2,8 @@
 
 Terminal database explorer — DataGrip-like UX, opencode-like UI.
 
-> **Status: early development.** See roadmap below.
+> **Status: early development.** See [ROADMAP.md](ROADMAP.md) and
+> [docs/ui-ux.md](docs/ui-ux.md) for the design concept.
 
 ## What is this?
 
