@@ -61,7 +61,7 @@ Goal: in-terminal ER diagram via [flowmaid](https://github.com/go-routine-id/flo
 |---|---|
 | Write ops | Inline cell edit, add/delete row with DataGrip-style "pending changes + submit" dialog |
 | Query analysis | `EXPLAIN` viewer (text), multi-statement results |
-| Databases | PostgreSQL, SQLite drivers (already trait-ready); then NoSQL (MongoDB, Redis) via the capability model — see [docs/architecture.md](docs/architecture.md) |
+| Databases | PostgreSQL, SQLite (sqlx — trait-ready); SQL Server + Azure SQL ([tiberius](https://github.com/prisma/tiberius), TDS protocol); then NoSQL (MongoDB, Redis) via the capability model — see [docs/architecture.md](docs/architecture.md) |
 | Input | Mouse support (click, scroll, drag splitter), optional vim-mode editing |
 | Productivity | Saved/favorite queries, connection switcher in-app (`ctrl+d`), table data filter bar (WHERE builder) |
 
