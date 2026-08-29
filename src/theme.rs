@@ -59,6 +59,15 @@ impl Theme {
         Style::default().fg(self.text_dim)
     }
 
+    /// Full-area dim style used to fade out the rest of the UI when a blocking
+    /// operation (e.g. in-flight connection test) is in progress.
+    pub fn dimmed(&self) -> Style {
+        Style::default()
+            .bg(self.background)
+            .fg(self.text_dim)
+            .add_modifier(Modifier::DIM)
+    }
+
     pub fn success(&self) -> Style {
         Style::default().fg(self.success)
     }

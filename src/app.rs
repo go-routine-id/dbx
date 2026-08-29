@@ -1,23 +1,8 @@
 //! App runtime: event loop, tick-driven animation, terminal lifecycle.
-//! Contract for M0 (app-runtime agent):
-//!
-//! `run` must:
-//! 1. Install a panic hook that restores the terminal BEFORE printing the
-//!    panic (NFR-9 — a panic must never leave the user's shell in raw mode).
-//! 2. Enter raw mode + alternate screen; restore both on every exit path
-//!    (normal, error, panic).
-//! 3. Run the loop: draw → poll crossterm events with ~60ms cap → on tick,
-//!    advance spinner/toasts → on key, dispatch.
-//! 4. Keys for the M0 demo: `q` quit, `?` toggle help popup, `t` push a demo
-//!    toast (cycles kinds), any other key ignored.
-//! 5. If terminal < 80x24, render only the too-small notice (layout::too_small).
-//!
-//! Demo screen: header `◆ dbx  v{version}` (accent logo), body shows an
-//! empty-state + a live spinner ("Connecting... (demo)"), status bar with the
-//! demo hints, toasts overlay, help popup when open.
 
 use std::io::{self};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -30,70 +15,1189 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Alignment, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph};
+use ratatui::widgets::{Block, Clear, Paragraph};
 
+use crate::config::AppConfig;
+use crate::driver::{Driver, Page};
+use crate::clipboard::ClipboardManager;
+use crate::export::{ExportFormat, Exporter};
 use crate::theme::Theme;
 use crate::ui::layout::{self, MIN_HEIGHT, MIN_WIDTH};
-use crate::ui::widgets::{empty, help, spinner::Spinner, statusbar, toast::ToastKind, toast::Toasts};
+use crate::ui::screens::explorer::{
+    self, DataTab, ExportModalState, ExplorerState, FocusedPane,
+    TreeNodeKind, WorkspaceTab,
+};
+use crate::ui::screens::picker::{self, ConfirmDeleteModal, ConnectionForm, FormField};
+use crate::ui::screens::query::{ConsoleSubpane, QueryConsole};
+use crate::ui::widgets::{help, spinner::Spinner, statusbar, toast::ToastKind, toast::Toasts};
 
 /// How long the event poll waits before a tick fires (spinner/toast cadence).
 const TICK_CAP: Duration = Duration::from_millis(60);
 
-const STATUS_HINTS: [(&str, &str); 3] = [("q", "quit"), ("?", "help"), ("t", "toast")];
+/// Sentinel string stored in `CellEditModalState::text_buffer` when the user
+/// chose to set the cell to NULL via `Ctrl+N`. The SQL builder detects this
+/// sentinel and emits `SET col = NULL` (no quotes) instead of `SET col = '...'`.
+/// Kept internal — never shown to the user as-is; the modal renders it as
+/// the bold-italic word "NULL".
+pub const NULL_SENTINEL: &str = "__DBX_NULL__";
 
-const HELP_BINDINGS: [(&str, &str); 4] = [
+/// Helper: extract the printable character from a `KeyCode::Char(_)` event,
+/// or `None` if it's anything else (function keys, arrows, etc.). Centralizes
+/// the `Char` → `char` mapping for the cell-edit modal's text input.
+fn extract_char_payload(code: KeyCode, is_ctrl: bool) -> Option<char> {
+    if is_ctrl {
+        return None;
+    }
+    match code {
+        KeyCode::Char(c) => Some(c),
+        _ => None,
+    }
+}
+
+/// Phase-1 plan for cell-edit modal key handling. Captures everything the
+/// handler needs from immutable borrows (`exp.cell_edit_modal` as ref +
+/// `exp.active_tab()` as ref) so phase 2 can take a mutable borrow of
+/// `exp.cell_edit_modal` without conflicting.
+struct EditKeyPlan {
+    is_ctrl: bool,
+    key: KeyCode,
+    char_payload: Option<char>,
+    is_sentinel: bool,
+    is_nullable: bool,
+    original_value: Option<String>,
+}
+
+/// Phase-1 plan for the INSERT-row modal. Mirrors `EditKeyPlan` for the
+/// multi-field case. `is_skip` is true when the focused field is in the
+/// "skip / use DEFAULT" state (buffer = None), distinct from `is_sentinel`
+/// which is the NULL state.
+struct InsertKeyPlan {
+    is_ctrl: bool,
+    key: KeyCode,
+    char_payload: Option<char>,
+    is_sentinel: bool,
+    is_nullable: bool,
+    is_skip: bool,
+    focused: usize,
+    n: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Generic SQL building helpers (multi-driver safe)
+// ---------------------------------------------------------------------------
+//
+// These are intentionally **driver-agnostic** in their inputs: they take raw
+// strings and build SQL that works against any backend. The only driver
+// specifics that leak through are:
+//   1. Identifier quoting style (PG uses `"..."`, MySQL uses `` `...` ``).
+//   2. The `LIMIT 1` suffix that MySQL requires on a `DELETE` statement
+//      without an implied unique key (PostgreSQL rejects it).
+//   3. NULL literal rendering — same `NULL` keyword on every SQL backend,
+//      no quoting.
+//
+// All other concerns (string value escaping, NULL sentinel, skip columns,
+// dialect-agnostic UPDATE/INSERT syntax) are uniform. The driver crate
+// remains the source of truth for the connection dialect — we sniff
+// `DriverInfo::name` here purely for the two style differences above.
+
+/// Quoting style for a SQL dialect. Currently we only need to distinguish
+/// PostgreSQL (double-quote identifiers) from MySQL/SQLite (backtick) and
+/// SQL Server (square brackets). When SQL Server / SQLite land, extend the
+/// match in `quote_ident_for` — everything downstream stays the same.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum QuoteStyle {
+    /// PostgreSQL: `"identifier"` (case-sensitive).
+    Double,
+    /// MySQL / MariaDB: `` `identifier` `` (case-insensitive on default
+    /// lower_case_table_names). Also what SQLite accepts for compatibility.
+    Backtick,
+    /// SQL Server: `[identifier]` or `"identifier"` (the latter is
+    /// non-standard and conflicts with string literals in some contexts).
+    Bracket,
+}
+
+/// Map a driver-info name to its identifier quoting style. Defaults to
+/// double-quote (PG) for any unknown driver — safest for a SQL-syntax
+/// reference, and the connection itself will reject the SQL if the dialect
+/// is wildly different.
+fn quote_style_for(driver_name: &str) -> QuoteStyle {
+    let lower = driver_name.to_lowercase();
+    if lower.contains("postgres") || lower.contains("pg") {
+        QuoteStyle::Double
+    } else if lower.contains("mysql") || lower.contains("maria") {
+        QuoteStyle::Backtick
+    } else if lower.contains("sql server") || lower.contains("mssql") {
+        QuoteStyle::Bracket
+    } else if lower.contains("sqlite") {
+        // SQLite accepts both. Backtick is the most ergonomic for
+        // round-tripped queries.
+        QuoteStyle::Backtick
+    } else {
+        QuoteStyle::Double
+    }
+}
+
+/// Quote a SQL identifier (table / column / schema name) according to the
+/// given style. Doubles up the inner quote character so the identifier
+/// itself can contain the quote without breaking out — same defensive
+/// pattern that PostgreSQL/MySQL driver crates already apply internally.
+fn quote_ident_with(ident: &str, style: QuoteStyle) -> String {
+    match style {
+        QuoteStyle::Double => format!("\"{}\"", ident.replace('"', "\"\"")),
+        QuoteStyle::Backtick => format!("`{}`", ident.replace('`', "``")),
+        QuoteStyle::Bracket => format!("[{}]", ident.replace(']', "]]")),
+    }
+}
+
+/// Convenience wrapper that pulls the style from a `DriverInfo`-style name.
+/// Kept as a single entry point so call sites never have to think about the
+/// underlying style enum.
+fn quote_ident(ident: &str, driver_name: &str) -> String {
+    quote_ident_with(ident, quote_style_for(driver_name))
+}
+
+/// MySQL requires `LIMIT 1` at the end of a single-row DELETE (and UPDATE)
+/// when the WHERE clause doesn't target a unique key. PostgreSQL rejects
+/// the `LIMIT` clause in DELETE/UPDATE. Other dialects vary. This returns
+/// the dialect-appropriate suffix to append after the WHERE clause.
+fn single_row_suffix(driver_name: &str) -> &'static str {
+    let lower = driver_name.to_lowercase();
+    if lower.contains("mysql") || lower.contains("maria") {
+        " LIMIT 1"
+    } else {
+        // PostgreSQL, SQL Server, SQLite: the WHERE clause is enough.
+        ""
+    }
+}
+
+/// Escape a user-supplied value for safe inclusion as a SQL string literal.
+/// Doubles single quotes (the standard SQL escape). `None` (skip) is
+/// handled by callers before reaching here. The empty string becomes
+/// `''` which is a valid empty literal on every backend.
+fn escape_string_literal(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
+/// Render a single `Value` as the right-hand side of `col = ...` or as a
+/// WHERE-clause comparison value. NULL is the keyword `NULL` (never
+/// quoted, never escaped — this is the standard SQL semantics shared by
+/// every backend). All other values are emitted as quoted string
+/// literals; the server will coerce them to the column's actual type.
+/// This matches what every DB GUI does — it's the only way to stay
+/// driver-agnostic without dragging in type-aware formatting for INT,
+/// BOOL, TIMESTAMP, NUMERIC, etc. that differs subtly per dialect.
+fn render_value_sql(val: &crate::driver::Value) -> String {
+    match val {
+        crate::driver::Value::Null => "NULL".to_string(),
+        other => format!("'{}'", escape_string_literal(&other.display_str())),
+    }
+}
+
+/// Render the user-edited buffer that lives in a modal (`CellEditModalState`
+/// or `InsertRowModalState`). The `__DBX_NULL__` sentinel from `Ctrl+N` is
+/// translated to the bare `NULL` keyword; everything else is quoted. Empty
+/// string is intentionally rendered as `''` (a valid empty literal) so
+/// the user can blank out a non-nullable text column when desired.
+fn render_buffer_sql(buf: &str) -> String {
+    if buf == NULL_SENTINEL {
+        "NULL".to_string()
+    } else {
+        format!("'{}'", escape_string_literal(buf))
+    }
+}
+
+/// Build a WHERE clause that targets a single row from a table page,
+/// preferring primary-key columns (the safe, narrow target) and falling
+/// back to a full-row match when no PK is defined. Returns the WHERE
+/// fragment without the leading `WHERE ` keyword. Returns `None` when
+/// no columns could be matched at all (e.g. zero-column table) so callers
+/// can bail out with a toast instead of running a destructive statement
+/// with an always-true WHERE.
+fn build_where_for_row(
+    columns: &[String],
+    row: &crate::driver::Record,
+    pk_cols: &[String],
+    driver_name: &str,
+) -> Option<String> {
+    let mut where_clauses: Vec<String> = Vec::new();
+
+    if !pk_cols.is_empty() {
+        for pk in pk_cols {
+            if let Some(pos) = columns.iter().position(|c| c == pk)
+                && let Some(val) = row.values.get(pos)
+            {
+                let q_col = quote_ident(pk, driver_name);
+                if matches!(val, crate::driver::Value::Null) {
+                    where_clauses.push(format!("{q_col} IS NULL"));
+                } else {
+                    where_clauses.push(format!("{q_col} = {}", render_value_sql(val)));
+                }
+            }
+        }
+    } else {
+        // No PK: match on every column. Less safe (could match multiple
+        // rows if duplicates exist) but the only way to target a row in
+        // tables without a defined primary key. The dialect-specific
+        // `LIMIT 1` suffix appended by the caller narrows the blast radius
+        // on backends that allow it.
+        for (i, c) in columns.iter().enumerate() {
+            if let Some(val) = row.values.get(i) {
+                let q_col = quote_ident(c, driver_name);
+                if matches!(val, crate::driver::Value::Null) {
+                    where_clauses.push(format!("{q_col} IS NULL"));
+                } else {
+                    where_clauses.push(format!("{q_col} = {}", render_value_sql(val)));
+                }
+            }
+        }
+    }
+
+    if where_clauses.is_empty() {
+        None
+    } else {
+        Some(where_clauses.join(" AND "))
+    }
+}
+
+/// Build a generic `INSERT INTO ns.tbl (col, col) VALUES (val, val)` from
+/// a list of `(column_name, Option<buffer>)` pairs. `None` buffers are
+/// skipped — the column is omitted from both the column list and the
+/// values list, so the server applies the column's DEFAULT (or NULL when
+/// nullable and no default, or rejects the row when NOT NULL with no
+/// default). `Some(NULL_SENTINEL)` is rendered as the bare `NULL` keyword.
+/// The output syntax is the standard SQL form that PostgreSQL, MySQL,
+/// SQL Server, and SQLite all accept. Driver differences (PG `RETURNING`,
+/// MySQL `LAST_INSERT_ID()`, etc.) are intentionally **not** baked in —
+/// the caller can ignore rows_affected if it needs richer feedback.
+fn build_insert_sql(
+    cref: &crate::driver::CollectionRef,
+    fields: &[(String, Option<String>)],
+    driver_name: &str,
+) -> Option<String> {
+    // Strip out the skipped (None) columns. Order is preserved as supplied.
+    let provided: Vec<(&String, &String)> = fields
+        .iter()
+        .filter_map(|(name, buf)| buf.as_ref().map(|b| (name, b)))
+        .collect();
+    if provided.is_empty() {
+        return None;
+    }
+    let q_ns = quote_ident(&cref.namespace.0, driver_name);
+    let q_tbl = quote_ident(&cref.name, driver_name);
+    let col_list = provided
+        .iter()
+        .map(|(name, _)| quote_ident(name, driver_name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let value_list = provided
+        .iter()
+        .map(|(_, buf)| render_buffer_sql(buf))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Some(format!(
+        "INSERT INTO {q_ns}.{q_tbl} ({col_list}) VALUES ({value_list});"
+    ))
+}
+
+const PICKER_HINTS: [(&str, &str); 6] = [
+    ("Enter", "connect"),
+    ("a", "add"),
+    ("e", "edit"),
+    ("d", "delete"),
+    ("t", "test"),
+    ("?", "help"),
+];
+
+const EXPLORER_HINTS: [(&str, &str); 12] = [
+    ("Tab", "pane"),
+    ("c", "new console"),
+    ("F2", "erd"),
+    ("Ctrl+Enter", "run SQL"),
+    ("Enter/Space", "open/expand"),
+    ("y/Y", "copy cell/row"),
+    ("Ctrl+E", "export"),
+    ("e", "edit cell"),
+    ("Backspace", "delete row"),
+    ("i", "insert row"),
+    ("w", "close tab"),
+    ("Esc", "picker"),
+];
+
+const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
+    ("Enter", "connect to selected database"),
+    ("a", "add new connection"),
+    ("e", "edit selected connection"),
+    ("d", "delete selected connection"),
+    ("t", "test connection ping"),
     ("q", "quit"),
-    ("?", "toggle help"),
-    ("t", "push demo toast"),
-    ("Esc", "close help"),
+    ("Esc", "close popup / back"),
 ];
 
-const TOAST_KINDS: [ToastKind; 4] = [
-    ToastKind::Success,
-    ToastKind::Warning,
-    ToastKind::Error,
-    ToastKind::Info,
+const EXPLORER_HELP_BINDINGS: [(&str, &str); 19] = [
+    ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
+    ("c", "open new SQL Query Console tab"),
+    ("F2", "open In-Terminal ERD diagram for selected database"),
+    ("Ctrl+Enter / F5", "execute SQL query in active console"),
+    ("j / Down", "move cursor / selection down"),
+    ("k / Up", "move cursor / selection up"),
+    ("h / Left", "move cursor / column selection left"),
+    ("l / Right", "move cursor / column selection right"),
+    ("Space", "expand / collapse database node in tree"),
+    ("Enter", "open table in workspace grid"),
+    ("y / c", "copy active cell value to system clipboard"),
+    ("Y / Ctrl+Y", "copy active row as formatted JSON to clipboard"),
+    ("Ctrl+E", "open export dialog (CSV, JSON, SQL INSERT) for current dataset"),
+    ("e / Enter", "edit active cell value (shows safe SQL confirmation)"),
+    ("Backspace", "delete selected row (shows safe SQL confirmation)"),
+    ("i", "open INSERT-row modal — fill fields, server applies DEFAULT for skipped"),
+    ("F1", "view table DDL schema popup"),
+    ("n / p", "next / previous page in data grid"),
+    ("w", "close active workspace tab"),
 ];
+
+pub enum ScreenMode {
+    Picker,
+    Connected,
+}
 
 pub struct App {
+    config: AppConfig,
+    config_path: PathBuf,
     theme: Theme,
     toasts: Toasts,
     help_open: bool,
     should_quit: bool,
+
+    // Screen S1 / P5 state
+    selected_connection: usize,
+    form_modal: Option<ConnectionForm>,
+    // In-flight test ping for the form modal. None = idle.
+    form_test_rx: Option<tokio::sync::mpsc::Receiver<Result<std::time::Duration, String>>>,
+    /// Confirmation dialog for destructive delete on a saved connection.
+    /// `Some` means a confirmation popup is open; user must press Enter to
+    /// actually delete, or Esc to cancel. Stores the original index so the
+    /// delete targets the right connection even if the picker selection has
+    /// moved (which it can't while this modal is open, but defensive).
+    confirm_delete_modal: Option<ConfirmDeleteModal>,
+
+    // Driver & Screen S2 state
+    mode: ScreenMode,
+    active_driver: Option<Arc<dyn Driver>>,
+    explorer_state: Option<ExplorerState>,
+    connecting: bool,
 }
 
 impl App {
-    pub fn new() -> Self {
+    pub fn new(config: AppConfig, config_path: PathBuf) -> Self {
         Self {
+            config,
+            config_path,
             theme: Theme::dark(),
             toasts: Toasts::default(),
             help_open: false,
             should_quit: false,
+            selected_connection: 0,
+            form_modal: None,
+            form_test_rx: None,
+            confirm_delete_modal: None,
+            mode: ScreenMode::Picker,
+            active_driver: None,
+            explorer_state: None,
+            connecting: false,
         }
     }
 
-    fn handle_key(&mut self, key: KeyEvent, toast_counter: &mut u64) {
+    fn handle_key(&mut self, key: KeyEvent) {
         // Universal exit: in raw mode Ctrl+C arrives as a key event, not SIGINT.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
             self.should_quit = true;
             return;
         }
-        // Plain bindings only — don't fire on Ctrl/Alt-modified chars.
-        // (SHIFT allowed so `?`, which needs shift on most layouts, works.)
-        if !(key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) {
+
+        // If help is open, Esc or ? closes it
+        if self.help_open {
+            if key.code == KeyCode::Esc || key.code == KeyCode::Char('?') {
+                self.help_open = false;
+            }
             return;
         }
+
+        // Screen S2 (Explorer) Handlers
+        if matches!(self.mode, ScreenMode::Connected) {
+            if let Some(exp) = &mut self.explorer_state {
+                // If DDL popup is open, Esc closes it
+                if exp.ddl_popup.is_some() {
+                    if key.code == KeyCode::Esc {
+                        exp.ddl_popup = None;
+                    }
+                    return;
+                }
+
+                // If Export modal is open, route keys
+                if let Some(modal) = &mut exp.export_modal {
+                    match key.code {
+                        KeyCode::Esc => {
+                            exp.export_modal = None;
+                        }
+                        KeyCode::Tab => {
+                            modal.active_field = (modal.active_field + 1) % 2;
+                        }
+                        KeyCode::Left | KeyCode::Right => {
+                            if modal.active_field == 0 {
+                                let formats = ExportFormat::ALL;
+                                let curr_idx = formats.iter().position(|f| *f == modal.format).unwrap_or(0);
+                                let next_idx = if key.code == KeyCode::Right {
+                                    (curr_idx + 1) % formats.len()
+                                } else {
+                                    (curr_idx + formats.len() - 1) % formats.len()
+                                };
+                                modal.format = formats[next_idx];
+                                let default_ext = modal.format.extension();
+                                modal.target_path = format!("~/dbx_export_{}.{}", modal.default_table_name, default_ext);
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            if modal.active_field == 1 {
+                                modal.target_path.pop();
+                            }
+                        }
+                        KeyCode::Char(c) => {
+                            if modal.active_field == 1 && !key.modifiers.contains(KeyModifiers::CONTROL) {
+                                modal.target_path.push(c);
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+
+                // If Cell edit modal is open, route keys.
+                // We split work into two phases to satisfy the borrow checker:
+                //   1) read-only phase: extract row/col index and (if the buffer holds
+                //      the NULL sentinel) the cell's original value, then drop the
+                //      immutable borrow of `exp`.
+                //   2) mutation phase: take `&mut exp.cell_edit_modal` and apply the
+                //      decision from phase 1. This avoids holding both borrows at once.
+                if exp.cell_edit_modal.is_some() {
+                    let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+                    // Phase 1: gather everything we need from immutable borrows.
+                    let plan: EditKeyPlan = {
+                        let edit = exp.cell_edit_modal.as_ref().unwrap();
+                        let is_sentinel = edit.text_buffer == NULL_SENTINEL;
+                        let original_value: Option<String> = if is_sentinel {
+                            exp.active_tab().and_then(|tab| match tab {
+                                WorkspaceTab::Table(t) => t
+                                    .page
+                                    .records
+                                    .get(edit.row_idx)
+                                    .and_then(|row| row.values.get(edit.col_idx))
+                                    .map(|v| v.display_str()),
+                                _ => None,
+                            })
+                        } else {
+                            None
+                        };
+                        EditKeyPlan {
+                            is_ctrl,
+                            key: key.code,
+                            char_payload: extract_char_payload(key.code, is_ctrl),
+                            is_sentinel,
+                            is_nullable: edit.is_nullable,
+                            original_value,
+                        }
+                    };
+
+                    // Phase 2: apply. Only one path actually mutates.
+                    match plan.key {
+                        KeyCode::Esc => {
+                            exp.cell_edit_modal = None;
+                        }
+                        // Ctrl+N: set the cell to NULL. Only enabled on nullable columns.
+                        // Stores the NULL_SENTINEL in the buffer; the SQL builder translates
+                        // it to a bare `= NULL` clause. Idempotent — pressing it again is a
+                        // no-op while the sentinel is already set.
+                        KeyCode::Char('n') | KeyCode::Char('N') if plan.is_ctrl => {
+                            if plan.is_nullable {
+                                if !plan.is_sentinel {
+                                    let edit = exp.cell_edit_modal.as_mut().unwrap();
+                                    edit.text_buffer = NULL_SENTINEL.to_string();
+                                    self.toasts.push(
+                                        ToastKind::Info,
+                                        "cell will be set to NULL (press [Enter] to review SQL)"
+                                            .to_string(),
+                                    );
+                                }
+                            } else {
+                                self.toasts.push(
+                                    ToastKind::Warning,
+                                    "this column is NOT NULL — cannot set to NULL".to_string(),
+                                );
+                            }
+                        }
+                        // Ctrl+G: clear the NULL sentinel and restore the current cell's
+                        // original value, so the user can back out of the NULL choice
+                        // without closing the whole modal.
+                        KeyCode::Char('g') | KeyCode::Char('G') if plan.is_ctrl => {
+                            if let Some(orig) = plan.original_value {
+                                let edit = exp.cell_edit_modal.as_mut().unwrap();
+                                edit.text_buffer = orig;
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            // Don't let Backspace corrupt the NULL sentinel — just clear it
+                            // and return to the original value, like Ctrl+G.
+                            if let Some(orig) = plan.original_value {
+                                let edit = exp.cell_edit_modal.as_mut().unwrap();
+                                edit.text_buffer = orig;
+                            } else {
+                                let edit = exp.cell_edit_modal.as_mut().unwrap();
+                                edit.text_buffer.pop();
+                            }
+                        }
+                        KeyCode::Char(_) if !plan.is_ctrl => {
+                            if let Some(c) = plan.char_payload {
+                                let edit = exp.cell_edit_modal.as_mut().unwrap();
+                                // Typing any character while the NULL sentinel is set
+                                // clears it first (overwrite semantics), so the user
+                                // can't accidentally mix literal text with the sentinel.
+                                if plan.is_sentinel {
+                                    edit.text_buffer = String::new();
+                                }
+                                edit.text_buffer.push(c);
+                            }
+                        }
+                        _ => {
+                            // Anything else (function keys, ctrl-modified chars, etc.) is
+                            // ignored inside the cell-edit modal — the user must Esc out
+                            // to use global bindings.
+                        }
+                    }
+                    return;
+                }
+
+                // If INSERT-row modal is open, route keys. Same 2-phase pattern
+                // as the cell-edit modal: gather everything from immutable
+                // borrows first, then mutate in phase 2. Insert modal doesn't
+                // need a SQL-preview confirm step — the user has already
+                // reviewed their values field by field, and the statement is
+                // additive (new row) rather than destructive.
+                if exp.insert_row_modal.is_some() {
+                    let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                    let plan: InsertKeyPlan = {
+                        let m = exp.insert_row_modal.as_ref().unwrap();
+                        let n = m.column_meta.len();
+                        let focused = m.focused_field;
+                        let is_sentinel = m
+                            .field_buffers
+                            .get(focused)
+                            .and_then(|x| x.as_ref())
+                            .map(|s| s == NULL_SENTINEL)
+                            .unwrap_or(false);
+                        let is_nullable = m
+                            .column_meta
+                            .get(focused)
+                            .map(|c| c.is_nullable)
+                            .unwrap_or(false);
+                        let is_skip = m
+                            .field_buffers
+                            .get(focused)
+                            .map(|x| x.is_none())
+                            .unwrap_or(true);
+                        InsertKeyPlan {
+                            is_ctrl,
+                            key: key.code,
+                            char_payload: extract_char_payload(key.code, is_ctrl),
+                            is_sentinel,
+                            is_nullable,
+                            is_skip,
+                            focused,
+                            n,
+                        }
+                    };
+
+                    // Phase 2: apply the plan to the mutable modal state.
+                    match plan.key {
+                        KeyCode::Esc => {
+                            // Esc on an empty field → flip back to "skip" state
+                            // (handy for "I changed my mind, let the server
+                            // apply DEFAULT"). Esc on a populated field or on
+                            // the sentinel just cancels the modal entirely.
+                            if plan.is_skip {
+                                exp.insert_row_modal = None;
+                                self.toasts.push(
+                                    ToastKind::Info,
+                                    "insert cancelled".to_string(),
+                                );
+                            } else {
+                                let m = exp.insert_row_modal.as_mut().unwrap();
+                                m.field_buffers[plan.focused] = None;
+                            }
+                        }
+                        KeyCode::Tab | KeyCode::Down => {
+                            if plan.n > 0 {
+                                let m = exp.insert_row_modal.as_mut().unwrap();
+                                m.focused_field = (plan.focused + 1) % plan.n;
+                            }
+                        }
+                        KeyCode::BackTab | KeyCode::Up => {
+                            if plan.n > 0 {
+                                let m = exp.insert_row_modal.as_mut().unwrap();
+                                m.focused_field = if plan.focused == 0 {
+                                    plan.n - 1
+                                } else {
+                                    plan.focused - 1
+                                };
+                            }
+                        }
+                        // Ctrl+N: mark the focused field as NULL. Only valid
+                        // on nullable columns; non-nullable columns get a
+                        // warning toast (the row would be rejected anyway).
+                        KeyCode::Char('n') | KeyCode::Char('N') if plan.is_ctrl => {
+                            if plan.is_nullable {
+                                if !plan.is_sentinel {
+                                    let m = exp.insert_row_modal.as_mut().unwrap();
+                                    m.field_buffers[plan.focused] =
+                                        Some(NULL_SENTINEL.to_string());
+                                }
+                            } else {
+                                self.toasts.push(
+                                    ToastKind::Warning,
+                                    "this column is NOT NULL — cannot set to NULL".to_string(),
+                                );
+                            }
+                        }
+                        // Backspace: drop the last char of the focused buffer.
+                        // If the buffer holds the NULL sentinel, Backspace
+                        // flips it back to the "skip" state instead of
+                        // corrupting the literal sentinel string.
+                        KeyCode::Backspace => {
+                            let m = exp.insert_row_modal.as_mut().unwrap();
+                            match m.field_buffers[plan.focused].as_mut() {
+                                None => {}
+                                Some(s) if s == NULL_SENTINEL => {
+                                    m.field_buffers[plan.focused] = None;
+                                }
+                                Some(s) => {
+                                    s.pop();
+                                    if s.is_empty() {
+                                        // Empty string is the same as
+                                        // "skip" — collapse it so the UI
+                                        // shows <skip> instead of an
+                                        // empty bar. Saves a keystroke.
+                                        m.field_buffers[plan.focused] = None;
+                                    }
+                                }
+                            }
+                        }
+                        KeyCode::Char(_) if !plan.is_ctrl => {
+                            if let Some(c) = plan.char_payload {
+                                let m = exp.insert_row_modal.as_mut().unwrap();
+                                let buf = m.field_buffers[plan.focused].get_or_insert_with(String::new);
+                                // If the buffer is the NULL sentinel, the
+                                // first typed char starts a fresh value
+                                // (overwrite semantics) — same as cell-edit.
+                                if buf == NULL_SENTINEL {
+                                    m.field_buffers[plan.focused] = Some(c.to_string());
+                                } else {
+                                    buf.push(c);
+                                }
+                            }
+                        }
+                        // Enter (submit) is intentionally handled in the async
+                        // event loop, not here. Building the SQL + executing
+                        // it against the driver + refreshing the page all need
+                        // `.await` and access to `drv` / `app`, which are
+                        // out of scope in this sync `handle_key`. The
+                        // cell-edit modal uses the same split: char/backspace
+                        // routing happens here, but Enter opens the
+                        // SQL-confirm modal in the event loop.
+                        KeyCode::Enter => {}
+                        _ => {}
+                    }
+                    return;
+                }
+
+                // If SQL confirm modal is open, Esc cancels
+                if exp.sql_confirm_modal.is_some() {
+                    if key.code == KeyCode::Esc {
+                        exp.sql_confirm_modal = None;
+                    }
+                    return;
+                }
+
+                match key.code {
+                    KeyCode::Esc => {
+                        self.mode = ScreenMode::Picker;
+                        self.active_driver = None;
+                        self.explorer_state = None;
+                        return;
+                    }
+                    KeyCode::Tab => {
+                        if exp.focused_pane == FocusedPane::Tree {
+                            exp.focused_pane = FocusedPane::Workspace;
+                        } else {
+                            let mut switch_to_tree = false;
+                            if let Some(WorkspaceTab::Console(c)) = exp.active_tab_mut() {
+                                if c.focused_subpane == ConsoleSubpane::Editor {
+                                    c.focused_subpane = ConsoleSubpane::Result;
+                                } else {
+                                    c.focused_subpane = ConsoleSubpane::Editor;
+                                    switch_to_tree = true;
+                                }
+                            } else {
+                                switch_to_tree = true;
+                            }
+
+                            if switch_to_tree {
+                                exp.focused_pane = FocusedPane::Tree;
+                            }
+                        }
+                    }
+                    KeyCode::Char('?') => {
+                        self.help_open = true;
+                    }
+                    KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if let Some(tab) = exp.active_tab() {
+                            match tab {
+                                WorkspaceTab::Table(t) => {
+                                    let default_fmt = ExportFormat::Csv;
+                                    let path = format!("~/dbx_export_{}.{}", t.collection.name, default_fmt.extension());
+                                    exp.export_modal = Some(ExportModalState {
+                                        format: default_fmt,
+                                        target_path: path,
+                                        active_field: 0,
+                                        default_table_name: t.collection.name.clone(),
+                                    });
+                                }
+                                WorkspaceTab::Console(c) => {
+                                    if let Some(res) = &c.last_result && !res.records.is_empty() {
+                                        let default_fmt = ExportFormat::Csv;
+                                        let path = format!("~/dbx_export_query_result.{}", default_fmt.extension());
+                                        exp.export_modal = Some(ExportModalState {
+                                            format: default_fmt,
+                                            target_path: path,
+                                            active_field: 0,
+                                            default_table_name: "query_result".to_string(),
+                                        });
+                                    } else {
+                                        self.toasts.push(ToastKind::Info, "no query result to export".to_string());
+                                    }
+                                }
+                                WorkspaceTab::Erd(_) => {}
+                            }
+                        }
+                    }
+                    KeyCode::Char('q') => {
+                        self.should_quit = true;
+                    }
+                    _ => {}
+                }
+
+                match exp.focused_pane {
+                    FocusedPane::Tree => match key.code {
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            if exp.selected_tree_index > 0 {
+                                exp.selected_tree_index -= 1;
+                            }
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            if !exp.tree_nodes.is_empty()
+                                && exp.selected_tree_index < exp.tree_nodes.len() - 1
+                            {
+                                exp.selected_tree_index += 1;
+                            }
+                        }
+                        _ => {}
+                    },
+                    FocusedPane::Workspace => {
+                        let can_edit = exp.driver_capabilities.contains(crate::driver::Capabilities::EDIT_DATA);
+                        if let Some(tab) = exp.active_tab_mut() {
+                            match tab {
+                                WorkspaceTab::Table(t) => match key.code {
+                                    KeyCode::Up | KeyCode::Char('k') => {
+                                        if t.selected_row > 0 {
+                                            t.selected_row -= 1;
+                                        }
+                                    }
+                                    KeyCode::Down | KeyCode::Char('j') => {
+                                        if !t.page.records.is_empty() && t.selected_row < t.page.records.len() - 1 {
+                                            t.selected_row += 1;
+                                        }
+                                    }
+                                    KeyCode::Left | KeyCode::Char('h') => {
+                                        if t.selected_col > 0 {
+                                            t.selected_col -= 1;
+                                            if t.selected_col < t.scroll_offset_x {
+                                                t.scroll_offset_x = t.selected_col;
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Right | KeyCode::Char('l') => {
+                                        if !t.page.columns.is_empty() && t.selected_col < t.page.columns.len() - 1 {
+                                            t.selected_col += 1;
+                                            if t.selected_col >= t.scroll_offset_x + 6 {
+                                                t.scroll_offset_x = t.selected_col.saturating_sub(5);
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                        if let Some(row) = t.page.records.get(t.selected_row) {
+                                            match ClipboardManager::copy_row_tsv(row) {
+                                                Ok(_) => self.toasts.push(ToastKind::Success, "copied row as TSV (spreadsheet) to clipboard".to_string()),
+                                                Err(e) => self.toasts.push(ToastKind::Error, e),
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char('y') => {
+                                        if let Some(row) = t.page.records.get(t.selected_row) {
+                                            if let Some(val) = row.values.get(t.selected_col) {
+                                                match ClipboardManager::copy_cell(val) {
+                                                    Ok(_) => self.toasts.push(ToastKind::Success, "copied cell to clipboard".to_string()),
+                                                    Err(e) => self.toasts.push(ToastKind::Error, e),
+                                                }
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char('c') => {
+                                        if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                                            if let Some(row) = t.page.records.get(t.selected_row) {
+                                                if let Some(val) = row.values.get(t.selected_col) {
+                                                    match ClipboardManager::copy_cell(val) {
+                                                        Ok(_) => self.toasts.push(ToastKind::Success, "copied cell to clipboard".to_string()),
+                                                        Err(e) => self.toasts.push(ToastKind::Error, e),
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char('Y') => {
+                                        if let Some(row) = t.page.records.get(t.selected_row) {
+                                            match ClipboardManager::copy_row_json(&t.page.columns, row) {
+                                                Ok(_) => self.toasts.push(ToastKind::Success, "copied row as JSON to clipboard".to_string()),
+                                                Err(e) => self.toasts.push(ToastKind::Error, e),
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char('e') | KeyCode::Enter => {
+                                        if !can_edit {
+                                            self.toasts.push(ToastKind::Warning, "active driver does not support editing data");
+                                        } else if let Some(row) = t.page.records.get(t.selected_row)
+                                            && let Some(col_name) = t.page.columns.get(t.selected_col)
+                                            && let Some(val) = row.values.get(t.selected_col)
+                                        {
+                                            // Look up the column's nullable flag from the metadata that
+                                            // was fetched when the tab was opened. If metadata is missing
+                                            // (e.g. legacy tab or query console), default to true so the
+                                            // user still has the option; the UPDATE will fail at the DB
+                                            // level if the column is actually NOT NULL.
+                                            let is_nullable = t
+                                                .column_meta
+                                                .iter()
+                                                .find(|m| m.name == *col_name)
+                                                .map(|m| m.is_nullable)
+                                                .unwrap_or(true);
+                                            exp.cell_edit_modal = Some(crate::ui::screens::explorer::CellEditModalState {
+                                                collection: t.collection.clone(),
+                                                column_name: col_name.clone(),
+                                                row_idx: t.selected_row,
+                                                col_idx: t.selected_col,
+                                                text_buffer: val.display_str(),
+                                                is_nullable,
+                                            });
+                                        }
+                                    }
+                                    _ => {}
+                                },
+                                WorkspaceTab::Console(c) => match c.focused_subpane {
+                                    ConsoleSubpane::Editor => match key.code {
+                                        KeyCode::Up => c.move_cursor_up(),
+                                        KeyCode::Down => c.move_cursor_down(),
+                                        KeyCode::Left => c.move_cursor_left(),
+                                        KeyCode::Right => c.move_cursor_right(),
+                                        KeyCode::Backspace => c.backspace(),
+                                        KeyCode::Enter => c.insert_newline(),
+                                        KeyCode::Char(ch) => {
+                                            if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                                                c.insert_char(ch);
+                                            }
+                                        }
+                                        _ => {}
+                                    },
+                                    ConsoleSubpane::Result => match key.code {
+                                        KeyCode::Up | KeyCode::Char('k') => {
+                                            if c.result_selected_row > 0 {
+                                                c.result_selected_row -= 1;
+                                            }
+                                        }
+                                        KeyCode::Down | KeyCode::Char('j') => {
+                                            if let Some(res) = &c.last_result {
+                                                if !res.records.is_empty() && c.result_selected_row < res.records.len() - 1 {
+                                                    c.result_selected_row += 1;
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Left | KeyCode::Char('h') => {
+                                            if c.result_selected_col > 0 {
+                                                c.result_selected_col -= 1;
+                                                if c.result_selected_col < c.result_scroll_x {
+                                                    c.result_scroll_x = c.result_selected_col;
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Right | KeyCode::Char('l') => {
+                                            if let Some(res) = &c.last_result {
+                                                if !res.columns.is_empty() && c.result_selected_col < res.columns.len() - 1 {
+                                                    c.result_selected_col += 1;
+                                                    if c.result_selected_col >= c.result_scroll_x + 6 {
+                                                        c.result_scroll_x = c.result_selected_col.saturating_sub(5);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                            if let Some(res) = &c.last_result {
+                                                if let Some(row) = res.records.get(c.result_selected_row) {
+                                                    match ClipboardManager::copy_row_tsv(row) {
+                                                        Ok(_) => self.toasts.push(ToastKind::Success, "copied row as TSV (spreadsheet) to clipboard".to_string()),
+                                                        Err(e) => self.toasts.push(ToastKind::Error, e),
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Char('y') => {
+                                            if let Some(res) = &c.last_result {
+                                                if let Some(row) = res.records.get(c.result_selected_row) {
+                                                    if let Some(val) = row.values.get(c.result_selected_col) {
+                                                        match ClipboardManager::copy_cell(val) {
+                                                            Ok(_) => self.toasts.push(ToastKind::Success, "copied cell to clipboard".to_string()),
+                                                            Err(e) => self.toasts.push(ToastKind::Error, e),
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Char('c') => {
+                                            if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                                                if let Some(res) = &c.last_result {
+                                                    if let Some(row) = res.records.get(c.result_selected_row) {
+                                                        if let Some(val) = row.values.get(c.result_selected_col) {
+                                                            match ClipboardManager::copy_cell(val) {
+                                                                Ok(_) => self.toasts.push(ToastKind::Success, "copied cell to clipboard".to_string()),
+                                                                Err(e) => self.toasts.push(ToastKind::Error, e),
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Char('Y') => {
+                                            if let Some(res) = &c.last_result {
+                                                if let Some(row) = res.records.get(c.result_selected_row) {
+                                                    match ClipboardManager::copy_row_json(&res.columns, row) {
+                                                        Ok(_) => self.toasts.push(ToastKind::Success, "copied row as JSON to clipboard".to_string()),
+                                                        Err(e) => self.toasts.push(ToastKind::Error, e),
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    },
+                                },
+                                WorkspaceTab::Erd(e) => match key.code {
+                                    KeyCode::Up | KeyCode::Char('k') => e.scroll_up(),
+                                    KeyCode::Down | KeyCode::Char('j') => e.scroll_down(),
+                                    KeyCode::Left | KeyCode::Char('h') => e.scroll_left(),
+                                    KeyCode::Right | KeyCode::Char('l') => e.scroll_right(),
+                                    _ => {}
+                                },
+                            }
+                        }
+
+                        if key.code == KeyCode::Char('w') && !exp.tabs.is_empty() {
+                            exp.tabs.remove(exp.active_tab_index);
+                            if exp.active_tab_index >= exp.tabs.len() && exp.active_tab_index > 0 {
+                                exp.active_tab_index -= 1;
+                            }
+                            // If the last tab was just closed, the workspace pane is now
+                            // empty and there's nothing to interact with there. Bounce
+                            // focus back to the tree so the user can pick another table
+                            // without manually pressing Tab/h. We only do this when the
+                            // tab list is fully empty — if other tabs remain, the user
+                            // probably wants to keep working in the workspace.
+                            if exp.tabs.is_empty() {
+                                exp.focused_pane = FocusedPane::Tree;
+                            }
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // If form modal P5 is open, route typing to form
+        if let Some(form) = &mut self.form_modal {
+            match key.code {
+                KeyCode::Esc => {
+                    self.form_modal = None;
+                }
+                KeyCode::Tab | KeyCode::Down => {
+                    form.focused_field = form.focused_field.next();
+                }
+                KeyCode::BackTab | KeyCode::Up => {
+                    form.focused_field = form.focused_field.prev();
+                }
+                KeyCode::Enter => {
+                    let new_cfg = form.to_connection_config();
+                    if form.is_editing && let Some(orig) = &form.original_name {
+                        if let Some(pos) = self.config.connections.iter().position(|c| &c.name == orig) {
+                            self.config.connections[pos] = new_cfg;
+                        }
+                    } else {
+                        self.config.connections.push(new_cfg);
+                        self.selected_connection = self.config.connections.len().saturating_sub(1);
+                    }
+
+                    if let Err(e) = self.config.save(&self.config_path) {
+                        self.toasts.push(ToastKind::Error, format!("failed to save config: {e:#}"));
+                    } else {
+                        self.toasts.push(ToastKind::Success, "connection saved".to_string());
+                    }
+                    self.form_modal = None;
+                }
+                KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.focused_field == FormField::Driver => {
+                    form.driver = match form.driver {
+                        crate::config::DriverType::MySql => {
+                            if form.port == "3306" {
+                                form.port = "5432".to_string();
+                            }
+                            crate::config::DriverType::Postgres
+                        }
+                        crate::config::DriverType::Postgres => {
+                            if form.port == "5432" {
+                                form.port = "3306".to_string();
+                            }
+                            crate::config::DriverType::MySql
+                        }
+                        _ => crate::config::DriverType::MySql,
+                    };
+                }
+                KeyCode::Backspace => {
+                    let target_str = match form.focused_field {
+                        FormField::Name => &mut form.name,
+                        FormField::Driver => return,
+                        FormField::Host => &mut form.host,
+                        FormField::Port => &mut form.port,
+                        FormField::User => &mut form.user,
+                        FormField::Password => &mut form.password,
+                        FormField::Database => &mut form.database,
+                    };
+                    target_str.pop();
+                }
+                KeyCode::Char(c) => {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                        let target_str = match form.focused_field {
+                            FormField::Name => &mut form.name,
+                            FormField::Driver => return,
+                            FormField::Host => &mut form.host,
+                            FormField::Port => {
+                                if c.is_ascii_digit() {
+                                    &mut form.port
+                                } else {
+                                    return;
+                                }
+                            }
+                            FormField::User => &mut form.user,
+                            FormField::Password => &mut form.password,
+                            FormField::Database => &mut form.database,
+                        };
+                        target_str.push(c);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Screen S1 (Picker) Keybindings
         match key.code {
             KeyCode::Char('q') => self.should_quit = true,
-            KeyCode::Char('?') => self.help_open = !self.help_open,
-            KeyCode::Esc if self.help_open => self.help_open = false,
-            KeyCode::Char('t') => {
-                *toast_counter += 1;
-                let kind = TOAST_KINDS[(*toast_counter as usize - 1) % TOAST_KINDS.len()];
-                self.toasts
-                    .push(kind, format!("demo toast #{}", *toast_counter));
+            KeyCode::Char('?') => self.help_open = true,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.selected_connection > 0 {
+                    self.selected_connection -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if !self.config.connections.is_empty()
+                    && self.selected_connection < self.config.connections.len() - 1
+                {
+                    self.selected_connection += 1;
+                }
+            }
+            KeyCode::Char('a') => {
+                self.form_modal = Some(ConnectionForm::new_empty());
+            }
+            KeyCode::Char('e') => {
+                if let Some(cfg) = self.config.connections.get(self.selected_connection) {
+                    self.form_modal = Some(ConnectionForm::from_config(cfg));
+                }
+            }
+            KeyCode::Char('d') => {
+                // Open the confirm-delete modal instead of deleting immediately.
+                // Destructive operations need a confirmation step so a stray
+                // `d` keystroke can't wipe a saved credential by accident.
+                if !self.config.connections.is_empty()
+                    && let Some(cfg) = self.config.connections.get(self.selected_connection).cloned()
+                {
+                    self.confirm_delete_modal = Some(ConfirmDeleteModal {
+                        connection_name: cfg.name,
+                        connection_index: self.selected_connection,
+                    });
+                }
             }
             _ => {}
+        }
+    }
+
+    /// Execute the pending delete. Called from the confirm-delete modal's
+    /// `Enter` handler in `run()`. Pulled out so the actual destructive logic
+    /// (remove from vec, save config, adjust selection) lives in one place
+    /// and can be unit-tested or reused if other entry points ever need it.
+    fn execute_pending_delete(&mut self) {
+        let Some(modal) = self.confirm_delete_modal.take() else {
+            return;
+        };
+        // Defensive: re-bound the index in case the vec shrank from elsewhere.
+        // (No other code path currently mutates the list while this modal is
+        // open, but bounding protects against future refactors.)
+        if modal.connection_index >= self.config.connections.len() {
+            self.toasts.push(
+                ToastKind::Error,
+                format!("connection '{}' no longer exists", modal.connection_name),
+            );
+            return;
+        }
+        let removed = self.config.connections.remove(modal.connection_index);
+        // Keep the cursor on a valid index after removal.
+        if self.selected_connection >= self.config.connections.len()
+            && self.selected_connection > 0
+        {
+            self.selected_connection -= 1;
+        }
+        match self.config.save(&self.config_path) {
+            Ok(_) => {
+                self.toasts.push(
+                    ToastKind::Info,
+                    format!("deleted '{}'", removed.name),
+                );
+            }
+            Err(e) => {
+                self.toasts.push(
+                    ToastKind::Error,
+                    format!("failed to delete: {e:#}"),
+                );
+            }
         }
     }
 
@@ -101,8 +1205,14 @@ impl App {
         let area = f.area();
         let theme = &self.theme;
 
-        // Paint the whole frame with the base background first.
-        f.render_widget(Block::default().style(theme.base()), area);
+        // Paint background base. When a blocking form-modal test is in flight, dim
+        // the entire frame so the rest of the UI reads as inactive.
+        let base_style = if self.form_test_rx.is_some() {
+            theme.dimmed()
+        } else {
+            theme.base()
+        };
+        f.render_widget(Block::default().style(base_style), area);
 
         if layout::too_small(area) {
             let notice = format!(
@@ -125,58 +1235,90 @@ impl App {
 
         let layout = layout::compute(area);
 
-        // Header: accent logo + dim version.
+        // Header
+        let config_str = format!("  [{}]", self.config_path.display());
         let header = Line::from(vec![
             Span::styled("◆ dbx", theme.accent()),
             Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), theme.dim()),
+            Span::styled(config_str, theme.dim()),
         ]);
         f.render_widget(Paragraph::new(header).style(theme.base()), layout.header);
 
-        // Body: live spinner on the first body line, empty state below it.
-        let spinner_area = Rect {
-            height: 1,
-            ..layout.body
-        };
-        spinner.render(f, spinner_area, "Connecting... (demo)", theme);
-        let empty_area = Rect {
-            y: layout.body.y.saturating_add(1),
-            height: layout.body.height.saturating_sub(1),
-            ..layout.body
-        };
-        empty::render(
-            f,
-            empty_area,
-            "no database connected",
-            Some("press ? for help · t for a demo toast"),
-            theme,
-        );
+        // Body
+        match self.mode {
+            ScreenMode::Picker => {
+                picker::render_picker(
+                    f,
+                    layout.body,
+                    &self.config.connections,
+                    self.selected_connection,
+                    theme,
+                );
+                let context_text = if self.connecting {
+                    "Connecting..."
+                } else {
+                    "S1: Connection Picker"
+                };
+                statusbar::render(f, layout.status, context_text, &PICKER_HINTS, theme);
+            }
+            ScreenMode::Connected => {
+                if let Some(exp) = &self.explorer_state {
+                    explorer::render_explorer(f, layout.body, exp, theme);
+                }
+                statusbar::render(f, layout.status, "S2: Explorer", &EXPLORER_HINTS, theme);
+            }
+        }
 
-        statusbar::render(f, layout.status, "dbx demo", &STATUS_HINTS, theme);
+        // Overlays
+        if let Some(form) = &self.form_modal {
+            // Draw a dim "scrim" over the whole frame BEFORE the modal so everything
+            // outside the modal reads as inactive. The modal then sits on top with
+            // its own style, drawing the eye to the in-flight test.
+            if self.form_test_rx.is_some() {
+                f.render_widget(Clear, area);
+                f.render_widget(
+                    Block::default().style(theme.dimmed()),
+                    area,
+                );
+            }
+            picker::render_form_modal(f, area, form, self.form_test_rx.is_some(), spinner, theme);
+        }
 
-        // Overlays last, so they draw on top.
+        // Confirm-delete popup (destructive action). Drawn after form modal so
+        // a stacked confirm-on-form case is unambiguous, but before toasts
+        // so any "delete cancelled" / "deleted ..." toast overlays cleanly.
+        if let Some(confirm) = &self.confirm_delete_modal {
+            picker::render_confirm_delete_modal(f, area, confirm, theme);
+        }
+
+        if self.connecting {
+            let spin_area = Rect {
+                x: area.x + 2,
+                y: area.y + 1,
+                width: 30,
+                height: 1,
+            };
+            spinner.render(f, spin_area, "Connecting to MySQL...", theme);
+        }
+
         self.toasts.render(f, area, theme);
+
         if self.help_open {
-            help::render(f, area, "demo", &HELP_BINDINGS, theme);
+            let (title, bindings) = match self.mode {
+                ScreenMode::Picker => ("Connection Picker", &PICKER_HELP_BINDINGS[..]),
+                ScreenMode::Connected => ("Database Explorer", &EXPLORER_HELP_BINDINGS[..]),
+            };
+            help::render(f, area, title, bindings, theme);
         }
     }
 }
 
-impl Default for App {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-/// Restores the terminal on drop so every exit path (normal, error, panic
-/// unwinding) leaves the shell usable.
+/// Restores the terminal on drop so every exit path leaves the shell usable.
 struct TerminalGuard;
 
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
-        // Construct the guard BEFORE the fallible alt-screen enter: if it
-        // fails, Drop still runs and undoes raw mode. LeaveAlternateScreen on
-        // a never-entered alternate screen is a harmless no-op escape.
         let guard = Self;
         execute!(io::stdout(), EnterAlternateScreen)?;
         Ok(guard)
@@ -194,9 +1336,7 @@ impl Drop for TerminalGuard {
     }
 }
 
-pub async fn run(_config: Option<PathBuf>) -> anyhow::Result<()> {
-    // Panic hook FIRST: restore the terminal before the default panic output,
-    // so a panic never leaves the user's shell in raw mode.
+pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         TerminalGuard::restore();
@@ -205,7 +1345,6 @@ pub async fn run(_config: Option<PathBuf>) -> anyhow::Result<()> {
 
     let _guard = TerminalGuard::enter().context("failed to initialize terminal")?;
 
-    // Spawn a signal listener for SIGINT/SIGTERM/SIGHUP so sudden termination restores the terminal cleanly.
     tokio::spawn(async {
         use tokio::signal::unix::{SignalKind, signal};
         if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
@@ -214,13 +1353,15 @@ pub async fn run(_config: Option<PathBuf>) -> anyhow::Result<()> {
             std::process::exit(130);
         }
     });
+
+    let config_path = AppConfig::default_path(cli_config.as_deref());
+    let config = AppConfig::load(&config_path).unwrap_or_default();
+
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
         .context("failed to create terminal backend")?;
 
-    let mut app = App::new();
+    let mut app = App::new(config, config_path);
     let mut spinner = Spinner::new();
-    let mut toast_counter: u64 = 0;
-
     let mut last_tick = Instant::now();
 
     while !app.should_quit {
@@ -228,19 +1369,743 @@ pub async fn run(_config: Option<PathBuf>) -> anyhow::Result<()> {
             .draw(|f| app.draw(f, &spinner))
             .context("failed to draw frame")?;
 
-        // Sync crossterm polling with a tick cap.
         if event::poll(TICK_CAP).context("failed to poll terminal events")?
             && let Event::Key(key) = event::read().context("failed to read terminal event")?
             && key.kind == KeyEventKind::Press
         {
-            app.handle_key(key, &mut toast_counter);
+            // P5: while a form-modal test is in flight, ignore ALL key input so the user
+            // can't edit fields, change driver, or save mid-ping. The spinner + toast
+            // communicate progress; result delivered via tick poll.
+            if app.form_test_rx.is_some() {
+                continue;
+            }
+            // Confirm-delete modal intercepts ONLY Enter / Esc. Any other key
+            // is ignored so the user can't accidentally fire picker shortcuts
+            // (j/k navigation, `a` add, `d` re-open modal, etc.) while the
+            // destructive dialog is up. Enter executes, Esc cancels.
+            if app.confirm_delete_modal.is_some() {
+                match key.code {
+                    KeyCode::Enter => {
+                        app.execute_pending_delete();
+                    }
+                    KeyCode::Esc => {
+                        app.confirm_delete_modal = None;
+                        app.toasts.push(
+                            ToastKind::Info,
+                            "delete cancelled".to_string(),
+                        );
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+            // P5: Ctrl+T inside Connection Form Modal — handle BEFORE handle_key so the
+            // sync form-modal handler doesn't swallow the key as plain 't' typing.
+            // Non-blocking: spawn task, store receiver, return immediately. UI stays
+            // responsive; spinner shows in the modal; result delivered via tick poll.
+            if !app.help_open
+                && app.form_modal.is_some()
+                && app.form_test_rx.is_none()
+                && key.modifiers.contains(KeyModifiers::CONTROL)
+                && key.code == KeyCode::Char('t')
+            {
+                let cfg = app.form_modal.as_ref().map(|f| f.to_connection_config());
+                if let Some(cfg) = cfg {
+                    // Don't push an info "testing..." toast here — the in-modal spinner
+                    // is the live feedback. Only the final success/error toast is shown,
+                    // so the user sees a clear, single result instead of two quick
+                    // back-to-back toasts.
+                    if let Some(form) = app.form_modal.as_mut() {
+                        form.last_test_result = None;
+                    }
+                    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Duration, String>>(1);
+                    tokio::spawn(async move {
+                        // Hard 60s ceiling: even if the network/server hangs forever
+                        // (e.g. packet drop, firewall blackhole), the user gets a
+                        // clear timeout toast instead of a permanently spinning modal.
+                        let res = match tokio::time::timeout(
+                            Duration::from_secs(60),
+                            async {
+                                match crate::driver::connect_driver(&cfg).await {
+                                    Ok(driver) => driver.ping().await
+                                        .map_err(|e| format!("ping failed: {e:#}")),
+                                    Err(e) => Err(format!("connect failed: {e:#}")),
+                                }
+                            },
+                        ).await {
+                            Ok(inner) => inner,
+                            Err(_) => Err("ping timed out after 60s".to_string()),
+                        };
+                        let _ = tx.send(res).await;
+                    });
+                    app.form_test_rx = Some(rx);
+                }
+                continue;
+            }
+            if matches!(app.mode, ScreenMode::Connected) {
+                if let (Some(drv), Some(exp)) = (&app.active_driver, &mut app.explorer_state) {
+                    // 1. Export modal execution
+                    if let Some(modal) = &exp.export_modal {
+                        if key.code == KeyCode::Enter {
+                            let format = modal.format;
+                            let target_path = modal.target_path.clone();
+                            let table_name = modal.default_table_name.clone();
+
+                            // Extract current active dataset
+                            let export_data: Option<(Vec<String>, Vec<crate::driver::Record>)> = if let Some(tab) = exp.active_tab() {
+                                match tab {
+                                    WorkspaceTab::Table(t) => Some((t.page.columns.clone(), t.page.records.clone())),
+                                    WorkspaceTab::Console(c) => c.last_result.as_ref().map(|res| (res.columns.clone(), res.records.clone())),
+                                    WorkspaceTab::Erd(_) => None,
+                                }
+                            } else {
+                                None
+                            };
+
+                            if let Some((cols, recs)) = export_data {
+                                let content = match format {
+                                    ExportFormat::Csv => Ok(Exporter::format_csv(&cols, &recs)),
+                                    ExportFormat::Json => Exporter::format_json(&cols, &recs)
+                                        .map_err(|e| format!("JSON export error: {e:#}")),
+                                    ExportFormat::SqlInsert => Ok(Exporter::format_sql_insert(&table_name, &cols, &recs)),
+                                };
+
+                                match content {
+                                    Ok(text) => match Exporter::save_to_file(&target_path, &text) {
+                                        Ok(saved_path) => {
+                                            app.toasts.push(
+                                                ToastKind::Success,
+                                                format!("exported {} rows to {}", recs.len(), saved_path.display()),
+                                            );
+                                            exp.export_modal = None;
+                                        }
+                                        Err(e) => {
+                                            app.toasts.push(ToastKind::Error, format!("failed to save export file: {e:#}"));
+                                        }
+                                    },
+                                    Err(e) => {
+                                        app.toasts.push(ToastKind::Error, e);
+                                    }
+                                }
+                            } else {
+                                app.toasts.push(ToastKind::Error, "no dataset available for export".to_string());
+                                exp.export_modal = None;
+                            }
+                            continue;
+                        }
+                    }
+
+                    // 2. Cell edit modal submit -> Generate SQL Preview & open confirmation modal
+                    if let Some(edit) = &exp.cell_edit_modal {
+                        if key.code == KeyCode::Enter {
+                            let cref = edit.collection.clone();
+                            let col_name = edit.column_name.clone();
+                            let new_val_str = edit.text_buffer.clone();
+                            let row_idx = edit.row_idx;
+
+                            // Fetch table metadata to discover primary keys for exact targeting
+                            let drv_clone = drv.clone();
+                            let meta = drv_clone.collection_meta(&cref).await.ok();
+                            let pk_cols: Vec<String> = meta
+                                .as_ref()
+                                .map(|m| {
+                                    m.columns
+                                        .iter()
+                                        .filter(|c| c.is_primary_key)
+                                        .map(|c| c.name.clone())
+                                        .collect()
+                                })
+                                .unwrap_or_default();
+
+                            // Build the WHERE clause via the shared helper so UPDATE / DELETE
+                            // / future row-targeting statements all agree on NULL handling,
+                            // identifier quoting, and PK-preferring semantics.
+                            let driver_name = drv.info().name.clone();
+                            let where_sql = if let Some(WorkspaceTab::Table(t)) = exp.active_tab() {
+                                t.page
+                                    .records
+                                    .get(row_idx)
+                                    .and_then(|row| {
+                                        build_where_for_row(&t.page.columns, row, &pk_cols, &driver_name)
+                                    })
+                                    .unwrap_or_else(|| "1 = 1".to_string())
+                            } else {
+                                "1 = 1".to_string()
+                            };
+
+                            let q_ns = quote_ident(&cref.namespace.0, &driver_name);
+                            let q_tbl = quote_ident(&cref.name, &driver_name);
+                            let q_col = quote_ident(&col_name, &driver_name);
+
+                            // The sentinel is the only way the buffer can carry
+                            // "set to NULL" intent; literal user-typed text "NULL"
+                            // stays a regular string.
+                            let assignment = render_buffer_sql(&new_val_str);
+
+                            // MySQL needs `LIMIT 1` on single-row UPDATE when the WHERE
+                            // doesn't include a unique key. Other backends don't.
+                            let suffix = single_row_suffix(&driver_name);
+
+                            let sql = format!(
+                                "UPDATE {q_ns}.{q_tbl} SET {q_col} = {assignment} WHERE {where_sql}{suffix};"
+                            );
+
+                            exp.cell_edit_modal = None;
+                            exp.sql_confirm_modal = Some(crate::ui::screens::explorer::SqlConfirmModalState {
+                                collection: cref,
+                                sql_query: sql,
+                                row_idx,
+                            });
+                            continue;
+                        }
+                    }
+
+                    // 2b. INSERT-row modal submit. Char / Tab / Esc / Ctrl+N
+                    //     are all routed in `handle_key` (sync), but the
+                    //     submit step needs `drv.execute().await` and a page
+                    //     refresh, so it lives here in the async event loop.
+                    //     We don't go through a SQL-confirm modal because the
+                    //     statement is additive (new row) and the user has
+                    //     already reviewed every value field by field.
+                    if let Some(m) = &exp.insert_row_modal {
+                        if key.code == KeyCode::Enter {
+                            // Snapshot the modal state into a plain Vec so
+                            // the borrow on `exp.insert_row_modal` ends
+                            // before we touch `drv` and `exp.active_tab_mut`.
+                            let mut fields: Vec<(String, Option<String>)> =
+                                Vec::with_capacity(m.column_meta.len());
+                            for (i, col) in m.column_meta.iter().enumerate() {
+                                let buf = m.field_buffers.get(i).cloned().flatten();
+                                fields.push((col.name.clone(), buf));
+                            }
+                            let cref = m.collection.clone();
+
+                            let driver_name = drv.info().name.clone();
+                            match build_insert_sql(&cref, &fields, &driver_name) {
+                                Some(sql) => {
+                                    app.toasts.push(
+                                        ToastKind::Info,
+                                        "executing INSERT...".to_string(),
+                                    );
+                                    let drv_clone = drv.clone();
+                                    let cref_clone = cref.clone();
+                                    match drv_clone.execute(&cref.namespace, &sql).await {
+                                        Ok(res) => {
+                                            app.toasts.push(
+                                                ToastKind::Success,
+                                                format!(
+                                                    "inserted 1 row (rows affected: {})",
+                                                    res.rows_affected.max(1)
+                                                ),
+                                            );
+                                            exp.insert_row_modal = None;
+                                            // Refresh the current page so the
+                                            // new row shows up immediately if
+                                            // it falls within the visible
+                                            // window. If it doesn't (e.g.
+                                            // sorted descending), the user can
+                                            // navigate manually.
+                                            if let Some(WorkspaceTab::Table(t)) =
+                                                exp.active_tab_mut()
+                                            {
+                                                if t.collection == cref_clone {
+                                                    let cur_page = Page {
+                                                        offset: t.page.page * t.page.page_size,
+                                                        limit: t.page.page_size,
+                                                    };
+                                                    if let Ok(refreshed) =
+                                                        drv_clone.records(&cref_clone, cur_page).await
+                                                    {
+                                                        t.page = refreshed;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            app.toasts.push(
+                                                ToastKind::Error,
+                                                format!("INSERT failed: {e:#}"),
+                                            );
+                                            // Keep modal open so the user can
+                                            // fix the offending field and
+                                            // retry instead of starting over.
+                                        }
+                                    }
+                                }
+                                None => {
+                                    app.toasts.push(
+                                        ToastKind::Error,
+                                        "no values provided — fill at least one field before inserting"
+                                            .to_string(),
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
+                    // 3. SQL Confirmation modal -> Execute UPDATE and refresh data grid
+                    if let Some(confirm) = &exp.sql_confirm_modal {
+                        if key.code == KeyCode::Enter {
+                            let cref = confirm.collection.clone();
+                            let sql = confirm.sql_query.clone();
+                            let drv_clone = drv.clone();
+
+                            app.toasts.push(ToastKind::Info, "executing safe UPDATE...".to_string());
+                            match drv_clone.execute(&cref.namespace, &sql).await {
+                                Ok(res) => {
+                                    app.toasts.push(
+                                        ToastKind::Success,
+                                        format!("updated successfully (rows affected: {})", res.rows_affected),
+                                    );
+                                    exp.sql_confirm_modal = None;
+
+                                    // Refresh active table tab
+                                    if let Some(WorkspaceTab::Table(t)) = exp.active_tab_mut() {
+                                        if t.collection == cref {
+                                            let cur_page = Page {
+                                                offset: t.page.page * t.page.page_size,
+                                                limit: t.page.page_size,
+                                            };
+                                            if let Ok(refreshed) = drv_clone.records(&cref, cur_page).await {
+                                                t.page = refreshed;
+                                            }
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    app.toasts.push(ToastKind::Error, format!("UPDATE failed: {e:#}"));
+                                    exp.sql_confirm_modal = None;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
+                    if exp.ddl_popup.is_none() && exp.focused_pane == FocusedPane::Tree {
+                        match key.code {
+                            KeyCode::Char(' ') | KeyCode::Enter => {
+                                if let Some(node) = exp.selected_node() {
+                                    match &node.kind {
+                                        TreeNodeKind::Database(ns) => {
+                                            let ns_clone = ns.clone();
+                                            let is_expanded = node.is_expanded;
+                                            if !is_expanded && !exp.tables.contains_key(&ns_clone.0) {
+                                                if let Some(n) = exp.tree_nodes.iter_mut().find(|n| match &n.kind {
+                                                    TreeNodeKind::Database(d) => d == &ns_clone,
+                                                    _ => false,
+                                                }) {
+                                                    n.is_loading = true;
+                                                }
+                                                let drv_clone = drv.clone();
+                                                if let Ok(tbls) = drv_clone.collections(&ns_clone).await {
+                                                    exp.tables.insert(ns_clone.0.clone(), tbls);
+                                                }
+                                                if let Some(n) = exp.tree_nodes.iter_mut().find(|n| match &n.kind {
+                                                    TreeNodeKind::Database(d) => d == &ns_clone,
+                                                    _ => false,
+                                                }) {
+                                                    n.is_loading = false;
+                                                }
+                                            }
+                                            if let Some(n) = exp.tree_nodes.iter_mut().find(|n| match &n.kind {
+                                                TreeNodeKind::Database(d) => d == &ns_clone,
+                                                _ => false,
+                                            }) {
+                                                n.is_expanded = !is_expanded;
+                                            }
+                                            exp.rebuild_tree_nodes();
+
+                                            // Restore selection index to the toggled database item
+                                            if let Some(new_idx) = exp.tree_nodes.iter().position(|n| match &n.kind {
+                                                TreeNodeKind::Database(d) => d == &ns_clone,
+                                                _ => false,
+                                            }) {
+                                                exp.selected_tree_index = new_idx;
+                                            }
+                                        }
+                                        TreeNodeKind::Table(cref, _) => {
+                                            let cref_clone = cref.clone();
+                                            if let Some(existing_idx) = exp.tabs.iter().position(|t| match t {
+                                                WorkspaceTab::Table(tab) => tab.collection == cref_clone,
+                                                _ => false,
+                                            }) {
+                                                exp.active_tab_index = existing_idx;
+                                                exp.focused_pane = FocusedPane::Workspace;
+                                            } else {
+                                                let drv_clone = drv.clone();
+                                                // Fetch records AND column metadata. column_meta drives the
+                                                // cell-edit modal's nullable shortcut (Ctrl+N → set NULL).
+                                                // Metadata fetch failure is non-fatal: tab still loads,
+                                                // just without the NULL-set capability.
+                                                let meta_res = drv_clone.collection_meta(&cref_clone).await;
+                                                let rec_res = drv_clone.records(&cref_clone, Page::default()).await;
+                                                match rec_res {
+                                                    Ok(rec_page) => {
+                                                        let column_meta = meta_res
+                                                            .map(|m| m.columns)
+                                                            .unwrap_or_default();
+                                                        exp.tabs.push(WorkspaceTab::Table(DataTab {
+                                                            collection: cref_clone,
+                                                            page: rec_page,
+                                                            selected_row: 0,
+                                                            selected_col: 0,
+                                                            scroll_offset_x: 0,
+                                                            column_meta,
+                                                        }));
+                                                        exp.active_tab_index = exp.tabs.len().saturating_sub(1);
+                                                        exp.focused_pane = FocusedPane::Workspace;
+                                                    }
+                                                    Err(e) => {
+                                                        app.toasts.push(ToastKind::Error, format!("failed to load table: {e:#}"));
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::F(1) => {
+                                if let Some(node) = exp.selected_node() {
+                                    if let TreeNodeKind::Table(cref, _) = &node.kind {
+                                        let cref_clone = cref.clone();
+                                        let drv_clone = drv.clone();
+                                        match drv_clone.definition(&cref_clone).await {
+                                            Ok(ddl) => {
+                                                exp.ddl_popup = Some((cref_clone, ddl));
+                                            }
+                                            Err(e) => {
+                                                app.toasts.push(ToastKind::Error, format!("failed to fetch DDL: {e:#}"));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::F(2) => {
+                                if let Some(node) = exp.selected_node() {
+                                    let target_ns = match &node.kind {
+                                        TreeNodeKind::Database(ns) => ns.clone(),
+                                        TreeNodeKind::Table(cref, _) => cref.namespace.clone(),
+                                    };
+
+                                    if let Some(existing_idx) = exp.tabs.iter().position(|t| match t {
+                                        WorkspaceTab::Erd(erd) => erd.namespace == target_ns,
+                                        _ => false,
+                                    }) {
+                                        exp.active_tab_index = existing_idx;
+                                        exp.focused_pane = FocusedPane::Workspace;
+                                    } else {
+                                        app.toasts.push(ToastKind::Info, format!("generating ERD for '{}'...", target_ns.0));
+                                        let drv_clone = drv.clone();
+                                        let mut erd_tab = crate::ui::screens::erd::ErdTab::new(target_ns.clone());
+                                        if let Ok(tbls) = drv_clone.collections(&target_ns).await {
+                                            let mut metas = Vec::new();
+                                            for tbl in tbls {
+                                                let cref = crate::driver::CollectionRef {
+                                                    namespace: target_ns.clone(),
+                                                    name: tbl.name,
+                                                };
+                                                if let Ok(meta) = drv_clone.collection_meta(&cref).await {
+                                                    metas.push(meta);
+                                                }
+                                            }
+                                            erd_tab.generate_from_meta(&metas);
+                                            exp.tabs.push(WorkspaceTab::Erd(erd_tab));
+                                            exp.active_tab_index = exp.tabs.len().saturating_sub(1);
+                                            exp.focused_pane = FocusedPane::Workspace;
+                                            app.toasts.push(ToastKind::Success, "ERD generated".to_string());
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                app.handle_key(key);
+                            }
+                        }
+                    } else if exp.ddl_popup.is_none() && exp.focused_pane == FocusedPane::Workspace {
+                        let is_ctrl_enter = key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Enter;
+                        let is_f5 = key.code == KeyCode::F(5);
+
+                        if is_ctrl_enter || is_f5 {
+                            // Find active database from selected tree node or fallback to first namespace
+                            let active_ns = if let Some(node) = exp.selected_node() {
+                                match &node.kind {
+                                    TreeNodeKind::Database(ns) => ns.clone(),
+                                    TreeNodeKind::Table(cref, _) => cref.namespace.clone(),
+                                }
+                            } else {
+                                exp.namespaces.first().cloned().unwrap_or(crate::driver::Namespace("mysql".to_string()))
+                            };
+
+                            if let Some(WorkspaceTab::Console(console)) = exp.active_tab_mut() {
+                                let query_text = console.text();
+                                let drv_clone = drv.clone();
+                                console.is_executing = true;
+                                console.execution_error = None;
+
+                                match drv_clone.execute(&active_ns, &query_text).await {
+                                    Ok(res) => {
+                                        console.is_executing = false;
+                                        console.last_result = Some(res);
+                                        console.execution_error = None;
+                                        console.result_selected_row = 0;
+                                        console.result_selected_col = 0;
+                                        app.toasts.push(ToastKind::Success, "query executed".to_string());
+                                    }
+                                    Err(e) => {
+                                        console.is_executing = false;
+                                        console.execution_error = Some(format!("{e:#}"));
+                                        app.toasts.push(ToastKind::Error, "query failed".to_string());
+                                    }
+                                }
+                            }
+                        } else {
+                            match key.code {
+                                // Backspace on a selected row → confirm + DELETE the row.
+                                // We need the active driver for the driver-name sniff
+                                // (`quote_ident` + `single_row_suffix`) so this lives
+                                // here in the async event loop, not in `handle_key`.
+                                KeyCode::Backspace => {
+                                    let can_edit = exp.driver_capabilities.contains(crate::driver::Capabilities::EDIT_DATA);
+                                    if !can_edit {
+                                        app.toasts.push(ToastKind::Warning, "active driver does not support editing data".to_string());
+                                        continue;
+                                    }
+                                    // Build WHERE from PK (preferred) or all columns.
+                                    // Pull everything we need from immutable borrows,
+                                    // then drop them before opening the confirm modal
+                                    // mutably.
+                                    let delete_plan: Option<(crate::driver::CollectionRef, String)> = (|| {
+                                        let tab = exp.active_tab()?;
+                                        let WorkspaceTab::Table(t) = tab else { return None; };
+                                        let pk_cols: Vec<String> = t
+                                            .column_meta
+                                            .iter()
+                                            .filter(|c| c.is_primary_key)
+                                            .map(|c| c.name.clone())
+                                            .collect();
+                                        let row = t.page.records.get(t.selected_row)?;
+                                        let driver_name = drv.info().name.clone();
+                                        let where_sql = build_where_for_row(
+                                            &t.page.columns,
+                                            row,
+                                            &pk_cols,
+                                            &driver_name,
+                                        )?;
+                                        let q_ns = quote_ident(&t.collection.namespace.0, &driver_name);
+                                        let q_tbl = quote_ident(&t.collection.name, &driver_name);
+                                        let suffix = single_row_suffix(&driver_name);
+                                        let sql = format!(
+                                            "DELETE FROM {q_ns}.{q_tbl} WHERE {where_sql}{suffix};"
+                                        );
+                                        Some((t.collection.clone(), sql))
+                                    })();
+                                    match delete_plan {
+                                        Some((cref, sql)) => {
+                                            exp.sql_confirm_modal = Some(
+                                                crate::ui::screens::explorer::SqlConfirmModalState {
+                                                    collection: cref,
+                                                    sql_query: sql,
+                                                    row_idx: exp
+                                                        .active_tab()
+                                                        .and_then(|t| match t {
+                                                            WorkspaceTab::Table(tt) => Some(tt.selected_row),
+                                                            _ => None,
+                                                        })
+                                                        .unwrap_or(0),
+                                                },
+                                            );
+                                        }
+                                        None => {
+                                            app.toasts.push(
+                                                ToastKind::Error,
+                                                "cannot delete: no row selected or no columns to identify it".to_string(),
+                                            );
+                                        }
+                                    }
+                                }
+                                // `i` → open the INSERT-row modal. All fields start
+                                // in the "skip" state so the user can opt in to
+                                // providing values one column at a time.
+                                KeyCode::Char('i') | KeyCode::Char('I')
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    let can_edit = exp.driver_capabilities.contains(crate::driver::Capabilities::EDIT_DATA);
+                                    if !can_edit {
+                                        app.toasts.push(ToastKind::Warning, "active driver does not support editing data".to_string());
+                                        continue;
+                                    }
+                                    // Snapshot the active table's column metadata.
+                                    let open: Option<crate::ui::screens::explorer::InsertRowModalState> = exp
+                                        .active_tab()
+                                        .and_then(|tab| match tab {
+                                            WorkspaceTab::Table(t) => {
+                                                if t.column_meta.is_empty() {
+                                                    None
+                                                } else {
+                                                    let n = t.column_meta.len();
+                                                    Some(crate::ui::screens::explorer::InsertRowModalState {
+                                                        collection: t.collection.clone(),
+                                                        field_buffers: vec![None; n],
+                                                        column_meta: t.column_meta.clone(),
+                                                        focused_field: 0,
+                                                    })
+                                                }
+                                            }
+                                            _ => None,
+                                        });
+                                    match open {
+                                        Some(m) => {
+                                            exp.insert_row_modal = Some(m);
+                                        }
+                                        None => {
+                                            app.toasts.push(
+                                                ToastKind::Error,
+                                                "no column metadata available for this table".to_string(),
+                                            );
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('c') => {
+                                    let count = exp.tabs.iter().filter(|t| matches!(t, WorkspaceTab::Console(_))).count() + 1;
+                                    let console_title = format!("console_{count}.sql");
+                                    exp.tabs.push(WorkspaceTab::Console(QueryConsole::new(console_title, None)));
+                                    exp.active_tab_index = exp.tabs.len().saturating_sub(1);
+                                    exp.focused_pane = FocusedPane::Workspace;
+                                    app.toasts.push(ToastKind::Info, "opened new SQL console".to_string());
+                                }
+                                KeyCode::Char('n') => {
+                                    if let Some(WorkspaceTab::Table(tab)) = exp.active_tab_mut() {
+                                        let mut next_page = Page::default();
+                                        next_page.offset = (tab.page.page + 1) * tab.page.page_size;
+                                        let drv_clone = drv.clone();
+                                        let cref_clone = tab.collection.clone();
+                                        if let Ok(new_rec_page) = drv_clone.records(&cref_clone, next_page).await {
+                                            if !new_rec_page.records.is_empty() {
+                                                tab.page = new_rec_page;
+                                                tab.selected_row = 0;
+                                            }
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('p') => {
+                                    if let Some(WorkspaceTab::Table(tab)) = exp.active_tab_mut() && tab.page.page > 0 {
+                                        let mut prev_page = Page::default();
+                                        prev_page.offset = (tab.page.page - 1) * tab.page.page_size;
+                                        let drv_clone = drv.clone();
+                                        let cref_clone = tab.collection.clone();
+                                        if let Ok(new_rec_page) = drv_clone.records(&cref_clone, prev_page).await {
+                                            tab.page = new_rec_page;
+                                            tab.selected_row = 0;
+                                        }
+                                    }
+                                }
+                                _ => {
+                                    app.handle_key(key);
+                                }
+                            }
+                        }
+                    } else {
+                        app.handle_key(key);
+                    }
+                }
+            } else {
+                // Test connection 't' key handled with async tokio spawn
+                if !app.help_open && app.form_modal.is_none() && key.code == KeyCode::Char('t') {
+                    if let Some(cfg) = app.config.connections.get(app.selected_connection).cloned() {
+                        app.toasts.push(ToastKind::Info, format!("testing ping to '{}'...", cfg.name));
+                        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Duration, String>>(1);
+                        tokio::spawn(async move {
+                            match crate::driver::connect_driver(&cfg).await {
+                                Ok(driver) => match driver.ping().await {
+                                    Ok(dur) => { let _ = tx.send(Ok(dur)).await; }
+                                    Err(e) => { let _ = tx.send(Err(format!("ping failed: {e:#}"))).await; }
+                                },
+                                Err(e) => { let _ = tx.send(Err(format!("connect failed: {e:#}"))).await; }
+                            }
+                        });
+
+                        match tokio::time::timeout(Duration::from_millis(3000), rx.recv()).await {
+                            Ok(Some(res)) => match res {
+                                Ok(dur) => app.toasts.push(ToastKind::Success, format!("ping ok ({:.2?})", dur)),
+                                Err(err) => app.toasts.push(ToastKind::Error, err),
+                            },
+                            Ok(None) => {
+                                app.toasts.push(ToastKind::Error, "ping task ended unexpectedly".to_string());
+                            }
+                            Err(_) => {
+                                app.toasts.push(ToastKind::Error, "ping timed out (3s)".to_string());
+                            }
+                        }
+                    }
+                } else if !app.help_open && app.form_modal.is_none() && key.code == KeyCode::Enter {
+                    if let Some(cfg) = app.config.connections.get(app.selected_connection).cloned() {
+                        app.connecting = true;
+                        app.toasts.push(ToastKind::Info, format!("connecting to '{}'...", cfg.name));
+                        match crate::driver::connect_driver(&cfg).await {
+                            Ok(drv) => {
+                                let info = drv.info();
+                                let capabilities = drv.capabilities();
+                                let namespaces = drv.namespaces().await.unwrap_or_default();
+                                app.explorer_state = Some(ExplorerState::new(namespaces, capabilities));
+                                app.active_driver = Some(drv);
+                                app.mode = ScreenMode::Connected;
+                                app.toasts.push(ToastKind::Success, format!("connected: {} {}", info.name, info.server_version));
+                            }
+                            Err(e) => {
+                                app.toasts.push(ToastKind::Error, format!("connection failed: {e:#}"));
+                            }
+                        }
+                        app.connecting = false;
+                    }
+                } else {
+                    app.handle_key(key);
+                }
+            }
         }
 
-        // Tick on a wall-clock schedule, not on poll timeout — otherwise an
-        // event flood (key repeat) starves the spinner and toasts.
         if last_tick.elapsed() >= TICK_CAP {
             spinner.tick();
             app.toasts.tick();
+            // Poll form-modal test result non-blockingly. Push toast AND set the
+            // form's last_test_result so the outcome shows inside the modal
+            // (right where the user is editing) — most reliable place to be seen.
+            if let Some(rx) = &mut app.form_test_rx {
+                match rx.try_recv() {
+                    Ok(res) => {
+                        let (success, message) = match res {
+                            Ok(dur) => {
+                                let msg = format!("ping ok ({:.2?})", dur);
+                                app.toasts.push(ToastKind::Success, msg.clone());
+                                (true, msg)
+                            }
+                            Err(err) => {
+                                app.toasts.push(ToastKind::Error, err.clone());
+                                (false, err)
+                            }
+                        };
+                        if let Some(form) = app.form_modal.as_mut() {
+                            form.last_test_result =
+                                Some(crate::ui::screens::picker::TestResult { success, message });
+                        }
+                        app.form_test_rx = None;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                        // Still pending; keep waiting.
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        let msg = "ping task ended unexpectedly".to_string();
+                        app.toasts.push(ToastKind::Error, msg.clone());
+                        if let Some(form) = app.form_modal.as_mut() {
+                            form.last_test_result = Some(crate::ui::screens::picker::TestResult {
+                                success: false,
+                                message: msg,
+                            });
+                        }
+                        app.form_test_rx = None;
+                    }
+                }
+            }
             last_tick = Instant::now();
         }
     }
