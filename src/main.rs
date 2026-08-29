@@ -4,20 +4,57 @@ mod app;
 mod theme;
 mod ui;
 
+use std::io::{self, IsTerminal};
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use clap::Parser;
 
+const EXAMPLES: &str = "\
+Examples:
+  dbx                      # Open connection picker using default config (~/.config/dbx/config.toml)
+  dbx --config ./my.toml   # Use custom config file
+";
+
 #[derive(Parser, Debug)]
-#[command(name = "dbx", version, about = "Terminal database explorer")]
+#[command(
+    name = "dbx",
+    version,
+    about = "Terminal database explorer — DataGrip UX in your terminal",
+    after_help = EXAMPLES
+)]
 struct Cli {
-    /// Path to config file (default: ~/.config/dbx/config.toml)
+    /// Path to config file (default: ~/.config/dbx/config.toml or $XDG_CONFIG_HOME/dbx/config.toml)
     #[arg(long, value_name = "PATH")]
     config: Option<PathBuf>,
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> ExitCode {
+    // 1. Parse CLI arguments first (allows --help and --version to work in pipes/non-TTY)
     let cli = Cli::parse();
-    app::run(cli.config).await
+
+    // 2. TTY check: ensure both stdin and stdout are interactive terminals for TUI execution
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        eprintln!("Error: dbx is an interactive TUI tool and requires a TTY (terminal).");
+        eprintln!("If running via SSH, make sure to allocate a pseudo-terminal (ssh -t ...).");
+        return ExitCode::from(1);
+    }
+
+    // 3. TERM check: reject dumb terminals incapable of ANSI cursor/screen controls
+    if let Ok(term) = std::env::var("TERM")
+        && term == "dumb"
+    {
+        eprintln!("Error: terminal ($TERM=dumb) does not support required cursor/screen capabilities.");
+        return ExitCode::from(1);
+    }
+
+    match app::run(cli.config).await {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("Error: {err:#}");
+            ExitCode::from(1)
+        }
+    }
 }
+

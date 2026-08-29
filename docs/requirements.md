@@ -76,6 +76,13 @@ to [ROADMAP.md](../ROADMAP.md).
 | FR-5.5 | Terminal-too-small notice (min 80×24) | M |
 | FR-5.6 | Light theme | S (M4) |
 | FR-5.7 | Mouse support | C (backlog) |
+| FR-5.8 | TTY check & graceful non-TTY refusal (`is_terminal()`) on stdin/stdout | M |
+| FR-5.9 | `TERM=dumb` detection with clear informative exit | M |
+| FR-5.10 | `NO_COLOR` / `DBX_NO_COLOR` / `--no-color` support with monochrome theme fallback | S (M4) |
+| FR-5.11 | Signal handling (`SIGTERM`, `SIGHUP`, `SIGINT`) restoring terminal on abnormal exit | M |
+| FR-5.12 | Help examples & rich usage instructions in CLI (`after_help`) | M |
+| FR-5.13 | File-only logging via `DBX_LOG=<path>` (zero terminal pollution during TUI) | M |
+| FR-5.14 | Auto crash-log writing on panic (`~/.local/state/dbx/crash.log`) | M |
 
 ---
 
@@ -96,6 +103,8 @@ to [ROADMAP.md](../ROADMAP.md).
 | NFR-11 | Credential hygiene | logs/toasts never contain passwords or full connection strings (host only); config file mode `0600` |
 | NFR-12 | Transaction hygiene | all queries autocommit; never hold a transaction open across UI frames (InnoDB metadata locks block DDL server-wide) |
 | NFR-13 | Connection lifecycle | one pool per connection + one admin conn (for `KILL QUERY`); stale connections detected via `ping`, auto-reconnect; pools closed on tab close |
+| NFR-14 | Exit code contract | `0` = normal exit, `1` = runtime/DB error, `2` = CLI/config usage error |
+| NFR-15 | XDG path precedence | `--config <path>` > `$DBX_CONFIG` > `$XDG_CONFIG_HOME/dbx/` > `~/.config/dbx/` |
 
 ---
 

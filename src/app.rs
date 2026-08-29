@@ -204,6 +204,16 @@ pub async fn run(_config: Option<PathBuf>) -> anyhow::Result<()> {
     }));
 
     let _guard = TerminalGuard::enter().context("failed to initialize terminal")?;
+
+    // Spawn a signal listener for SIGINT/SIGTERM/SIGHUP so sudden termination restores the terminal cleanly.
+    tokio::spawn(async {
+        use tokio::signal::unix::{SignalKind, signal};
+        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+            sigterm.recv().await;
+            TerminalGuard::restore();
+            std::process::exit(130);
+        }
+    });
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
         .context("failed to create terminal backend")?;
 

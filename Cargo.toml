@@ -9,7 +9,7 @@ repository = "https://github.com/go-routine-id/dbx"
 [dependencies]
 ratatui = "0.30.2"
 crossterm = "0.29.0"
-tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "time", "signal"] }
 clap = { version = "4.6", features = ["derive"] }
 anyhow = "1.0"
 flowmaid = "0.25"
