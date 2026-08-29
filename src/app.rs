@@ -16,10 +16,44 @@
 //! empty-state + a live spinner ("Connecting... (demo)"), status bar with the
 //! demo hints, toasts overlay, help popup when open.
 
+use std::io::{self};
 use std::path::PathBuf;
+use std::time::Duration;
+
+use anyhow::Context;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::execute;
+use crossterm::terminal::{
+    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Alignment, Rect};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Paragraph};
 
 use crate::theme::Theme;
-use crate::ui::widgets::toast::Toasts;
+use crate::ui::layout::{self, MIN_HEIGHT, MIN_WIDTH};
+use crate::ui::widgets::{empty, help, spinner::Spinner, statusbar, toast::ToastKind, toast::Toasts};
+
+/// How long the event poll waits before a tick fires (spinner/toast cadence).
+const TICK_CAP: Duration = Duration::from_millis(60);
+
+const STATUS_HINTS: [(&str, &str); 3] = [("q", "quit"), ("?", "help"), ("t", "toast")];
+
+const HELP_BINDINGS: [(&str, &str); 4] = [
+    ("q", "quit"),
+    ("?", "toggle help"),
+    ("t", "push demo toast"),
+    ("Esc", "close help"),
+];
+
+const TOAST_KINDS: [ToastKind; 4] = [
+    ToastKind::Success,
+    ToastKind::Warning,
+    ToastKind::Error,
+    ToastKind::Info,
+];
 
 pub struct App {
     theme: Theme,
@@ -30,7 +64,90 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        todo!("app-runtime agent")
+        Self {
+            theme: Theme::dark(),
+            toasts: Toasts::default(),
+            help_open: false,
+            should_quit: false,
+        }
+    }
+
+    fn handle_key(&mut self, code: KeyCode, toast_counter: &mut u64) {
+        match code {
+            KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('?') => self.help_open = !self.help_open,
+            KeyCode::Esc if self.help_open => self.help_open = false,
+            KeyCode::Char('t') => {
+                *toast_counter += 1;
+                let kind = TOAST_KINDS[(*toast_counter as usize - 1) % TOAST_KINDS.len()];
+                self.toasts
+                    .push(kind, format!("demo toast #{}", *toast_counter));
+            }
+            _ => {}
+        }
+    }
+
+    fn draw(&self, f: &mut ratatui::Frame, spinner: &Spinner) {
+        let area = f.area();
+        let theme = &self.theme;
+
+        // Paint the whole frame with the base background first.
+        f.render_widget(Block::default().style(theme.base()), area);
+
+        if layout::too_small(area) {
+            let notice = format!(
+                "terminal too small (min {MIN_WIDTH}x{MIN_HEIGHT}), resize to continue"
+            );
+            let line_area = Rect {
+                x: area.x,
+                y: area.y + area.height / 2,
+                width: area.width,
+                height: 1,
+            };
+            f.render_widget(
+                Paragraph::new(notice)
+                    .style(theme.dim())
+                    .alignment(Alignment::Center),
+                line_area,
+            );
+            return;
+        }
+
+        let layout = layout::compute(area);
+
+        // Header: accent logo + dim version.
+        let header = Line::from(vec![
+            Span::styled("◆ dbx", theme.accent()),
+            Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), theme.dim()),
+        ]);
+        f.render_widget(Paragraph::new(header).style(theme.base()), layout.header);
+
+        // Body: live spinner on the first body line, empty state below it.
+        let spinner_area = Rect {
+            height: 1,
+            ..layout.body
+        };
+        spinner.render(f, spinner_area, "Connecting... (demo)", theme);
+        let empty_area = Rect {
+            y: layout.body.y.saturating_add(1),
+            height: layout.body.height.saturating_sub(1),
+            ..layout.body
+        };
+        empty::render(
+            f,
+            empty_area,
+            "no database connected",
+            Some("press ? for help · t for a demo toast"),
+            theme,
+        );
+
+        statusbar::render(f, layout.status, "dbx demo", &STATUS_HINTS, theme);
+
+        // Overlays last, so they draw on top.
+        self.toasts.render(f, area, theme);
+        if self.help_open {
+            help::render(f, area, "demo", &HELP_BINDINGS, theme);
+        }
     }
 }
 
@@ -40,6 +157,63 @@ impl Default for App {
     }
 }
 
+/// Restores the terminal on drop so every exit path (normal, error, panic
+/// unwinding) leaves the shell usable.
+struct TerminalGuard;
+
+impl TerminalGuard {
+    fn enter() -> io::Result<Self> {
+        enable_raw_mode()?;
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        Ok(Self)
+    }
+
+    fn restore() {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        Self::restore();
+    }
+}
+
 pub async fn run(_config: Option<PathBuf>) -> anyhow::Result<()> {
-    todo!("app-runtime agent")
+    // Panic hook FIRST: restore the terminal before the default panic output,
+    // so a panic never leaves the user's shell in raw mode.
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        TerminalGuard::restore();
+        default_hook(info);
+    }));
+
+    let _guard = TerminalGuard::enter().context("failed to initialize terminal")?;
+    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
+        .context("failed to create terminal backend")?;
+
+    let mut app = App::new();
+    let mut spinner = Spinner::new();
+    let mut toast_counter: u64 = 0;
+
+    while !app.should_quit {
+        terminal
+            .draw(|f| app.draw(f, &spinner))
+            .context("failed to draw frame")?;
+
+        // Sync crossterm polling with a tick cap: a poll timeout is a tick.
+        if event::poll(TICK_CAP).context("failed to poll terminal events")? {
+            if let Event::Key(key) = event::read().context("failed to read terminal event")? {
+                if key.kind == KeyEventKind::Press {
+                    app.handle_key(key.code, &mut toast_counter);
+                }
+            }
+        } else {
+            spinner.tick();
+            app.toasts.tick();
+        }
+    }
+
+    Ok(())
 }
