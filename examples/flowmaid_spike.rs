@@ -78,6 +78,7 @@ use ratatui::widgets::canvas::{Canvas, Circle, Line as CanvasLine};
 use ratatui::widgets::{Block, BorderType, Paragraph, Widget};
 use std::io;
 use std::time::Duration;
+use unicode_width::UnicodeWidthStr;
 
 /// Smallest terminal the painter accepts (cols x rows).
 const MIN_W: u16 = 60;
@@ -206,9 +207,11 @@ fn run(terminal: &mut ratatui::DefaultTerminal, scene: &ErScene) -> io::Result<(
             KeyCode::Char('0') => view = View::default(),
             _ => continue,
         }
-        // Allow a little overscroll past the origin for edge breathing room.
-        view.ox = view.ox.max(-2.0 * PX_PER_COL);
-        view.oy = view.oy.max(-2.0 * PX_PER_ROW);
+        // Clamp panning: a little overscroll past the origin for edge
+        // breathing room, and never past the diagram's far edge (otherwise
+        // the diagram can be panned off-screen forever).
+        view.ox = view.ox.clamp(-2.0 * PX_PER_COL, scene.scene.width);
+        view.oy = view.oy.clamp(-2.0 * PX_PER_ROW, scene.scene.height);
     }
 }
 
@@ -394,12 +397,15 @@ fn draw_tables(buf: &mut Buffer, scene: &ErScene, area: Rect, vx: f64, vy: f64) 
 /// cardinalities as text ("1", "0..1", "0..N", "1..N") just off each edge
 /// endpoint — terminal users read text faster than mini-glyphs.
 fn draw_edge_text(buf: &mut Buffer, scene: &ErScene, area: Rect, vx: f64, vy: f64) {
-    let label_style = Style::default().fg(Color::Cyan).bg(Color::Black);
+    // No explicit bg: a hardcoded background paints a halo on non-black
+    // terminals.
+    let label_style = Style::default().fg(Color::Cyan);
     let card_style = Style::default().fg(Color::DarkGray);
 
     for (j, edge) in scene.scene.edges.iter().enumerate() {
         if let Some((text, (cx, cy), _w)) = &edge.label {
-            let col = ((cx - vx) / PX_PER_COL - text.len() as f64 / 2.0).round() as i32;
+            let text_w = UnicodeWidthStr::width(text.as_str()) as f64;
+            let col = ((cx - vx) / PX_PER_COL - text_w / 2.0).round() as i32;
             let row = ((cy - vy) / PX_PER_ROW).round() as i32;
             put(buf, area, col, row, text, label_style);
         }

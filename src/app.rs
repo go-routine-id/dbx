@@ -18,10 +18,10 @@
 
 use std::io::{self};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -72,8 +72,18 @@ impl App {
         }
     }
 
-    fn handle_key(&mut self, code: KeyCode, toast_counter: &mut u64) {
-        match code {
+    fn handle_key(&mut self, key: KeyEvent, toast_counter: &mut u64) {
+        // Universal exit: in raw mode Ctrl+C arrives as a key event, not SIGINT.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+            self.should_quit = true;
+            return;
+        }
+        // Plain bindings only — don't fire on Ctrl/Alt-modified chars.
+        // (SHIFT allowed so `?`, which needs shift on most layouts, works.)
+        if !(key.modifiers.is_empty() || key.modifiers == KeyModifiers::SHIFT) {
+            return;
+        }
+        match key.code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('?') => self.help_open = !self.help_open,
             KeyCode::Esc if self.help_open => self.help_open = false,
@@ -164,8 +174,12 @@ struct TerminalGuard;
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
+        // Construct the guard BEFORE the fallible alt-screen enter: if it
+        // fails, Drop still runs and undoes raw mode. LeaveAlternateScreen on
+        // a never-entered alternate screen is a harmless no-op escape.
+        let guard = Self;
         execute!(io::stdout(), EnterAlternateScreen)?;
-        Ok(Self)
+        Ok(guard)
     }
 
     fn restore() {
@@ -197,21 +211,27 @@ pub async fn run(_config: Option<PathBuf>) -> anyhow::Result<()> {
     let mut spinner = Spinner::new();
     let mut toast_counter: u64 = 0;
 
+    let mut last_tick = Instant::now();
+
     while !app.should_quit {
         terminal
             .draw(|f| app.draw(f, &spinner))
             .context("failed to draw frame")?;
 
-        // Sync crossterm polling with a tick cap: a poll timeout is a tick.
-        if event::poll(TICK_CAP).context("failed to poll terminal events")? {
-            if let Event::Key(key) = event::read().context("failed to read terminal event")? {
-                if key.kind == KeyEventKind::Press {
-                    app.handle_key(key.code, &mut toast_counter);
-                }
-            }
-        } else {
+        // Sync crossterm polling with a tick cap.
+        if event::poll(TICK_CAP).context("failed to poll terminal events")?
+            && let Event::Key(key) = event::read().context("failed to read terminal event")?
+            && key.kind == KeyEventKind::Press
+        {
+            app.handle_key(key, &mut toast_counter);
+        }
+
+        // Tick on a wall-clock schedule, not on poll timeout — otherwise an
+        // event flood (key repeat) starves the spinner and toasts.
+        if last_tick.elapsed() >= TICK_CAP {
             spinner.tick();
             app.toasts.tick();
+            last_tick = Instant::now();
         }
     }
 
