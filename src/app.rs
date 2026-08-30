@@ -2884,11 +2884,26 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
     let _guard = TerminalGuard::enter().context("failed to initialize terminal")?;
 
     tokio::spawn(async {
-        use tokio::signal::unix::{SignalKind, signal};
-        if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
-            sigterm.recv().await;
-            TerminalGuard::restore();
-            std::process::exit(130);
+        // Graceful shutdown on termination: restore the terminal (raw mode +
+        // alternate screen) before exiting so the user isn't left with a
+        // broken shell. Unix listens for SIGTERM (Ctrl+C already arrives as a
+        // key event in raw mode); Windows has no SIGTERM, so it listens for
+        // Ctrl+C instead.
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{SignalKind, signal};
+            if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
+                sigterm.recv().await;
+                TerminalGuard::restore();
+                std::process::exit(130);
+            }
+        }
+        #[cfg(windows)]
+        {
+            if tokio::signal::ctrl_c().await.is_ok() {
+                TerminalGuard::restore();
+                std::process::exit(130);
+            }
         }
     });
 
