@@ -20,11 +20,11 @@ Prebuilt binaries ship on every [release](https://github.com/go-routine-id/dbx/r
 
 ```bash
 # Apple Silicon (M1/M2/M3)
-curl -L -o dbx https://github.com/go-routine-id/dbx/releases/download/v0.1.0/dbx-macos-arm64
+curl -L -o dbx https://github.com/go-routine-id/dbx/releases/latest/download/dbx-macos-arm64
 chmod +x dbx && sudo mv dbx /usr/local/bin/
 
 # Intel
-curl -L -o dbx https://github.com/go-routine-id/dbx/releases/download/v0.1.0/dbx-macos-x86_64
+curl -L -o dbx https://github.com/go-routine-id/dbx/releases/latest/download/dbx-macos-x86_64
 chmod +x dbx && sudo mv dbx /usr/local/bin/
 ```
 
@@ -33,7 +33,7 @@ Gatekeeper may block the unsigned binary — allow it with `xattr -d com.apple.q
 ### Linux (x86_64)
 
 ```bash
-curl -L -o dbx https://github.com/go-routine-id/dbx/releases/download/v0.1.0/dbx-linux-x86_64
+curl -L -o dbx https://github.com/go-routine-id/dbx/releases/latest/download/dbx-linux-x86_64
 chmod +x dbx && sudo mv dbx /usr/local/bin/
 ```
 
