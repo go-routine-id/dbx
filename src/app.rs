@@ -739,6 +739,16 @@ pub struct App {
     active_connection: Option<crate::config::ConnectionConfig>,
     /// Picker-pane area from the last draw — maps a mouse click to a connection.
     picker_hit_area: Option<Rect>,
+    /// In-flight ERD drag-to-pan state (mouse gesture).
+    erd_drag: Option<ErdDrag>,
+}
+
+/// Mouse drag state for panning the ERD view.
+#[derive(Clone, Copy, Debug, Default)]
+struct ErdDrag {
+    last_x: u16,
+    last_y: u16,
+    moved: bool,
 }
 
 impl App {
@@ -761,6 +771,7 @@ impl App {
             active_connection_name: None,
             active_connection: None,
             picker_hit_area: None,
+            erd_drag: None,
         }
     }
 
@@ -861,11 +872,82 @@ impl App {
                                 focus_workspace = true;
                             }
                         }
-                        WorkspaceTab::Erd(_) => {}
+                        // Figma-like: scroll wheel zooms the ERD.
+                        WorkspaceTab::Erd(erd) => {
+                            if let Some(area) = erd.last_canvas_area
+                                && mouse.column >= area.x
+                                && mouse.column < area.x + area.width
+                                && mouse.row >= area.y
+                                && mouse.row < area.y + area.height
+                            {
+                                if up {
+                                    erd.zoom_in();
+                                } else {
+                                    erd.zoom_out();
+                                }
+                            }
+                        }
                     }
                 }
                 if focus_workspace {
                     exp.focused_pane = FocusedPane::Workspace;
+                }
+            }
+            return Ok(());
+        }
+
+        // Figma-like mouse: drag pans the ERD, release after a click opens DDL.
+        if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) {
+            if let Some(drag) = self.erd_drag {
+                let dx = i32::from(mouse.column) - i32::from(drag.last_x);
+                let dy = i32::from(mouse.row) - i32::from(drag.last_y);
+                self.erd_drag = Some(ErdDrag {
+                    last_x: mouse.column,
+                    last_y: mouse.row,
+                    moved: true,
+                });
+                if let Some(exp) = &mut self.explorer_state
+                    && let Some(WorkspaceTab::Erd(erd)) = exp.active_tab_mut()
+                {
+                    erd.pan_by_cells(dx, dy);
+                }
+            }
+            return Ok(());
+        }
+
+        if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            let was_click = self
+                .erd_drag
+                .as_ref()
+                .map(|d| !d.moved)
+                .unwrap_or(false);
+            self.erd_drag = None;
+            if was_click {
+                // A click (press + release without drag) on an ERD node opens
+                // its DDL — same as the old press-to-open behaviour.
+                let (Some(drv), Some(exp)) = (&self.active_driver, &mut self.explorer_state)
+                else {
+                    return Ok(());
+                };
+                if let Some(WorkspaceTab::Erd(erd)) = exp.active_tab_mut() {
+                    let Some(idx) = erd.node_at_mouse(mouse.column, mouse.row) else {
+                        return Ok(());
+                    };
+                    erd.selected_node = Some(idx);
+                    let cref = {
+                        let Some(scene) = &erd.scene else { return Ok(()) };
+                        let node = &scene.scene.nodes[idx];
+                        crate::driver::CollectionRef {
+                            namespace: erd.namespace.clone(),
+                            name: node.id.clone(),
+                        }
+                    };
+                    match drv.definition(&cref).await {
+                        Ok(ddl) => exp.ddl_popup = Some((cref, ddl)),
+                        Err(e) => self
+                            .toasts
+                            .push(ToastKind::Error, format!("failed to fetch DDL: {e:#}")),
+                    }
                 }
             }
             return Ok(());
@@ -888,7 +970,7 @@ impl App {
             return Ok(());
         }
 
-        let (Some(drv), Some(exp)) = (&self.active_driver, &mut self.explorer_state) else {
+        let (Some(_drv), Some(exp)) = (&self.active_driver, &mut self.explorer_state) else {
             return Ok(());
         };
         // An overlay modal owns the click — don't let it fall through to the
@@ -1024,28 +1106,15 @@ impl App {
                 }
             }
             WorkspaceTab::Erd(erd) => {
-                let Some(idx) = erd.node_at_mouse(mouse.column, mouse.row) else {
-                    return Ok(());
-                };
-                erd.selected_node = Some(idx);
-                let cref = {
-                    let Some(scene) = &erd.scene else { return Ok(()) };
-                    let node = &scene.scene.nodes[idx];
-                    crate::driver::CollectionRef {
-                        namespace: erd.namespace.clone(),
-                        name: node.id.clone(),
-                    }
-                };
-                // Borrow of `erd` ends here; NLL lets us touch `exp` again.
-                match drv.definition(&cref).await {
-                    Ok(ddl) => {
-                        exp.ddl_popup = Some((cref, ddl));
-                    }
-                    Err(e) => {
-                        self.toasts
-                            .push(ToastKind::Error, format!("failed to fetch DDL: {e:#}"));
-                    }
-                }
+                // Press on the ERD starts a potential drag-to-pan; DDL opens
+                // on release if no drag occurred (handled in the Up branch).
+                let _ = erd.last_canvas_area;
+                self.erd_drag = Some(ErdDrag {
+                    last_x: mouse.column,
+                    last_y: mouse.row,
+                    moved: false,
+                });
+                return Ok(());
             }
         }
         if focus_workspace {
@@ -1783,6 +1852,27 @@ impl App {
                                 exp.selected_tree_index += 1;
                             }
                         }
+                        // Fn+Up/Down (PageUp/PageDown) scroll one viewport.
+                        KeyCode::PageDown => {
+                            if !exp.tree_nodes.is_empty() {
+                                let page_rows = exp
+                                    .tree_hit_area
+                                    .map(|r| (r.height as usize).saturating_sub(1))
+                                    .unwrap_or(10)
+                                    .max(1);
+                                exp.selected_tree_index = (exp.selected_tree_index + page_rows)
+                                    .min(exp.tree_nodes.len() - 1);
+                            }
+                        }
+                        KeyCode::PageUp => {
+                            let page_rows = exp
+                                .tree_hit_area
+                                .map(|r| (r.height as usize).saturating_sub(1))
+                                .unwrap_or(10)
+                                .max(1);
+                            exp.selected_tree_index =
+                                exp.selected_tree_index.saturating_sub(page_rows);
+                        }
                         _ => {}
                     },
                     FocusedPane::Workspace => {
@@ -1892,6 +1982,28 @@ impl App {
                                         if !t.page.records.is_empty() && t.selected_row < t.page.records.len() - 1 {
                                             t.selected_row += 1;
                                         }
+                                    }
+                                    // PageUp/PageDown scroll one viewport (rows visible
+                                    // in the grid) at a time.
+                                    KeyCode::PageDown => {
+                                        if !t.page.records.is_empty() {
+                                            let page_rows = t
+                                                .grid_hit_area
+                                                .map(|r| (r.height as usize).saturating_sub(2))
+                                                .unwrap_or(10)
+                                                .max(1);
+                                            t.selected_row =
+                                                (t.selected_row + page_rows)
+                                                    .min(t.page.records.len() - 1);
+                                        }
+                                    }
+                                    KeyCode::PageUp => {
+                                        let page_rows = t
+                                            .grid_hit_area
+                                            .map(|r| (r.height as usize).saturating_sub(2))
+                                            .unwrap_or(10)
+                                            .max(1);
+                                        t.selected_row = t.selected_row.saturating_sub(page_rows);
                                     }
                                     KeyCode::Left | KeyCode::Char('h') => {
                                         if t.selected_col > 0 {
@@ -2184,6 +2296,31 @@ impl App {
                                                     c.result_selected_row += 1;
                                                 }
                                             }
+                                        }
+                                        // Fn+Up/Down (PageUp/PageDown) scroll one viewport.
+                                        KeyCode::PageDown => {
+                                            if let Some(res) = &c.last_result
+                                                && !res.records.is_empty()
+                                            {
+                                                let page_rows = c
+                                                    .result_hit_area
+                                                    .map(|r| (r.height as usize).saturating_sub(2))
+                                                    .unwrap_or(10)
+                                                    .max(1);
+                                                c.result_selected_row = (c.result_selected_row
+                                                    + page_rows)
+                                                    .min(res.records.len() - 1);
+                                            }
+                                        }
+                                        KeyCode::PageUp => {
+                                            let page_rows = c
+                                                .result_hit_area
+                                                .map(|r| (r.height as usize).saturating_sub(2))
+                                                .unwrap_or(10)
+                                                .max(1);
+                                            c.result_selected_row = c
+                                                .result_selected_row
+                                                .saturating_sub(page_rows);
                                         }
                                         KeyCode::Left | KeyCode::Char('h') => {
                                             if c.result_selected_col > 0 {

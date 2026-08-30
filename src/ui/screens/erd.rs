@@ -201,6 +201,15 @@ impl ErdTab {
         self.view = View::default();
     }
 
+    /// Pan by a delta in terminal cells (mouse drag). Dragging down/right moves
+    /// the content with the cursor (view offset opposite to the drag).
+    pub fn pan_by_cells(&mut self, dx: i32, dy: i32) {
+        let dcol = f64::from(dx) * self.view.px_col();
+        let drow = f64::from(dy) * self.view.px_row();
+        self.view.ox -= dcol;
+        self.view.oy += drow;
+    }
+
     /// Zoom in toward the current view origin (clamped to a sane range).
     pub fn zoom_in(&mut self) {
         self.view.zoom = (self.view.zoom * 1.25).min(3.0);
