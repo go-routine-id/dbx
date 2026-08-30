@@ -445,12 +445,16 @@ const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-const EXPLORER_HELP_BINDINGS: [(&str, &str); 22] = [
+const EXPLORER_HELP_BINDINGS: [(&str, &str); 26] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
     ("Ctrl+T", "search all objects / jump to a table"),
     ("Ctrl+Enter / F5", "execute SQL query in active console"),
+    ("Alt+H", "open query history for this connection"),
+    ("Alt+F", "open saved favorite queries"),
+    ("Ctrl+S", "save current query as favorite"),
+    ("Ctrl+F", "pretty-print SQL in the editor"),
     ("j / Down", "move cursor / selection down"),
     ("k / Up", "move cursor / selection up"),
     ("h / Left", "move cursor / column selection left"),
@@ -500,6 +504,8 @@ pub struct App {
     active_driver: Option<Arc<dyn Driver>>,
     explorer_state: Option<ExplorerState>,
     connecting: bool,
+    /// Name of the connection currently connected — key for query history.
+    active_connection_name: Option<String>,
 }
 
 impl App {
@@ -519,6 +525,7 @@ impl App {
             active_driver: None,
             explorer_state: None,
             connecting: false,
+            active_connection_name: None,
         }
     }
 
@@ -1206,7 +1213,33 @@ impl App {
                                 }
                                     }
                                 },
-                                WorkspaceTab::Console(c) => match c.focused_subpane {
+                                WorkspaceTab::Console(c) => {
+                                    // History / favorites picker owns all keys.
+                                    if let Some(popup) = &mut c.popup {
+                                        match key.code {
+                                            KeyCode::Esc => c.popup = None,
+                                            KeyCode::Up | KeyCode::Char('k') => {
+                                                popup.selected = popup.selected.saturating_sub(1);
+                                            }
+                                            KeyCode::Down | KeyCode::Char('j') => {
+                                                popup.selected = (popup.selected + 1)
+                                                    .min(popup.items.len().saturating_sub(1));
+                                            }
+                                            KeyCode::Enter => {
+                                                let payload = popup
+                                                    .items
+                                                    .get(popup.selected)
+                                                    .map(|(_, p)| p.clone());
+                                                c.popup = None;
+                                                if let Some(sql) = payload {
+                                                    c.set_text(sql);
+                                                }
+                                            }
+                                            _ => {}
+                                        }
+                                        return;
+                                    }
+                                    match c.focused_subpane {
                                     ConsoleSubpane::Editor => match key.code {
                                         KeyCode::Up => c.move_cursor_up(),
                                         KeyCode::Down => c.move_cursor_down(),
@@ -1214,6 +1247,71 @@ impl App {
                                         KeyCode::Right => c.move_cursor_right(),
                                         KeyCode::Backspace => c.backspace(),
                                         KeyCode::Enter => c.insert_newline(),
+                                        // Alt+H: open this connection's query history.
+                                        // (Not Ctrl+H — on many terminals Ctrl+H is the
+                                        // Backspace erase byte, so it must stay free.)
+                                        KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::ALT) => {
+                                            let conn = self.active_connection_name.clone().unwrap_or_default();
+                                            let items = self
+                                                .config
+                                                .query_history
+                                                .get(&conn)
+                                                .cloned()
+                                                .unwrap_or_default()
+                                                .into_iter()
+                                                .map(|q| (q.clone(), q))
+                                                .collect();
+                                            c.popup = Some(crate::ui::screens::query::ConsolePopup {
+                                                title: format!("Query History ({conn})"),
+                                                items,
+                                                selected: 0,
+                                            });
+                                        }
+                                        // Alt+F: open saved favorite queries.
+                                        // (Ctrl+Shift+F is unreliable: crossterm drops
+                                        // the SHIFT modifier on most terminals.)
+                                        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
+                                            c.popup = Some(crate::ui::screens::query::ConsolePopup {
+                                                title: "Saved Queries".to_string(),
+                                                items: self.config.favorites.clone(),
+                                                selected: 0,
+                                            });
+                                        }
+                                        // Ctrl+S: save the current query as a favorite.
+                                        KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                            let sql = c.text();
+                                            let name = c
+                                                .lines
+                                                .first()
+                                                .cloned()
+                                                .unwrap_or_default()
+                                                .trim()
+                                                .to_string();
+                                            let base = if name.is_empty() {
+                                                "untitled".to_string()
+                                            } else {
+                                                name
+                                            };
+                                            // Disambiguate duplicates so a later favorite
+                                            // never silently overwrites an earlier one.
+                                            let mut name = base.clone();
+                                            let mut i = 2;
+                                            while self.config.favorites.iter().any(|(n, _)| n == &name) {
+                                                name = format!("{base} ({i})");
+                                                i += 1;
+                                            }
+                                            self.config.favorites.push((name.clone(), sql));
+                                            match self.config.save(&self.config_path) {
+                                                Ok(_) => self.toasts.push(
+                                                    ToastKind::Success,
+                                                    format!("saved favorite '{name}'"),
+                                                ),
+                                                Err(e) => self.toasts.push(
+                                                    ToastKind::Error,
+                                                    format!("failed to save favorite: {e:#}"),
+                                                ),
+                                            }
+                                        }
                                         // Ctrl+F: pretty-print the SQL.
                                         KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                             let formatted = crate::ui::screens::query::format_sql(&c.text());
@@ -1305,6 +1403,7 @@ impl App {
                                         }
                                         _ => {}
                                     },
+                                    }
                                 },
                                 WorkspaceTab::Erd(e) => match key.code {
                                     KeyCode::Up | KeyCode::Char('k') => e.scroll_up(),
@@ -1988,6 +2087,11 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                         ToastKind::Success,
                                         format!("executed successfully (rows affected: {})", res.rows_affected),
                                     );
+                                    // Confirmed statements (destructive guard / row
+                                    // delete) count as history too.
+                                    if let Some(conn) = &app.active_connection_name {
+                                        app.config.push_history(conn, &sql);
+                                    }
                                     exp.sql_confirm_modal = None;
 
                                     // Refresh active table tab
@@ -2357,7 +2461,15 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         let is_ctrl_enter = key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Enter;
                         let is_f5 = key.code == KeyCode::F(5);
 
-                        if is_ctrl_enter || is_f5 {
+                        // Don't run the query under a history/favorites popup —
+                        // Ctrl+Enter is muscle memory for "run" but the popup
+                        // owns the keystroke until Esc/Enter dismisses it.
+                        if (is_ctrl_enter || is_f5)
+                            && exp.active_tab().is_some_and(|t| match t {
+                                WorkspaceTab::Console(c) => c.popup.is_none(),
+                                _ => true,
+                            })
+                        {
                             // Find active database from selected tree node or fallback to first namespace
                             let active_ns = if let Some(node) = exp.selected_node() {
                                 match &node.kind {
@@ -2415,6 +2527,13 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                         console.execution_error = None;
                                         console.result_selected_row = 0;
                                         console.result_selected_col = 0;
+                                        // Record to this connection's query history.
+                                        // Not persisted per-query (re-serializing the
+                                        // whole config on every run is too costly);
+                                        // saved once when the app exits.
+                                        if let Some(conn) = &app.active_connection_name {
+                                            app.config.push_history(conn, &query_text);
+                                        }
                                         app.toasts.push(ToastKind::Success, "query executed".to_string());
                                     }
                                     Err(e) => {
@@ -2636,6 +2755,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 let namespaces = drv.namespaces().await.unwrap_or_default();
                                 app.explorer_state = Some(ExplorerState::new(namespaces, capabilities));
                                 app.active_driver = Some(drv);
+                                app.active_connection_name = Some(cfg.name.clone());
                                 app.mode = ScreenMode::Connected;
                                 app.toasts.push(ToastKind::Success, format!("connected: {} {}", info.name, info.server_version));
                             }
@@ -2701,6 +2821,11 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
             }
             last_tick = Instant::now();
         }
+    }
+
+    // Persist query history / favorites accumulated during the session.
+    if let Err(e) = app.config.save(&app.config_path) {
+        eprintln!("warning: failed to save config on exit: {e:#}");
     }
 
     Ok(())

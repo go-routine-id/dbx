@@ -105,6 +105,27 @@ pub struct AppConfig {
     /// to [`DEFAULT_PAGE_SIZE`].
     #[serde(default = "default_page_size")]
     pub page_size: u64,
+    /// Saved query favorites: `(name, sql)`.
+    #[serde(default)]
+    pub favorites: Vec<(String, String)>,
+    /// Last executed queries per connection name (most recent first).
+    #[serde(default)]
+    pub query_history: HashMap<String, Vec<String>>,
+}
+
+impl AppConfig {
+    /// Record a successfully-executed query in `conn`'s history (dedup, cap).
+    pub fn push_history(&mut self, conn: &str, query: &str) {
+        let q = query.trim();
+        if q.is_empty() {
+            return;
+        }
+        let history = self.query_history.entry(conn.to_string()).or_default();
+        // Most recent first; drop the previous occurrence of the same query.
+        history.retain(|h| h != q);
+        history.insert(0, q.to_string());
+        history.truncate(50);
+    }
 }
 
 impl AppConfig {
@@ -189,5 +210,29 @@ impl AppConfig {
             .with_context(|| format!("failed to atomically replace config at {}", path.display()))?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_push_history_dedup_and_cap() {
+        let mut cfg = AppConfig::default();
+        cfg.push_history("dev", "SELECT 1");
+        cfg.push_history("dev", "SELECT 2");
+        cfg.push_history("dev", "SELECT 1"); // moves to front, dedups
+        let h = cfg.query_history.get("dev").unwrap();
+        assert_eq!(h, &vec!["SELECT 1".to_string(), "SELECT 2".to_string()]);
+
+        // Empty queries are ignored.
+        cfg.push_history("dev", "   ");
+        assert_eq!(cfg.query_history.get("dev").unwrap().len(), 2);
+
+        // Different connections are isolated.
+        cfg.push_history("prod", "SELECT * FROM big");
+        assert_eq!(cfg.query_history.get("prod").unwrap().len(), 1);
+        assert_eq!(cfg.query_history.get("dev").unwrap().len(), 2);
     }
 }

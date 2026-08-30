@@ -6,7 +6,7 @@ use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, BorderType, Borders, Cell, Paragraph, Row as TableRow, Table, TableState,
+    Block, BorderType, Borders, Cell, Clear, Paragraph, Row as TableRow, Table, TableState,
 };
 
 use crate::driver::QueryResult;
@@ -37,12 +37,25 @@ pub struct QueryConsole {
     pub result_selected_col: usize,
     pub result_scroll_x: usize,
     pub focused_subpane: ConsoleSubpane,
+    /// Optional picker overlay (query history / saved favorites). When set,
+    /// the console routes Up/Down/Enter/Esc to it.
+    pub popup: Option<ConsolePopup>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsoleSubpane {
     Editor,
     Result,
+}
+
+/// A simple picker shown over the console: `items` are `(label, payload)`
+/// — for history both are the query text; for favorites label = name,
+/// payload = SQL. Enter loads `payload` into the editor.
+#[derive(Clone, Debug)]
+pub struct ConsolePopup {
+    pub title: String,
+    pub items: Vec<(String, String)>,
+    pub selected: usize,
 }
 
 impl QueryConsole {
@@ -73,6 +86,7 @@ impl QueryConsole {
             result_selected_col: 0,
             result_scroll_x: 0,
             focused_subpane: ConsoleSubpane::Editor,
+            popup: None,
         }
     }
 
@@ -198,27 +212,57 @@ impl QueryConsole {
 }
 
 /// Pretty-print a SQL statement: each main clause keyword starts a new line.
-/// Deliberately minimal (no parser) — it just breaks on clause starters so a
-/// long query becomes scannable. Joined as a single string via `\n`.
+/// Deliberately minimal (no parser) — but it DOES respect string literals so
+/// a `'a FROM b'` value isn't split, and matches keywords exactly (so
+/// `SELECTED` / `GROUP_CONCAT` aren't mistaken for clauses).
 pub fn format_sql(sql: &str) -> String {
     const CLAUSE_STARTS: &[&str] = &[
         "SELECT", "FROM", "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "UNION",
         "ON", "VALUES", "SET", "INTO",
     ];
+
+    // Tokenize word-by-word, keeping quoted literals as a single token so a
+    // clause keyword inside a string never triggers a line break.
     let mut out = String::new();
-    for token in sql.split_whitespace() {
-        let upper = token.to_uppercase();
-        let is_clause = CLAUSE_STARTS.iter().any(|k| upper == *k || upper.starts_with(k));
-        if is_clause && !out.is_empty() && !out.ends_with('\n') {
-            while out.ends_with(' ') {
-                out.pop();
+    let mut token = String::new();
+    let mut in_string: Option<char> = None;
+    for ch in sql.chars() {
+        if let Some(quote) = in_string {
+            token.push(ch);
+            if ch == quote {
+                in_string = None;
             }
-            out.push('\n');
+            continue;
         }
-        out.push_str(token);
-        out.push(' ');
+        if ch == '\'' || ch == '"' {
+            token.push(ch);
+            in_string = Some(ch);
+            continue;
+        }
+        if ch.is_whitespace() {
+            flush_sql_token(&mut token, &mut out, &CLAUSE_STARTS);
+            continue;
+        }
+        token.push(ch);
     }
+    flush_sql_token(&mut token, &mut out, &CLAUSE_STARTS);
     out.trim_end().to_string()
+}
+
+fn flush_sql_token(token: &mut String, out: &mut String, clauses: &[&str]) {
+    if token.is_empty() {
+        return;
+    }
+    let is_literal = token.starts_with('\'') || token.starts_with('"');
+    if !is_literal && clauses.contains(&token.to_uppercase().as_str()) && !out.is_empty() {
+        while out.ends_with(' ') {
+            out.pop();
+        }
+        out.push('\n');
+    }
+    out.push_str(token);
+    out.push(' ');
+    token.clear();
 }
 
 /// Tokenizes a single SQL line and returns highlighted Spans (owned Strings).
@@ -315,6 +359,62 @@ pub fn render_query_console(
 
     render_editor(f, chunks[0], console, is_tab_focused, theme);
     render_result(f, chunks[1], console, is_tab_focused, theme);
+
+    if let Some(popup) = &console.popup {
+        render_console_popup(f, area, popup, theme);
+    }
+}
+
+/// Centered picker overlay for history / favorites.
+fn render_console_popup(f: &mut Frame, area: Rect, popup: &ConsolePopup, theme: &Theme) {
+    let width = 72.min(area.width.saturating_sub(4));
+    let height = 16.min(area.height.saturating_sub(2));
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent())
+        .style(theme.panel())
+        .title(format!(" {} ", popup.title));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    // List on top, hint pinned to the bottom row (not overlaying the list).
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let max_rows = chunks[0].height as usize;
+    let sel = popup.selected.min(popup.items.len().saturating_sub(1));
+    let start = sel.saturating_sub(max_rows / 2);
+    let mut lines = Vec::new();
+    for (i, (label, _)) in popup.items.iter().skip(start).take(max_rows).enumerate() {
+        let is_sel = start + i == sel;
+        let style = if is_sel {
+            theme.selected()
+        } else {
+            theme.base()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if is_sel { "▶ " } else { "  " }, theme.accent()),
+            Span::styled(label.clone(), style),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), chunks[0]);
+
+    let hint = Line::from(Span::styled(
+        " ↑/↓ navigate · Enter load · Esc close ",
+        theme.dim(),
+    ));
+    f.render_widget(Paragraph::new(hint), chunks[1]);
 }
 
 fn render_editor(
@@ -571,6 +671,21 @@ mod tests {
 
         // No trailing whitespace.
         assert!(!f.ends_with(' '));
+    }
+
+    #[test]
+    fn test_format_sql_respects_string_literals() {
+        // 'a FROM b' is a string value — the clause detector must not split it.
+        let f = format_sql("SELECT 'a FROM b' FROM t");
+        assert_eq!(f, "SELECT 'a FROM b'\nFROM t");
+    }
+
+    #[test]
+    fn test_format_sql_exact_keyword_match() {
+        // SELECTED and GROUP_CONCAT are not clause keywords.
+        let f = format_sql("SELECT SELECTED FROM t WHERE GROUP_CONCAT(x) > 1");
+        assert!(f.contains("SELECT SELECTED\nFROM t"));
+        assert!(!f.contains("\nGROUP_CONCAT"));
     }
 }
 
