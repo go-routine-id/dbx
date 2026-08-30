@@ -607,11 +607,93 @@ fn is_destructive_stmt(stmt: &str) -> bool {
     }
 }
 
-/// Does a statement contain a `WHERE` keyword? Used to allow `DELETE … WHERE`
-/// (targeted) through the guard while blocking `DELETE FROM t` (full table).
+/// Does a statement contain a top-level `WHERE` keyword — outside string
+/// literals, backtick identifiers and `--` / `/* */` comments? Used to allow
+/// `DELETE … WHERE` (targeted) through the guard while blocking
+/// `DELETE FROM t` (full table). A `WHERE` hidden in `-- WHERE x` or `'WHERE'`
+/// must NOT count.
 fn has_where_clause(stmt: &str) -> bool {
-    stmt.split_whitespace()
-        .any(|tok| tok.to_uppercase() == "WHERE")
+    let mut in_string: Option<char> = None;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let mut word = String::new();
+    let end_word = |word: &mut String| -> bool {
+        let hit = word.eq_ignore_ascii_case("WHERE");
+        word.clear();
+        hit
+    };
+
+    let bytes = stmt.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = stmt[i..].chars().next().unwrap();
+        if in_line_comment {
+            if c == '\n' {
+                in_line_comment = false;
+            }
+            i += c.len_utf8();
+            continue;
+        }
+        if in_block_comment {
+            if c == '*' && bytes.get(i + 1) == Some(&b'/') {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                i += c.len_utf8();
+            }
+            continue;
+        }
+        if let Some(q) = in_string {
+            if c == '\\' {
+                i += 1 + c.len_utf8();
+                continue;
+            }
+            if c == q {
+                in_string = None;
+            }
+            i += c.len_utf8();
+            continue;
+        }
+        if c == '\'' || c == '"' || c == '`' {
+            in_string = Some(c);
+            i += 1;
+            continue;
+        }
+        if c == '-' && bytes.get(i + 1) == Some(&b'-') {
+            let after = stmt[i + 2..].chars().next();
+            let is_comment = after
+                .map(|n| n.is_whitespace() || n.is_control())
+                .unwrap_or(true);
+            if is_comment {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+        }
+        if c == '/' && bytes.get(i + 1) == Some(&b'*') {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if c.is_whitespace() {
+            if end_word(&mut word) {
+                return true;
+            }
+            i += c.len_utf8();
+            continue;
+        }
+        // Punctuation breaks a word so `WHERE(` and `(WHERE` are still found.
+        if matches!(c, '(' | ')' | ',' | ';' | '=' | '<' | '>') {
+            if end_word(&mut word) {
+                return true;
+            }
+            i += c.len_utf8();
+            continue;
+        }
+        word.push(c);
+        i += c.len_utf8();
+    }
+    word.eq_ignore_ascii_case("WHERE")
 }
 
 /// Skip leading whitespace and leading `--` / `/* */` comments so the first
@@ -743,9 +825,12 @@ pub struct App {
     erd_drag: Option<ErdDrag>,
 }
 
-/// Mouse drag state for panning the ERD view.
+/// Mouse drag state for panning the ERD view. `start` anchors the
+/// click-vs-drag threshold; `last` accumulates pan deltas.
 #[derive(Clone, Copy, Debug, Default)]
 struct ErdDrag {
+    start_x: u16,
+    start_y: u16,
     last_x: u16,
     last_y: u16,
     moved: bool,
@@ -901,10 +986,17 @@ impl App {
             if let Some(drag) = self.erd_drag {
                 let dx = i32::from(mouse.column) - i32::from(drag.last_x);
                 let dy = i32::from(mouse.row) - i32::from(drag.last_y);
+                // A drag only counts as such past a small threshold, so a
+                // one-cell wobble on a press doesn't kill the click.
+                let moved = drag.moved
+                    || (i32::from(mouse.column) - i32::from(drag.start_x)).abs() > 1
+                    || (i32::from(mouse.row) - i32::from(drag.start_y)).abs() > 1;
                 self.erd_drag = Some(ErdDrag {
+                    start_x: drag.start_x,
+                    start_y: drag.start_y,
                     last_x: mouse.column,
                     last_y: mouse.row,
-                    moved: true,
+                    moved,
                 });
                 if let Some(exp) = &mut self.explorer_state
                     && let Some(WorkspaceTab::Erd(erd)) = exp.active_tab_mut()
@@ -924,11 +1016,24 @@ impl App {
             self.erd_drag = None;
             if was_click {
                 // A click (press + release without drag) on an ERD node opens
-                // its DDL — same as the old press-to-open behaviour.
+                // its DDL — same as the old press-to-open behaviour. Only when
+                // no other modal has been opened mid-press.
                 let (Some(drv), Some(exp)) = (&self.active_driver, &mut self.explorer_state)
                 else {
                     return Ok(());
                 };
+                if exp.ddl_popup.is_some()
+                    || exp.export_modal.is_some()
+                    || exp.cell_edit_modal.is_some()
+                    || exp.insert_row_modal.is_some()
+                    || exp.sql_confirm_modal.is_some()
+                    || exp.object_search.is_some()
+                    || exp.import_csv_modal.is_some()
+                    || exp.schema_edit_modal.is_some()
+                    || exp.create_object_modal.is_some()
+                {
+                    return Ok(());
+                }
                 if let Some(WorkspaceTab::Erd(erd)) = exp.active_tab_mut() {
                     let Some(idx) = erd.node_at_mouse(mouse.column, mouse.row) else {
                         return Ok(());
@@ -1083,9 +1188,11 @@ impl App {
                 {
                     if let Some(res) = &c.last_result {
                         let rel_row = mouse.row - area.y;
-                        // Table header (1) + bottom_margin (1) = 2 rows.
+                        // Table header (1) + bottom_margin (1) = 2 rows. The
+                        // rendered window is sliced by `result_scroll_y`, so the
+                        // click's absolute row is offset + (rel_row - 2).
                         if rel_row >= 2 {
-                            let data_row = (rel_row - 2) as usize;
+                            let data_row = c.result_scroll_y + (rel_row - 2) as usize;
                             if data_row < res.records.len() {
                                 c.result_selected_row = data_row;
                             }
@@ -1108,12 +1215,26 @@ impl App {
             WorkspaceTab::Erd(erd) => {
                 // Press on the ERD starts a potential drag-to-pan; DDL opens
                 // on release if no drag occurred (handled in the Up branch).
-                let _ = erd.last_canvas_area;
-                self.erd_drag = Some(ErdDrag {
-                    last_x: mouse.column,
-                    last_y: mouse.row,
-                    moved: false,
-                });
+                // Only gestures starting on the canvas count — pressing on
+                // the border / status bar does nothing.
+                let in_canvas = erd
+                    .last_canvas_area
+                    .map(|r| {
+                        mouse.column >= r.x
+                            && mouse.column < r.x + r.width
+                            && mouse.row >= r.y
+                            && mouse.row < r.y + r.height
+                    })
+                    .unwrap_or(false);
+                if in_canvas {
+                    self.erd_drag = Some(ErdDrag {
+                        start_x: mouse.column,
+                        start_y: mouse.row,
+                        last_x: mouse.column,
+                        last_y: mouse.row,
+                        moved: false,
+                    });
+                }
                 return Ok(());
             }
         }
@@ -1986,15 +2107,29 @@ impl App {
                                     // PageUp/PageDown scroll one viewport (rows visible
                                     // in the grid) at a time.
                                     KeyCode::PageDown => {
-                                        if !t.page.records.is_empty() {
+                                        let visible = t
+                                            .filter
+                                            .as_ref()
+                                            .map(|f| {
+                                                t.page
+                                                    .records
+                                                    .iter()
+                                                    .filter(|r| {
+                                                        crate::ui::screens::explorer::record_matches_filter(
+                                                            r, f,
+                                                        )
+                                                    })
+                                                    .count()
+                                            })
+                                            .unwrap_or(t.page.records.len());
+                                        if visible > 0 {
                                             let page_rows = t
                                                 .grid_hit_area
                                                 .map(|r| (r.height as usize).saturating_sub(2))
                                                 .unwrap_or(10)
                                                 .max(1);
                                             t.selected_row =
-                                                (t.selected_row + page_rows)
-                                                    .min(t.page.records.len() - 1);
+                                                (t.selected_row + page_rows).min(visible - 1);
                                         }
                                     }
                                     KeyCode::PageUp => {
@@ -2270,6 +2405,7 @@ impl App {
                                                 c.result_selected_row = 0;
                                                 c.result_selected_col = 0;
                                                 c.result_scroll_x = 0;
+                                                c.result_scroll_y = 0;
                                             } else {
                                                 switch_tab(exp, -1);
                                             }
@@ -2281,6 +2417,7 @@ impl App {
                                                 c.result_selected_row = 0;
                                                 c.result_selected_col = 0;
                                                 c.result_scroll_x = 0;
+                                                c.result_scroll_y = 0;
                                             } else {
                                                 switch_tab(exp, 1);
                                             }
@@ -3936,13 +4073,14 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 console.is_executing = false;
                                 match failed {
                                     None => {
-                                        console.results = results.clone();
+                                        console.last_result = results.first().cloned();
                                         console.active_result = 0;
-                                        console.last_result = results.into_iter().next();
+                                        console.results = results;
                                         console.execution_error = None;
                                         console.result_selected_row = 0;
                                         console.result_selected_col = 0;
                                         console.result_scroll_x = 0;
+                                        console.result_scroll_y = 0;
                                         // Record to this connection's query history.
                                         // Not persisted per-query (re-serializing the
                                         // whole config on every run is too costly);
@@ -3964,12 +4102,23 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 }
                             }
                         } else {
+                            // Workspace-level edit/navigation keys. They only
+                            // make sense on a Table tab — inside a console
+                            // editor those letters are ordinary text — so route
+                            // them to `handle_key` when the active tab isn't a
+                            // Table (or, for `c`, when the console owns the key).
+                            let active_is_table = exp
+                                .active_tab()
+                                .is_some_and(|t| matches!(t, WorkspaceTab::Table(_)));
+                            let active_is_console = exp
+                                .active_tab()
+                                .is_some_and(|t| matches!(t, WorkspaceTab::Console(_)));
                             match key.code {
                                 // `x` on a selected row → confirm + DELETE the row.
                                 // We need the active driver for the driver-name sniff
                                 // (`quote_ident` + `single_row_suffix`) so this lives
                                 // here in the async event loop, not in `handle_key`.
-                                KeyCode::Char('x') | KeyCode::Char('X') => {
+                                KeyCode::Char('x') | KeyCode::Char('X') if active_is_table => {
                                     let can_edit = exp.driver_capabilities.contains(crate::driver::Capabilities::EDIT_DATA);
                                     if !can_edit {
                                         app.toasts.push(ToastKind::Warning, "active driver does not support editing data".to_string());
@@ -4043,7 +4192,8 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 // in the "skip" state so the user can opt in to
                                 // providing values one column at a time.
                                 KeyCode::Char('i') | KeyCode::Char('I')
-                                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                    if active_is_table
+                                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
                                 {
                                     let can_edit = exp.driver_capabilities.contains(crate::driver::Capabilities::EDIT_DATA);
                                     if !can_edit {
@@ -4092,7 +4242,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                         }
                                     }
                                 }
-                                KeyCode::Char('c') => {
+                                KeyCode::Char('c') if !active_is_console => {
                                     let count = exp.tabs.iter().filter(|t| matches!(t, WorkspaceTab::Console(_))).count() + 1;
                                     let console_title = format!("console_{count}.sql");
                                     exp.tabs.push(WorkspaceTab::Console(QueryConsole::new(console_title, None)));
@@ -4100,7 +4250,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                     exp.focused_pane = FocusedPane::Workspace;
                                     app.toasts.push(ToastKind::Info, "opened new SQL console".to_string());
                                 }
-                                KeyCode::Char('n') => {
+                                KeyCode::Char('n') if active_is_table => {
                                     if let Some(WorkspaceTab::Table(tab)) = exp.active_tab_mut() {
                                         let mut next_page = Page::default();
                                         next_page.offset = (tab.page.page + 1) * tab.page.page_size;
@@ -4114,7 +4264,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                         }
                                     }
                                 }
-                                KeyCode::Char('p') => {
+                                KeyCode::Char('p') if active_is_table => {
                                     if let Some(WorkspaceTab::Table(tab)) = exp.active_tab_mut() && tab.page.page > 0 {
                                         let mut prev_page = Page::default();
                                         prev_page.offset = (tab.page.page - 1) * tab.page.page_size;

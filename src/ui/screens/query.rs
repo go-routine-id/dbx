@@ -42,6 +42,9 @@ pub struct QueryConsole {
     pub result_selected_row: usize,
     pub result_selected_col: usize,
     pub result_scroll_x: usize,
+    /// Index of the first visible data row (vertical scroll) — mirrors the
+    /// window the result table renders, so mouse clicks map to the right row.
+    pub result_scroll_y: usize,
     pub focused_subpane: ConsoleSubpane,
     /// Optional picker overlay (query history / saved favorites). When set,
     /// the console routes Up/Down/Enter/Esc to it.
@@ -101,6 +104,7 @@ impl QueryConsole {
             result_selected_row: 0,
             result_selected_col: 0,
             result_scroll_x: 0,
+            result_scroll_y: 0,
             focused_subpane: ConsoleSubpane::Editor,
             popup: None,
             autocomplete: Vec::new(),
@@ -140,6 +144,9 @@ impl QueryConsole {
 
     /// Replace the whole editor buffer, resetting the cursor to the end.
     pub fn set_text(&mut self, text: String) {
+        // Stale suggestions would otherwise linger after the text is replaced.
+        self.autocomplete.clear();
+        self.autocomplete_selected = 0;
         let lines: Vec<String> = if text.trim().is_empty() {
             vec![String::new()]
         } else {
@@ -255,9 +262,45 @@ impl QueryConsole {
     }
 }
 
+/// If `s[i..]` begins a PostgreSQL dollar-quoted string (`$$…$$` or
+/// `$tag$…$tag$`), return the byte index just past its closing delimiter.
+/// Otherwise return `None` (the `$` is a normal character, e.g. a parameter).
+pub fn dollar_quote_end(s: &str, i: usize) -> Option<usize> {
+    let bytes = s.as_bytes();
+    if bytes.get(i) != Some(&b'$') {
+        return None;
+    }
+    // Parse the opening delimiter: `$$` (empty tag) or `$ident$`.
+    let mut j = i + 1;
+    if bytes.get(j) == Some(&b'$') {
+        j += 1;
+    } else {
+        let first = *bytes.get(j)?;
+        if !(first.is_ascii_alphabetic() || first == b'_') {
+            return None;
+        }
+        j += 1;
+        while let Some(&b) = bytes.get(j) {
+            if b.is_ascii_alphanumeric() || b == b'_' {
+                j += 1;
+            } else {
+                break;
+            }
+        }
+        if bytes.get(j) != Some(&b'$') {
+            return None;
+        }
+        j += 1;
+    }
+    let tag = &s[i..j];
+    let close = s[j..].find(tag)?;
+    Some(j + close + tag.len())
+}
+
 /// Pretty-print a SQL statement: each main clause keyword starts a new line.
-/// Deliberately minimal (no parser) — but it DOES respect string literals so
-/// a `'a FROM b'` value isn't split, and matches keywords exactly (so
+/// Deliberately minimal (no parser) — but it DOES respect string literals
+/// (incl. backslash-escaped quotes), backtick identifiers, `--` / `/* */`
+/// comments and `$tag$` dollar-quotes, and matches keywords exactly (so
 /// `SELECTED` / `GROUP_CONCAT` aren't mistaken for clauses).
 pub fn format_sql(sql: &str) -> String {
     const CLAUSE_STARTS: &[&str] = &[
@@ -265,31 +308,100 @@ pub fn format_sql(sql: &str) -> String {
         "ON", "VALUES", "SET", "INTO",
     ];
 
-    // Tokenize word-by-word, keeping quoted literals as a single token so a
-    // clause keyword inside a string never triggers a line break.
     let mut out = String::new();
     let mut token = String::new();
     let mut in_string: Option<char> = None;
-    for ch in sql.chars() {
-        if let Some(quote) = in_string {
-            token.push(ch);
-            if ch == quote {
-                in_string = None;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = sql[i..].chars().next().unwrap();
+
+        if in_line_comment {
+            // Preserve the rest of the line verbatim; only the newline ends it.
+            if c == '\n' {
+                in_line_comment = false;
+                flush_sql_token(&mut token, &mut out, CLAUSE_STARTS);
+            } else {
+                out.push(c);
+            }
+            i += c.len_utf8();
+            continue;
+        }
+        if in_block_comment {
+            out.push(c);
+            if c == '*' && bytes.get(i + 1) == Some(&b'/') {
+                out.push('/');
+                in_block_comment = false;
+                i += 2;
+            } else {
+                i += c.len_utf8();
             }
             continue;
         }
-        if ch == '\'' || ch == '"' {
-            token.push(ch);
-            in_string = Some(ch);
+        if let Some(q) = in_string {
+            out.push(c);
+            // Backslash escape (MySQL `\'`) — consume the next char too.
+            if c == '\\' {
+                if let Some(nc) = sql[i + 1..].chars().next() {
+                    out.push(nc);
+                    i += 1 + nc.len_utf8();
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == q {
+                in_string = None;
+            }
+            i += c.len_utf8();
             continue;
         }
-        if ch.is_whitespace() {
-            flush_sql_token(&mut token, &mut out, &CLAUSE_STARTS);
+        if c == '\'' || c == '"' || c == '`' {
+            flush_sql_token(&mut token, &mut out, CLAUSE_STARTS);
+            in_string = Some(c);
+            out.push(c);
+            i += 1;
             continue;
         }
-        token.push(ch);
+        if c == '$' && let Some(end) = dollar_quote_end(sql, i) {
+            flush_sql_token(&mut token, &mut out, CLAUSE_STARTS);
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+        if c == '-' && bytes.get(i + 1) == Some(&b'-') {
+            let after = sql[i + 2..].chars().next();
+            let is_comment = after
+                .map(|n| n.is_whitespace() || n.is_control())
+                .unwrap_or(true);
+            if is_comment {
+                flush_sql_token(&mut token, &mut out, CLAUSE_STARTS);
+                out.push('-');
+                out.push('-');
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+        }
+        if c == '/' && bytes.get(i + 1) == Some(&b'*') {
+            flush_sql_token(&mut token, &mut out, CLAUSE_STARTS);
+            out.push('/');
+            out.push('*');
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        if c.is_whitespace() {
+            flush_sql_token(&mut token, &mut out, CLAUSE_STARTS);
+            i += c.len_utf8();
+            continue;
+        }
+        token.push(c);
+        i += c.len_utf8();
     }
-    flush_sql_token(&mut token, &mut out, &CLAUSE_STARTS);
+    flush_sql_token(&mut token, &mut out, CLAUSE_STARTS);
     out.trim_end().to_string()
 }
 
@@ -312,8 +424,8 @@ fn flush_sql_token(token: &mut String, out: &mut String, clauses: &[&str]) {
 /// Split a query into individual `;`-separated statements, ignoring `;`
 /// inside string literals (incl. backslash-escaped quotes), backtick
 /// identifiers, `--` line comments (only when followed by whitespace, per
-/// the SQL standard / MySQL) and `/* */` block comments. Returns trimmed,
-/// non-empty statements.
+/// the SQL standard / MySQL), `/* */` block comments, and PostgreSQL
+/// `$tag$` dollar-quoted bodies. Returns trimmed, non-empty statements.
 pub fn split_statements(sql: &str) -> Vec<String> {
     let mut stmts = Vec::new();
     let mut cur = String::new();
@@ -321,20 +433,26 @@ pub fn split_statements(sql: &str) -> Vec<String> {
     let mut in_line_comment = false;
     let mut in_block_comment = false;
 
-    let mut chars = sql.chars().peekable();
-    while let Some(c) = chars.next() {
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = sql[i..].chars().next().unwrap();
         if in_line_comment {
             cur.push(c);
             if c == '\n' {
                 in_line_comment = false;
             }
+            i += c.len_utf8();
             continue;
         }
         if in_block_comment {
             cur.push(c);
-            if c == '*' && chars.peek() == Some(&'/') {
-                cur.push(chars.next().unwrap());
+            if c == '*' && bytes.get(i + 1) == Some(&b'/') {
+                cur.push('/');
                 in_block_comment = false;
+                i += 2;
+            } else {
+                i += c.len_utf8();
             }
             continue;
         }
@@ -343,39 +461,53 @@ pub fn split_statements(sql: &str) -> Vec<String> {
             // Backslash escape keeps the next char from closing the string
             // (MySQL `\'`). Consume it so it isn't re-scanned.
             if c == '\\' {
-                if let Some(next) = chars.next() {
-                    cur.push(next);
+                if let Some(nc) = sql[i + 1..].chars().next() {
+                    cur.push(nc);
+                    i += 1 + nc.len_utf8();
+                } else {
+                    i += 1;
                 }
                 continue;
             }
             if c == q {
                 in_string = None;
             }
+            i += c.len_utf8();
             continue;
         }
         if c == '\'' || c == '"' || c == '`' {
             in_string = Some(c);
             cur.push(c);
+            i += 1;
+            continue;
+        }
+        // PostgreSQL dollar-quote: a `;` inside `$$…$$` / `$tag$…$tag$` is
+        // part of the body and must not split the statement.
+        if c == '$' && let Some(end) = dollar_quote_end(sql, i) {
+            cur.push_str(&sql[i..end]);
+            i = end;
             continue;
         }
         // `--` starts a comment only when followed by whitespace/control
         // (SQL standard; MySQL allows `a--b` as a - (-b)).
-        if c == '-' && chars.peek() == Some(&'-') {
-            let after = chars.clone().nth(1);
+        if c == '-' && bytes.get(i + 1) == Some(&b'-') {
+            let after = sql[i + 2..].chars().next();
             let is_comment = after
                 .map(|n| n.is_whitespace() || n.is_control())
                 .unwrap_or(true);
             if is_comment {
                 in_line_comment = true;
-                cur.push(c);
-                cur.push(chars.next().unwrap()); // consume second '-'
+                cur.push('-');
+                cur.push('-');
+                i += 2;
                 continue;
             }
         }
-        if c == '/' && chars.peek() == Some(&'*') {
+        if c == '/' && bytes.get(i + 1) == Some(&b'*') {
             in_block_comment = true;
-            cur.push(c);
-            cur.push(chars.next().unwrap());
+            cur.push('/');
+            cur.push('*');
+            i += 2;
             continue;
         }
         if c == ';' {
@@ -384,9 +516,11 @@ pub fn split_statements(sql: &str) -> Vec<String> {
                 stmts.push(s.to_string());
             }
             cur.clear();
+            i += 1;
             continue;
         }
         cur.push(c);
+        i += c.len_utf8();
     }
     let tail = cur.trim();
     if !tail.is_empty() {
@@ -395,11 +529,90 @@ pub fn split_statements(sql: &str) -> Vec<String> {
     stmts
 }
 
-/// Is `stmt` a pure comment (nothing but a `--` line comment or a whole
-/// `/* ... */` block)? Such statements are skipped at execution.
+/// Is `stmt` a pure comment — nothing but `--` line / `/* */` block comments
+/// and whitespace? Such statements are skipped at execution. A statement like
+/// `-- note\nSELECT 1` is NOT comment-only (the `SELECT` must still run).
 pub fn is_comment_only(stmt: &str) -> bool {
-    let t = stmt.trim();
-    t.starts_with("--") || (t.starts_with("/*") && t.ends_with("*/"))
+    strip_comments(stmt).trim().is_empty()
+}
+
+/// Remove `--` line comments and `/* */` block comments, leaving string
+/// literals, backtick identifiers and `$tag$` dollar-quotes untouched so a
+/// `'--'` value or `$body$ -- x $body$` isn't mistaken for a comment.
+fn strip_comments(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len());
+    let mut in_string: Option<char> = None;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = sql[i..].chars().next().unwrap();
+        if in_line_comment {
+            if c == '\n' {
+                in_line_comment = false;
+                out.push(c);
+            }
+            i += c.len_utf8();
+            continue;
+        }
+        if in_block_comment {
+            if c == '*' && bytes.get(i + 1) == Some(&b'/') {
+                in_block_comment = false;
+                i += 2;
+            } else {
+                i += c.len_utf8();
+            }
+            continue;
+        }
+        if let Some(q) = in_string {
+            out.push(c);
+            if c == '\\' {
+                if let Some(nc) = sql[i + 1..].chars().next() {
+                    out.push(nc);
+                    i += 1 + nc.len_utf8();
+                } else {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == q {
+                in_string = None;
+            }
+            i += c.len_utf8();
+            continue;
+        }
+        if c == '\'' || c == '"' || c == '`' {
+            in_string = Some(c);
+            out.push(c);
+            i += 1;
+            continue;
+        }
+        if c == '$' && let Some(end) = dollar_quote_end(sql, i) {
+            out.push_str(&sql[i..end]);
+            i = end;
+            continue;
+        }
+        if c == '-' && bytes.get(i + 1) == Some(&b'-') {
+            let after = sql[i + 2..].chars().next();
+            let is_comment = after
+                .map(|n| n.is_whitespace() || n.is_control())
+                .unwrap_or(true);
+            if is_comment {
+                in_line_comment = true;
+                i += 2;
+                continue;
+            }
+        }
+        if c == '/' && bytes.get(i + 1) == Some(&b'*') {
+            in_block_comment = true;
+            i += 2;
+            continue;
+        }
+        out.push(c);
+        i += c.len_utf8();
+    }
+    out
 }
 
 /// Tier-1 autocomplete for the text before the cursor:
@@ -723,7 +936,12 @@ fn render_editor(
                 ));
                 spans.extend(highlight_sql_line(&after, theme));
             } else {
-                // Cursor at start of line — nothing to backspace; render plain.
+                // Cursor at column 0 (or empty line): render a block cursor
+                // before the first character so the caret stays visible.
+                spans.push(Span::styled(
+                    " ",
+                    theme.selected().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                ));
                 spans.extend(highlight_sql_line(line_str, theme));
             }
         } else {
@@ -809,12 +1027,31 @@ fn render_result(
             let col_offset = console.result_scroll_x.min(num_cols.saturating_sub(1));
 
             // Record rendered x-starts so mouse clicks map to actual widths.
+            // Columns are `Constraint::Min(16)`: when they fit they share the
+            // width evenly, and when they overflow each is 16 wide (clipped) —
+            // so the per-column stride is at least 16, never `width/visible`.
             if let Some(inner) = console.result_hit_area {
                 let num_visible = num_cols.saturating_sub(col_offset).max(1);
-                let col_w = (inner.width / num_visible as u16).max(1);
+                let col_w = (inner.width / num_visible as u16).max(16);
                 console.result_col_starts = (0..num_visible)
                     .map(|i| inner.x + (i as u16 * col_w))
                     .collect();
+            }
+
+            // Vertical scroll: keep the selected row inside the visible window
+            // and slice `records` to that window so the mouse handler can map a
+            // click with the same offset (header + bottom margin = 2 rows).
+            let inner_height = console.result_hit_area.map(|r| r.height).unwrap_or(0) as usize;
+            let visible_rows = inner_height.saturating_sub(2).max(1);
+            let total_rows = res.records.len();
+            if console.result_selected_row < console.result_scroll_y {
+                console.result_scroll_y = console.result_selected_row;
+            }
+            if console.result_selected_row >= console.result_scroll_y + visible_rows {
+                console.result_scroll_y = console.result_selected_row - visible_rows + 1;
+            }
+            if console.result_scroll_y > total_rows.saturating_sub(visible_rows) {
+                console.result_scroll_y = total_rows.saturating_sub(visible_rows);
             }
 
             let header_cells = res
@@ -827,11 +1064,14 @@ fn render_result(
             let rows: Vec<TableRow> = res
                 .records
                 .iter()
+                .skip(console.result_scroll_y)
+                .take(visible_rows)
                 .enumerate()
-                .map(|(r_idx, record)| {
+                .map(|(rel_idx, record)| {
+                    let r_idx = console.result_scroll_y + rel_idx;
                     let is_row_sel = r_idx == console.result_selected_row && is_result_focused;
-                    let cells = record.values.iter().skip(col_offset).enumerate().map(|(rel_idx, val)| {
-                        let abs_col = col_offset + rel_idx;
+                    let cells = record.values.iter().skip(col_offset).enumerate().map(|(i, val)| {
+                        let abs_col = col_offset + i;
                         let cell_str = val.display_str();
                         let is_cell_sel = is_row_sel && abs_col == console.result_selected_col;
                         let cell_style = if is_cell_sel {
@@ -860,7 +1100,9 @@ fn render_result(
                 .style(theme.base());
 
             let mut state = TableState::default();
-            state.select(Some(console.result_selected_row));
+            state.select(Some(
+                console.result_selected_row.saturating_sub(console.result_scroll_y),
+            ));
 
             f.render_stateful_widget(table, area, &mut state);
             return;
@@ -992,6 +1234,49 @@ mod tests {
         let stmts = split_statements("SELECT `a;b` FROM t; SELECT 2");
         assert_eq!(stmts.len(), 2);
         assert_eq!(stmts[0], "SELECT `a;b` FROM t");
+    }
+
+    #[test]
+    fn test_split_statements_dollar_quote() {
+        // A `;` inside a PostgreSQL `$$…$$` / `$body$…$body$` must not split.
+        let stmts = split_statements("CREATE FUNCTION f() RETURNS void AS $$ BEGIN; END; $$ LANGUAGE plpgsql; SELECT 2");
+        assert_eq!(stmts.len(), 2);
+        assert!(stmts[0].contains("$$ BEGIN; END; $$"));
+
+        let stmts = split_statements("SELECT $tag$ a; b $tag$; SELECT 2");
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "SELECT $tag$ a; b $tag$");
+
+        // A bare `$` (not a dollar-quote) is left alone.
+        let stmts = split_statements("SELECT $1; SELECT 2");
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "SELECT $1");
+    }
+
+    #[test]
+    fn test_is_comment_only() {
+        // Pure comments are skipped.
+        assert!(is_comment_only("-- just a note"));
+        assert!(is_comment_only("/* whole block */"));
+        assert!(is_comment_only("  -- leading ws\n-- more"));
+        // A statement after a leading comment still runs.
+        assert!(!is_comment_only("-- note\nSELECT 1"));
+        assert!(!is_comment_only("/* lead */ SELECT 1"));
+        assert!(!is_comment_only("SELECT 1"));
+        assert!(!is_comment_only("'-- not a comment'"));
+    }
+
+    #[test]
+    fn test_format_sql_ignores_keywords_in_literals_comments() {
+        // Clause keywords inside backticks / dollar-quotes / comments must not
+        // trigger a line break.
+        let f = format_sql("SELECT `FROM` FROM t -- WHERE note\nORDER BY `order`");
+        assert!(!f.contains("SELECT \nFROM") || f.starts_with("SELECT `FROM`"));
+        // `FROM` inside the backtick is literal.
+        assert!(f.starts_with("SELECT `FROM`\nFROM t"));
+        // `$x$ FROM $x$` is a dollar-quoted literal.
+        let f = format_sql("SELECT $x$ FROM $x$ FROM t");
+        assert!(f.starts_with("SELECT $x$ FROM $x$\nFROM t"));
     }
 
     #[test]

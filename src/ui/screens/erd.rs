@@ -201,13 +201,17 @@ impl ErdTab {
         self.view = View::default();
     }
 
-    /// Pan by a delta in terminal cells (mouse drag). Dragging down/right moves
-    /// the content with the cursor (view offset opposite to the drag).
+    /// Pan by a delta in terminal cells (mouse drag). Grab-to-pan: dragging
+    /// down/right moves the content with the cursor, so both axes subtract.
+    /// Clamped like the arrow-key scroll so the diagram can't be flung
+    /// entirely off-canvas.
     pub fn pan_by_cells(&mut self, dx: i32, dy: i32) {
         let dcol = f64::from(dx) * self.view.px_col();
         let drow = f64::from(dy) * self.view.px_row();
         self.view.ox -= dcol;
-        self.view.oy += drow;
+        self.view.oy -= drow;
+        self.view.ox = self.view.ox.clamp(-2.0 * self.view.px_col(), self.scene_w);
+        self.view.oy = self.view.oy.clamp(-2.0 * self.view.px_row(), self.scene_h);
     }
 
     /// Zoom in toward the current view origin (clamped to a sane range).
@@ -246,8 +250,8 @@ impl ErdTab {
     ///
     /// The transform inverts what `render_erd` does on draw:
     /// - cell → world: `x = ox + rel_x * PX_PER_COL`,
-    ///   `y = oy + vh - rel_y * PX_PER_ROW` (flowmaid is y-down; row 0 is
-    ///   the bottom edge of the viewport in y-down space).
+    ///   `y = oy + rel_y * PX_PER_ROW` (flowmaid's y and the screen row both
+    ///   grow downward, so there is no vertical flip).
     /// - then `scene.hit_test` with a zero tolerance (node rects are big
     ///   enough to click without needing edge tolerance).
     pub fn node_at_mouse(&self, col: u16, row: u16) -> Option<usize> {
@@ -262,9 +266,10 @@ impl ErdTab {
         }
         let rel_x = f64::from(col - area.x);
         let rel_y = f64::from(row - area.y);
-        let vh = f64::from(area.height) * self.view.px_row();
         let wx = self.view.ox + rel_x * self.view.px_col();
-        let wy = self.view.oy + vh - rel_y * self.view.px_row();
+        // Renderer maps world y → row as (y - oy) / px_row + area.y, so the
+        // inverse is world y = oy + rel_y * px_row (no vertical mirror).
+        let wy = self.view.oy + rel_y * self.view.px_row();
         match scene.scene.hit_test(wx, wy, 0.0) {
             Some(Hit::Node(i)) => Some(i),
             _ => None,
@@ -922,11 +927,10 @@ mod tests {
         // A plausible canvas: top-left of the terminal, 80x30 cells.
         tab.last_canvas_area = Some(Rect::new(0, 0, 80, 30));
 
-        // Invert node_at_mouse's mapping: cell = (world - view) / PX_PER_*,
-        // with the y-flip (row 0 = bottom of the y-down viewport).
-        let vh = 30.0 * PX_PER_ROW;
+        // Invert node_at_mouse's mapping: cell = (world - view) / PX_PER_*.
+        // World y and screen row grow in the same direction (no y-flip).
         let col = (node_x / PX_PER_COL) as u16;
-        let row = ((vh - node_y) / PX_PER_ROW) as u16;
+        let row = (node_y / PX_PER_ROW) as u16;
         assert_eq!(tab.node_at_mouse(col, row), Some(0));
 
         // A click far outside the canvas hits nothing.
