@@ -43,6 +43,11 @@ pub struct CellEditModalState {
     /// inside the modal to set the cell to NULL. The SQL preview then emits
     /// `SET col = NULL` instead of `SET col = '<value>'`.
     pub is_nullable: bool,
+    /// `true` when the column's type is boolean — the modal renders a
+    /// true/false(/NULL) dropdown instead of a free-text input.
+    pub is_boolean: bool,
+    /// Active dropdown option: 0=true, 1=false, 2=NULL (only when nullable).
+    pub bool_selection: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -1180,6 +1185,39 @@ fn render_cell_edit_modal(
             Constraint::Length(1), // Common hint
         ])
         .split(inner);
+
+    if modal.is_boolean {
+        // Boolean dropdown: true / false / NULL (only when nullable).
+        let options: [(&str, usize); 3] = [("true", 0), ("false", 1), ("NULL", 2)];
+        let mut lines = Vec::new();
+        for (label, idx) in options.iter() {
+            if *idx > 1 && !modal.is_nullable {
+                continue;
+            }
+            let is_sel = modal.bool_selection == *idx;
+            let style = if is_sel {
+                theme.selected()
+            } else {
+                theme.base()
+            };
+            lines.push(Line::from(Span::styled(
+                format!("  {} {label}", if is_sel { "▶" } else { " " }),
+                style,
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), chunks[0]);
+
+        let hint_line = Line::from(vec![
+            Span::styled("[↑/↓] ", theme.accent().add_modifier(Modifier::BOLD)),
+            Span::styled("choose  ", theme.dim()),
+            Span::styled("[Enter] ", theme.accent()),
+            Span::styled("Review SQL  ", theme.dim()),
+            Span::styled("[Esc] ", theme.accent()),
+            Span::styled("Cancel", theme.dim()),
+        ]);
+        f.render_widget(Paragraph::new(hint_line).alignment(Alignment::Center), chunks[1]);
+        return;
+    }
 
     let input_block = Block::default()
         .borders(Borders::ALL)

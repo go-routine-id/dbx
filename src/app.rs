@@ -926,6 +926,36 @@ impl App {
                         }
                     };
 
+                    // Boolean column → dropdown navigation instead of free-text
+                    // editing. Enter (SQL confirm) is handled in the event loop.
+                    if exp.cell_edit_modal.as_ref().unwrap().is_boolean {
+                        match key.code {
+                            KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
+                                let edit = exp.cell_edit_modal.as_mut().unwrap();
+                                let max = if edit.is_nullable { 2 } else { 1 };
+                                let delta = if matches!(
+                                    key.code,
+                                    KeyCode::Up | KeyCode::Char('k')
+                                ) {
+                                    max
+                                } else {
+                                    1
+                                };
+                                edit.bool_selection = (edit.bool_selection + delta) % (max + 1);
+                                edit.text_buffer = match edit.bool_selection {
+                                    0 => "true".to_string(),
+                                    1 => "false".to_string(),
+                                    _ => NULL_SENTINEL.to_string(),
+                                };
+                                return;
+                            }
+                            // Esc falls through to the phase-2 Esc arm (close).
+                            KeyCode::Esc => {}
+                            // All other keys are ignored for booleans.
+                            _ => return,
+                        }
+                    }
+
                     // Phase 2: apply. Only one path actually mutates.
                     match plan.key {
                         KeyCode::Esc => {
@@ -1510,6 +1540,17 @@ impl App {
                                                 .find(|m| m.name == *col_name)
                                                 .map(|m| m.is_nullable)
                                                 .unwrap_or(true);
+                                            let is_boolean = t
+                                                .column_meta
+                                                .iter()
+                                                .find(|m| m.name == *col_name)
+                                                .map(|m| m.data_type.to_uppercase().contains("BOOL"))
+                                                .unwrap_or(false);
+                                            let bool_selection = match val {
+                                                crate::driver::Value::Bool(true) => 0,
+                                                crate::driver::Value::Bool(false) => 1,
+                                                _ => 2,
+                                            };
                                             exp.cell_edit_modal = Some(crate::ui::screens::explorer::CellEditModalState {
                                                 collection: t.collection.clone(),
                                                 column_name: col_name.clone(),
@@ -1517,6 +1558,8 @@ impl App {
                                                 col_idx: t.selected_col,
                                                 text_buffer: val.display_str(),
                                                 is_nullable,
+                                                is_boolean,
+                                                bool_selection,
                                             });
                                         }
                                     }
@@ -2415,8 +2458,14 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
 
                             // The sentinel is the only way the buffer can carry
                             // "set to NULL" intent; literal user-typed text "NULL"
-                            // stays a regular string.
-                            let assignment = render_buffer_sql(&new_val_str);
+                            // stays a regular string. Boolean columns emit the
+                            // bare `true`/`false` keyword (PG + MySQL accept it),
+                            // not a quoted string.
+                            let assignment = if edit.is_boolean && new_val_str != NULL_SENTINEL {
+                                new_val_str.clone()
+                            } else {
+                                render_buffer_sql(&new_val_str)
+                            };
 
                             // MySQL needs `LIMIT 1` on single-row UPDATE when the WHERE
                             // doesn't include a unique key. Other backends don't.
