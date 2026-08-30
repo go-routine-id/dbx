@@ -32,6 +32,15 @@ for automatic layout and crow's-foot geometry, painted into a
 `ratatui::widgets::canvas` with the `Braille` marker so curves stay smooth
 inside a terminal grid.
 
+## Preview
+<img width="1314" height="1044" alt="image" src="https://github.com/user-attachments/assets/a8b3a8e1-30b6-4998-aecf-864842dac0bd" />
+<img width="1314" height="1044" alt="image" src="https://github.com/user-attachments/assets/c86ebb64-bd8e-43a3-a204-bd14fdeaacd5" />
+<img width="1314" height="1044" alt="image" src="https://github.com/user-attachments/assets/30e780b7-43b4-42fe-b577-778f9cd4c9d3" />
+<img width="1314" height="1044" alt="image" src="https://github.com/user-attachments/assets/a149d6d6-2b2d-4dff-9d6e-ff23470bd452" />
+
+
+
+
 ## Driver support
 
 | Driver | Status |
