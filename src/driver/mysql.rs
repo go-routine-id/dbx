@@ -33,6 +33,17 @@ impl MySqlDriver {
             opts = opts.host(&cfg.host).port(port);
         }
 
+        // TLS enforcement. `None` = driver default (opportunistic TLS), so a
+        // pre-existing config without ssl/ssl_mode keeps working.
+        if let Some(mode) = cfg.effective_ssl_mode() {
+            let ssl_mode = match mode {
+                crate::config::SslMode::Disable => sqlx::mysql::MySqlSslMode::Disabled,
+                crate::config::SslMode::Require => sqlx::mysql::MySqlSslMode::Required,
+                crate::config::SslMode::Verify => sqlx::mysql::MySqlSslMode::VerifyIdentity,
+            };
+            opts = opts.ssl_mode(ssl_mode);
+        }
+
         if let Some(user) = &cfg.user {
             opts = opts.username(user);
         }

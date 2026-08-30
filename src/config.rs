@@ -29,6 +29,34 @@ impl DriverType {
     }
 }
 
+/// SSL enforcement level for a connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SslMode {
+    Disable,
+    Require,
+    /// Require TLS + verify the server certificate.
+    Verify,
+}
+
+/// Tolerant deserializer for `ssl_mode`: unknown spellings (libpq/sqlx
+/// variants like "verify-full", "prefer", "verify_ca") fall back to `None`
+/// (driver default) instead of failing the whole config parse — a bad value
+/// must never empty the connection list or enable data-loss overwrites.
+fn de_ssl_mode_opt<'de, D>(d: D) -> Result<Option<SslMode>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = Option::<String>::deserialize(d)?;
+    Ok(s.and_then(|v| match v.to_lowercase().as_str() {
+        "require" | "required" => Some(SslMode::Require),
+        "verify" | "verify-full" | "verify_ca" | "verify_identity" | "verify_full" => {
+            Some(SslMode::Verify)
+        }
+        _ => None,
+    }))
+}
+
 /// A saved connection entry in config.toml.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ConnectionConfig {
@@ -43,6 +71,18 @@ pub struct ConnectionConfig {
     pub socket: Option<String>,
     #[serde(default)]
     pub ssl: bool,
+    /// TLS enforcement. Missing/unknown → driver default (opportunistic TLS).
+    /// The legacy `ssl: true` boolean is honoured when `ssl_mode` is unset.
+    #[serde(default, deserialize_with = "de_ssl_mode_opt")]
+    pub ssl_mode: Option<SslMode>,
+}
+
+impl ConnectionConfig {
+    /// Effective SSL mode: an explicit `ssl_mode` wins; otherwise the legacy
+    /// `ssl: true` boolean maps to `Require`; otherwise `None` (driver default).
+    pub fn effective_ssl_mode(&self) -> Option<SslMode> {
+        self.ssl_mode.or_else(|| self.ssl.then_some(SslMode::Require))
+    }
 }
 
 /// Default connection host when a config entry omits it. Local dev

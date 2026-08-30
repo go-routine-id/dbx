@@ -29,6 +29,17 @@ impl PostgresDriver {
         let port = cfg.port.unwrap_or(5432);
         opts = opts.host(&cfg.host).port(port);
 
+        // TLS enforcement. `None` = driver default (opportunistic TLS), so a
+        // pre-existing config without ssl/ssl_mode keeps working.
+        if let Some(mode) = cfg.effective_ssl_mode() {
+            let ssl_mode = match mode {
+                crate::config::SslMode::Disable => sqlx::postgres::PgSslMode::Disable,
+                crate::config::SslMode::Require => sqlx::postgres::PgSslMode::Require,
+                crate::config::SslMode::Verify => sqlx::postgres::PgSslMode::VerifyFull,
+            };
+            opts = opts.ssl_mode(ssl_mode);
+        }
+
         if let Some(user) = &cfg.user {
             opts = opts.username(user);
         }

@@ -489,12 +489,13 @@ const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-const EXPLORER_HELP_BINDINGS: [(&str, &str); 27] = [
+const EXPLORER_HELP_BINDINGS: [(&str, &str); 28] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
     ("Ctrl+T", "search all objects / jump to a table"),
     ("Ctrl+Enter / F5", "execute SQL query in active console"),
+    ("Ctrl+R", "reconnect after a dropped connection"),
     ("Alt+H", "open query history for this connection"),
     ("Alt+F", "open saved favorite queries"),
     ("Ctrl+S", "save current query as favorite"),
@@ -551,6 +552,8 @@ pub struct App {
     connecting: bool,
     /// Name of the connection currently connected — key for query history.
     active_connection_name: Option<String>,
+    /// Full config of the active connection — used for reconnect.
+    active_connection: Option<crate::config::ConnectionConfig>,
 }
 
 impl App {
@@ -571,6 +574,7 @@ impl App {
             explorer_state: None,
             connecting: false,
             active_connection_name: None,
+            active_connection: None,
         }
     }
 
@@ -997,6 +1001,10 @@ impl App {
                         self.mode = ScreenMode::Picker;
                         self.active_driver = None;
                         self.explorer_state = None;
+                        // Teardown must mirror connect: drop the retained
+                        // connection config (and its password) too.
+                        self.active_connection = None;
+                        self.active_connection_name = None;
                         return;
                     }
                     KeyCode::Tab => {
@@ -1870,7 +1878,15 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
     });
 
     let config_path = AppConfig::default_path(cli_config.as_deref());
-    let config = AppConfig::load(&config_path).unwrap_or_default();
+    let config = match AppConfig::load(&config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            // Never fail silently: a parse error that empties the connection
+            // list can lead to a later save() overwriting the user's config.
+            eprintln!("warning: failed to load config ({}): {e:#}", config_path.display());
+            AppConfig::default()
+        }
+    };
 
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))
         .context("failed to create terminal backend")?;
@@ -1957,6 +1973,84 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                 continue;
             }
             if matches!(app.mode, ScreenMode::Connected) {
+                // Reconnect (Ctrl+R): re-establish the active connection when
+                // it was dropped. Handled before the driver/explorer borrow so
+                // we can replace `active_driver` freely.
+                if app.active_connection.is_some()
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.code == KeyCode::Char('r')
+                {
+                    // Gate: don't fire while a modal owns the keyboard, or when
+                    // the connection is already healthy (Ctrl+R should only
+                    // rescue a dropped connection, not abort in-flight work).
+                    let busy = app
+                        .explorer_state
+                        .as_ref()
+                        .map(|e| {
+                            e.export_modal.is_some()
+                                || e.cell_edit_modal.is_some()
+                                || e.insert_row_modal.is_some()
+                                || e.sql_confirm_modal.is_some()
+                                || e.object_search.is_some()
+                                || e.ddl_popup.is_some()
+                        })
+                        .unwrap_or(false);
+                    if busy {
+                        app.toasts.push(ToastKind::Warning, "close the current popup before reconnecting".to_string());
+                        continue;
+                    }
+                    if let Some(drv) = &app.active_driver
+                        && drv.ping().await.is_ok()
+                    {
+                        app.toasts.push(ToastKind::Info, "connection is healthy — nothing to reconnect".to_string());
+                        continue;
+                    }
+
+                    let cfg = app.active_connection.clone().unwrap();
+                    app.toasts.push(ToastKind::Info, "reconnecting...".to_string());
+                    // Timeout so a hung network can't freeze the TUI forever.
+                    match tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        crate::driver::connect_driver(&cfg),
+                    )
+                    .await
+                    {
+                        Ok(Ok(new_drv)) => {
+                            let info = new_drv.info();
+                            // Refresh namespaces/tree but PRESERVE open tabs and
+                            // buffers (don't rebuild ExplorerState from scratch).
+                            let ns_result = new_drv.namespaces().await;
+                            if let Some(exp) = &mut app.explorer_state {
+                                match ns_result {
+                                    Ok(ns) => {
+                                        exp.namespaces = ns;
+                                        exp.tables.clear();
+                                        exp.rebuild_tree_nodes();
+                                        exp.selected_tree_index = 0;
+                                    }
+                                    Err(e) => {
+                                        app.toasts.push(
+                                            ToastKind::Error,
+                                            format!("reconnect: failed to list namespaces: {e:#}"),
+                                        );
+                                    }
+                                }
+                            }
+                            app.active_driver = Some(new_drv);
+                            app.toasts.push(
+                                ToastKind::Success,
+                                format!("reconnected: {} {}", info.name, info.server_version),
+                            );
+                        }
+                        Ok(Err(e)) => {
+                            app.toasts.push(ToastKind::Error, format!("reconnect failed: {e:#}"));
+                        }
+                        Err(_) => {
+                            app.toasts.push(ToastKind::Error, "reconnect timed out after 10s".to_string());
+                        }
+                    }
+                    continue;
+                }
                 if let (Some(drv), Some(exp)) = (&app.active_driver, &mut app.explorer_state) {
                     // 1. Export modal execution
                     if let Some(modal) = &exp.export_modal {
@@ -2919,6 +3013,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 app.explorer_state = Some(ExplorerState::new(namespaces, capabilities));
                                 app.active_driver = Some(drv);
                                 app.active_connection_name = Some(cfg.name.clone());
+                                app.active_connection = Some(cfg.clone());
                                 app.mode = ScreenMode::Connected;
                                 app.toasts.push(ToastKind::Success, format!("connected: {} {}", info.name, info.server_version));
                             }

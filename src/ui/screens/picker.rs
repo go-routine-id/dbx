@@ -81,6 +81,9 @@ pub struct ConnectionForm {
     pub user: String,
     pub password: String,
     pub database: String,
+    /// TLS settings, preserved through edit so saving never downgrades them.
+    pub ssl: bool,
+    pub ssl_mode: Option<crate::config::SslMode>,
     /// Last Ctrl+T result, kept visible inside the modal so the user always
     /// sees the test outcome right where they're editing. Cleared on the next
     /// Ctrl+T press.
@@ -125,6 +128,8 @@ impl ConnectionForm {
             user: env_default("DBX_DEFAULT_USER"),
             password: env_default("DBX_DEFAULT_PASSWORD"),
             database: env_default("DBX_DEFAULT_DATABASE"),
+            ssl: false,
+            ssl_mode: None,
             last_test_result: None,
         }
     }
@@ -141,6 +146,8 @@ impl ConnectionForm {
             user: cfg.user.clone().unwrap_or_default(),
             password: cfg.password.clone().unwrap_or_default(),
             database: cfg.database.clone().unwrap_or_default(),
+            ssl: cfg.ssl,
+            ssl_mode: cfg.ssl_mode,
             last_test_result: None,
         }
     }
@@ -155,7 +162,8 @@ impl ConnectionForm {
             password: if self.password.is_empty() { None } else { Some(self.password.clone()) },
             database: if self.database.trim().is_empty() { None } else { Some(self.database.trim().to_string()) },
             socket: None,
-            ssl: false,
+            ssl: self.ssl,
+            ssl_mode: self.ssl_mode,
         }
     }
 }
