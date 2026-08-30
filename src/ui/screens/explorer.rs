@@ -67,6 +67,15 @@ pub struct InsertRowModalState {
     pub focused_field: usize,
 }
 
+/// State for the CSV-import modal (`Ctrl+Shift+I` on a table tab). Enter
+/// parses the file; a second Enter (once `parsed`) inserts the rows.
+#[derive(Clone, Debug)]
+pub struct ImportCsvModalState {
+    pub path: String,
+    pub rows: Vec<Vec<String>>,
+    pub parsed: bool,
+}
+
 /// Kind of object in the object-search results — drives the icon and how
 /// Enter opens it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -276,6 +285,7 @@ pub struct ExplorerState {
     pub sql_confirm_modal: Option<SqlConfirmModalState>,
     pub insert_row_modal: Option<InsertRowModalState>,
     pub object_search: Option<ObjectSearchState>,
+    pub import_csv_modal: Option<ImportCsvModalState>,
     pub driver_capabilities: crate::driver::Capabilities,
 }
 
@@ -310,6 +320,7 @@ impl ExplorerState {
             sql_confirm_modal: None,
             insert_row_modal: None,
             object_search: None,
+            import_csv_modal: None,
             driver_capabilities,
         }
     }
@@ -431,6 +442,73 @@ pub fn render_explorer(
     if let Some(search) = &state.object_search {
         render_object_search(f, area, search, theme);
     }
+
+    if let Some(import) = &state.import_csv_modal {
+        render_import_csv_modal(f, area, import, theme);
+    }
+}
+
+/// Centered overlay for CSV import: path input + preview of parsed rows.
+fn render_import_csv_modal(f: &mut Frame, area: Rect, modal: &ImportCsvModalState, theme: &Theme) {
+    let width = 72.min(area.width.saturating_sub(4));
+    let height = 18.min(area.height.saturating_sub(2));
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent())
+        .style(theme.panel())
+        .title(" Import CSV ");
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(1), // path
+            Constraint::Length(1), // status
+            Constraint::Min(1),    // preview
+            Constraint::Length(1), // hint
+        ])
+        .split(inner);
+
+    let path_line = Line::from(vec![
+        Span::styled("file> ", theme.accent().add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{}█", modal.path), theme.base()),
+    ]);
+    f.render_widget(Paragraph::new(path_line), chunks[0]);
+
+    if modal.parsed {
+        let status = format!("{} rows, {} columns", modal.rows.len().saturating_sub(1), modal.rows.first().map(|r| r.len()).unwrap_or(0));
+        f.render_widget(Paragraph::new(Span::styled(status, theme.dim())), chunks[1]);
+
+        // Preview up to 5 data rows (skip header).
+        let mut lines = Vec::new();
+        for row in modal.rows.iter().skip(1).take(5) {
+            lines.push(Line::from(Span::styled(
+                row.join(" | "),
+                theme.base(),
+            )));
+        }
+        f.render_widget(Paragraph::new(lines), chunks[2]);
+    } else {
+        f.render_widget(Paragraph::new(Span::styled("(press Enter to read the file)", theme.dim())), chunks[1]);
+    }
+
+    let hint = Line::from(vec![
+        Span::styled("[Enter] ", theme.accent()),
+        Span::styled(if modal.parsed { "Insert rows  " } else { "Read file  " }, theme.base()),
+        Span::styled("[Esc] Cancel", theme.dim()),
+    ]);
+    f.render_widget(Paragraph::new(hint).alignment(Alignment::Center), chunks[3]);
 }
 
 /// Centered overlay for the object search (`Ctrl+T`): a text input at the

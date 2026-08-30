@@ -489,13 +489,14 @@ const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-const EXPLORER_HELP_BINDINGS: [(&str, &str); 28] = [
+const EXPLORER_HELP_BINDINGS: [(&str, &str); 29] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
     ("Ctrl+T", "search all objects / jump to a table"),
     ("Ctrl+Enter / F5", "execute SQL query in active console"),
     ("Ctrl+R", "reconnect after a dropped connection"),
+    ("Ctrl+Shift+I", "import rows from a CSV file into the active table"),
     ("Alt+H", "open query history for this connection"),
     ("Alt+F", "open saved favorite queries"),
     ("Ctrl+S", "save current query as favorite"),
@@ -996,6 +997,41 @@ impl App {
                     return;
                 }
 
+                // CSV-import modal: path typing + read-on-Enter. (Enter again
+                // once parsed is handled in the async event loop — it needs
+                // `drv.execute`.)
+                if let Some(imp) = &mut exp.import_csv_modal {
+                    match key.code {
+                        KeyCode::Esc => exp.import_csv_modal = None,
+                        KeyCode::Backspace if !imp.parsed => {
+                            imp.path.pop();
+                        }
+                        KeyCode::Char(c)
+                            if !imp.parsed && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                        {
+                            imp.path.push(c);
+                        }
+                        KeyCode::Enter => {
+                            if !imp.parsed {
+                                match std::fs::read_to_string(&imp.path) {
+                                    Ok(content) => {
+                                        imp.rows = crate::export::parse_csv(&content);
+                                        imp.parsed = true;
+                                    }
+                                    Err(e) => {
+                                        self.toasts.push(
+                                            ToastKind::Error,
+                                            format!("failed to read CSV: {e:#}"),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+
                 match key.code {
                     KeyCode::Esc => {
                         self.mode = ScreenMode::Picker;
@@ -1137,6 +1173,19 @@ impl App {
                                         }
                                     } else {
                                         match key.code {
+                                    KeyCode::Char('i')
+                                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                                            && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                                    {
+                                        // Ctrl+Shift+I: import rows from a CSV file.
+                                        exp.import_csv_modal = Some(
+                                            crate::ui::screens::explorer::ImportCsvModalState {
+                                                path: String::new(),
+                                                rows: Vec::new(),
+                                                parsed: false,
+                                            },
+                                        );
+                                    }
                                     KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                         // Copy the selected row as an INSERT statement.
                                         if let Some(row) = t.page.records.get(t.selected_row) {
@@ -2428,6 +2477,90 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                     exp.ddl_popup = Some((cref, stub));
                                 }
                             }
+                        }
+                        continue;
+                    }
+
+                    // CSV import: Enter on a parsed file inserts the rows.
+                    if exp.import_csv_modal.is_some() && key.code == KeyCode::Enter {
+                        let snapshot = {
+                            let m = exp.import_csv_modal.as_ref().unwrap();
+                            if !m.parsed {
+                                None
+                            } else {
+                                Some((
+                                    m.rows.clone(),
+                                    exp.active_tab().and_then(|t| match t {
+                                        WorkspaceTab::Table(t) => Some(t.collection.clone()),
+                                        _ => None,
+                                    }),
+                                ))
+                            }
+                        };
+                        if let Some((rows, Some(cref))) = snapshot {
+                            let drv_clone = drv.clone();
+                            let driver_name = drv.info().name.clone();
+                            let headers = rows.first().cloned().unwrap_or_default();
+                            let mut inserted = 0u64;
+                            let mut fail: Option<String> = None;
+                            for row in rows.iter().skip(1) {
+                                if row.len() != headers.len() {
+                                    fail = Some(format!(
+                                        "column count mismatch ({} vs {}) at row {}",
+                                        row.len(),
+                                        headers.len(),
+                                        inserted + 2
+                                    ));
+                                    break;
+                                }
+                                let fields: Vec<(String, Option<String>)> = headers
+                                    .iter()
+                                    .zip(row.iter())
+                                    .map(|(h, v)| (h.clone(), Some(v.clone())))
+                                    .collect();
+                                if let Some(sql) =
+                                    build_insert_sql(&cref, &fields, &driver_name)
+                                {
+                                    match drv_clone.execute(&cref.namespace, &sql).await {
+                                        Ok(_) => inserted += 1,
+                                        Err(e) => {
+                                            fail = Some(format!("{e:#}"));
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                            exp.import_csv_modal = None;
+                            match fail {
+                                Some(e) => {
+                                    app.toasts.push(
+                                        ToastKind::Error,
+                                        format!("import failed after {inserted} rows: {e}"),
+                                    );
+                                }
+                                None => {
+                                    app.toasts.push(
+                                        ToastKind::Success,
+                                        format!("imported {inserted} rows"),
+                                    );
+                                    // Refresh the table tab.
+                                    if let Some(WorkspaceTab::Table(t)) = exp.active_tab_mut() {
+                                        if t.collection == cref {
+                                            let cur_page = Page {
+                                                offset: t.page.page * t.page.page_size,
+                                                limit: t.page.page_size,
+                                            };
+                                            if let Ok(refreshed) =
+                                                drv_clone.records(&cref, cur_page).await
+                                            {
+                                                t.page = refreshed;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            exp.import_csv_modal = None;
                         }
                         continue;
                     }

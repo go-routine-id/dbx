@@ -189,9 +189,64 @@ pub fn resolve_path(path_str: &str) -> Result<PathBuf> {
     }
 }
 
+/// Parse a CSV string into rows of fields, honouring double-quoted fields
+/// (quotes, commas and doubled `""` inside quotes). Blank lines are skipped.
+pub fn parse_csv(content: &str) -> Vec<Vec<String>> {
+    let mut rows = Vec::new();
+    for line in content.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut row = Vec::new();
+        let mut field = String::new();
+        let mut in_quotes = false;
+        let mut chars = line.chars().peekable();
+        while let Some(c) = chars.next() {
+            if in_quotes {
+                if c == '"' {
+                    if chars.peek() == Some(&'"') {
+                        field.push('"');
+                        chars.next();
+                    } else {
+                        in_quotes = false;
+                    }
+                } else {
+                    field.push(c);
+                }
+            } else {
+                match c {
+                    '"' => in_quotes = true,
+                    ',' => row.push(std::mem::take(&mut field)),
+                    _ => field.push(c),
+                }
+            }
+        }
+        row.push(field);
+        rows.push(row);
+    }
+    rows
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_parse_csv_basic() {
+        let rows = parse_csv("a,b,c\n1,2,3\n");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec!["a".to_string(), "b".to_string(), "c".to_string()]);
+        assert_eq!(rows[1], vec!["1".to_string(), "2".to_string(), "3".to_string()]);
+    }
+
+    #[test]
+    fn test_parse_csv_quoted_fields() {
+        // Commas and quotes inside double-quoted fields survive.
+        let rows = parse_csv("\"a,b\",\"say \"\"hi\"\"\"\nx,y\n");
+        assert_eq!(rows[0], vec!["a,b".to_string(), "say \"hi\"".to_string()]);
+        // Blank lines skipped.
+        assert_eq!(parse_csv("a\n\nb\n").len(), 2);
+    }
 
     #[test]
     fn test_csv_export_escaping() {
