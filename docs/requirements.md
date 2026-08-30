@@ -128,7 +128,7 @@ Versions verified against crates.io on 2026-08-30.
 | `unicode-width` | 0.2 | Correct cell widths (CJK/emoji) | M1 |
 | `arboard` | 3.6 | Clipboard (degrade gracefully headless) | M1 |
 | `sqlparser` | 0.62 | Autocomplete tier 2 | M2.5 (optional) |
-| `flowmaid` | 0.25 | ER layout engine (`scene()` only, no SVG) | M0 spike / M3 |
+| `flowmaid` | 0.25 | ER layout engine — `er::scene()` yields geometry for a terminal painter; `render()` emits **SVG** (not used) | M0 spike / M3 |
 | `testcontainers` | 0.28 | MySQL integration tests | M1 (dev-dep) |
 
 Rules: no new crate without a line in this table; prefer std/existing deps;

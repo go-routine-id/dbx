@@ -82,15 +82,37 @@ impl ConnectionConfig {
 }
 
 /// Root structure of ~/.config/dbx/config.toml.
+/// Default rows per page when a table tab is opened. Configurable via the
+/// `page_size` key in config.toml.
+const DEFAULT_PAGE_SIZE: u64 = 50;
+
+fn default_page_size() -> u64 {
+    DEFAULT_PAGE_SIZE
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
     pub connections: Vec<ConnectionConfig>,
     #[serde(default)]
     pub settings: HashMap<String, String>,
+    /// Rows fetched per page in the data grid. `0` (or missing) falls back
+    /// to [`DEFAULT_PAGE_SIZE`].
+    #[serde(default = "default_page_size")]
+    pub page_size: u64,
 }
 
 impl AppConfig {
+    /// Resolve the configured page size, treating an absent/zero value as
+    /// the default (a `0` would otherwise mean "fetch nothing").
+    pub fn effective_page_size(&self) -> u64 {
+        if self.page_size == 0 {
+            DEFAULT_PAGE_SIZE
+        } else {
+            self.page_size
+        }
+    }
+
     /// Determines the config file path following XDG precedence:
     /// 1. `--config <path>` override
     /// 2. `$DBX_CONFIG` env var

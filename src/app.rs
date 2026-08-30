@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -299,19 +302,60 @@ fn build_insert_sql(
     ))
 }
 
-const PICKER_HINTS: [(&str, &str); 6] = [
+/// Roadmap M2.10: detect statements that can destroy data before the query
+/// console runs them, so the user gets an explicit confirm dialog.
+///
+/// This is a deliberate heuristic (keyword/prefix scan), NOT a full SQL
+/// parser. False positives are preferred over false negatives — an extra
+/// confirm on a benign query is a small annoyance; a DROP that executes
+/// without confirmation is a data-loss incident.
+fn is_destructive_statement(query: &str) -> bool {
+    let trimmed = query.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    // Split on `;` so each statement in a multi-statement script is checked
+    // independently (a safe SELECT before a DROP still trips the guard).
+    trimmed
+        .split(';')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .any(|s| {
+            let first = s
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_uppercase();
+            match first.as_str() {
+                "DROP" | "TRUNCATE" => true,
+                "DELETE" => !has_where_clause(s),
+                "ALTER" => s.to_uppercase().contains(" DROP "),
+                _ => false,
+            }
+        })
+}
+
+/// Does a statement contain a `WHERE` keyword? Used to allow `DELETE … WHERE`
+/// (targeted) through the guard while blocking `DELETE FROM t` (full table).
+fn has_where_clause(stmt: &str) -> bool {
+    stmt.split_whitespace()
+        .any(|tok| tok.to_uppercase() == "WHERE")
+}
+
+const PICKER_HINTS: [(&str, &str); 7] = [
     ("Enter", "connect"),
     ("a", "add"),
     ("e", "edit"),
     ("d", "delete"),
     ("t", "test"),
+    ("q", "quit"),
     ("?", "help"),
 ];
 
 const EXPLORER_HINTS: [(&str, &str); 12] = [
     ("Tab", "pane"),
     ("c", "new console"),
-    ("F2", "erd"),
+    ("g", "erd"),
     ("Ctrl+Enter", "run SQL"),
     ("Enter/Space", "open/expand"),
     ("y/Y", "copy cell/row"),
@@ -336,7 +380,7 @@ const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
 const EXPLORER_HELP_BINDINGS: [(&str, &str); 19] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
-    ("F2", "open In-Terminal ERD diagram for selected database"),
+    ("g", "open In-Terminal ERD diagram for selected database"),
     ("Ctrl+Enter / F5", "execute SQL query in active console"),
     ("j / Down", "move cursor / selection down"),
     ("k / Up", "move cursor / selection up"),
@@ -407,6 +451,76 @@ impl App {
         }
     }
 
+    /// Handle a mouse event. Currently only left-clicking an ERD node opens
+    /// its DDL (hit-test in scene space); every other mouse gesture is a
+    /// no-op. Keyboard navigation remains the primary interaction model.
+    async fn handle_mouse(&mut self, mouse: MouseEvent) -> anyhow::Result<()> {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return Ok(());
+        }
+        if !matches!(self.mode, ScreenMode::Connected) {
+            return Ok(());
+        }
+        let (Some(drv), Some(exp)) = (&self.active_driver, &mut self.explorer_state) else {
+            return Ok(());
+        };
+        // An overlay modal owns the click — don't let it fall through to the
+        // diagram behind it. The DDL popup dismisses on a click OUTSIDE its
+        // painted rect (standard "click-away" behaviour); every other modal
+        // swallows the click entirely.
+        if exp.ddl_popup.is_some() {
+            let inside = match exp.ddl_popup_area {
+                Some(rect) => {
+                    mouse.column >= rect.x
+                        && mouse.column < rect.x + rect.width
+                        && mouse.row >= rect.y
+                        && mouse.row < rect.y + rect.height
+                }
+                None => false,
+            };
+            if !inside {
+                exp.ddl_popup = None;
+                exp.ddl_popup_area = None;
+            }
+            return Ok(());
+        }
+        if exp.export_modal.is_some()
+            || exp.cell_edit_modal.is_some()
+            || exp.insert_row_modal.is_some()
+            || exp.sql_confirm_modal.is_some()
+        {
+            return Ok(());
+        }
+        let Some(tab) = exp.active_tab_mut() else {
+            return Ok(());
+        };
+        let WorkspaceTab::Erd(erd) = tab else {
+            return Ok(());
+        };
+        let Some(idx) = erd.node_at_mouse(mouse.column, mouse.row) else {
+            return Ok(());
+        };
+        erd.selected_node = Some(idx);
+        let cref = {
+            let Some(scene) = &erd.scene else { return Ok(()) };
+            let node = &scene.scene.nodes[idx];
+            crate::driver::CollectionRef {
+                namespace: erd.namespace.clone(),
+                name: node.id.clone(),
+            }
+        };
+        match drv.definition(&cref).await {
+            Ok(ddl) => {
+                exp.ddl_popup = Some((cref, ddl));
+            }
+            Err(e) => {
+                self.toasts
+                    .push(ToastKind::Error, format!("failed to fetch DDL: {e:#}"));
+            }
+        }
+        Ok(())
+    }
+
     fn handle_key(&mut self, key: KeyEvent) {
         // Universal exit: in raw mode Ctrl+C arrives as a key event, not SIGINT.
         if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
@@ -454,16 +568,19 @@ impl App {
                                 modal.format = formats[next_idx];
                                 let default_ext = modal.format.extension();
                                 modal.target_path = format!("~/dbx_export_{}.{}", modal.default_table_name, default_ext);
+                                modal.confirm_overwrite = false; // new path → re-confirm
                             }
                         }
                         KeyCode::Backspace => {
                             if modal.active_field == 1 {
                                 modal.target_path.pop();
+                                modal.confirm_overwrite = false; // path changed
                             }
                         }
                         KeyCode::Char(c) => {
                             if modal.active_field == 1 && !key.modifiers.contains(KeyModifiers::CONTROL) {
                                 modal.target_path.push(c);
+                                modal.confirm_overwrite = false; // path changed
                             }
                         }
                         _ => {}
@@ -768,6 +885,7 @@ impl App {
                                         target_path: path,
                                         active_field: 0,
                                         default_table_name: t.collection.name.clone(),
+                                        confirm_overwrite: false,
                                     });
                                 }
                                 WorkspaceTab::Console(c) => {
@@ -779,6 +897,7 @@ impl App {
                                             target_path: path,
                                             active_field: 0,
                                             default_table_name: "query_result".to_string(),
+                                            confirm_overwrite: false,
                                         });
                                     } else {
                                         self.toasts.push(ToastKind::Info, "no query result to export".to_string());
@@ -1009,6 +1128,14 @@ impl App {
                                     KeyCode::Down | KeyCode::Char('j') => e.scroll_down(),
                                     KeyCode::Left | KeyCode::Char('h') => e.scroll_left(),
                                     KeyCode::Right | KeyCode::Char('l') => e.scroll_right(),
+                                    KeyCode::Char('0') => e.reset_view(),
+                                    // Keyboard node selection (`.`/`,` next/prev);
+                                    // Enter → DDL is handled in the event loop
+                                    // (it needs `drv.definition().await`).
+                                    KeyCode::Char('.') | KeyCode::Char('>') => e.select_next(),
+                                    KeyCode::Char(',') | KeyCode::Char('<') => e.select_prev(),
+                                    KeyCode::Char('+') | KeyCode::Char('=') => e.zoom_in(),
+                                    KeyCode::Char('-') | KeyCode::Char('_') => e.zoom_out(),
                                     _ => {}
                                 },
                             }
@@ -1201,7 +1328,7 @@ impl App {
         }
     }
 
-    fn draw(&self, f: &mut ratatui::Frame, spinner: &Spinner) {
+    fn draw(&mut self, f: &mut ratatui::Frame, spinner: &Spinner) {
         let area = f.area();
         let theme = &self.theme;
 
@@ -1262,7 +1389,7 @@ impl App {
                 statusbar::render(f, layout.status, context_text, &PICKER_HINTS, theme);
             }
             ScreenMode::Connected => {
-                if let Some(exp) = &self.explorer_state {
+                if let Some(exp) = &mut self.explorer_state {
                     explorer::render_explorer(f, layout.body, exp, theme);
                 }
                 statusbar::render(f, layout.status, "S2: Explorer", &EXPLORER_HINTS, theme);
@@ -1320,13 +1447,16 @@ impl TerminalGuard {
     fn enter() -> io::Result<Self> {
         enable_raw_mode()?;
         let guard = Self;
-        execute!(io::stdout(), EnterAlternateScreen)?;
+        // Mouse capture lets the user click an ERD node (hit-tested in scene
+        // space) to open its DDL. `EnableMouseCapture` + `EnterAlternateScreen`
+        // in one execute keeps the two terminal modes atomic.
+        execute!(io::stdout(), EnableMouseCapture, EnterAlternateScreen)?;
         Ok(guard)
     }
 
     fn restore() {
+        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
     }
 }
 
@@ -1369,10 +1499,9 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
             .draw(|f| app.draw(f, &spinner))
             .context("failed to draw frame")?;
 
-        if event::poll(TICK_CAP).context("failed to poll terminal events")?
-            && let Event::Key(key) = event::read().context("failed to read terminal event")?
-            && key.kind == KeyEventKind::Press
-        {
+        if event::poll(TICK_CAP).context("failed to poll terminal events")? {
+            match event::read().context("failed to read terminal event")? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
             // P5: while a form-modal test is in flight, ignore ALL key input so the user
             // can't edit fields, change driver, or save mid-ping. The spinner + toast
             // communicate progress; result delivered via tick poll.
@@ -1450,6 +1579,24 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             let format = modal.format;
                             let target_path = modal.target_path.clone();
                             let table_name = modal.default_table_name.clone();
+                            let confirm_overwrite = modal.confirm_overwrite;
+
+                            // Overwrite guard: if the target file already exists,
+                            // ask the user to confirm before clobbering it. The
+                            // first Enter flips the flag + warns; the second one
+                            // (with the flag set) proceeds.
+                            if !confirm_overwrite
+                                && std::path::Path::new(&target_path).exists()
+                            {
+                                if let Some(m) = exp.export_modal.as_mut() {
+                                    m.confirm_overwrite = true;
+                                }
+                                app.toasts.push(
+                                    ToastKind::Warning,
+                                    format!("{} already exists — press Enter again to overwrite", target_path),
+                                );
+                                continue;
+                            }
 
                             // Extract current active dataset
                             let export_data: Option<(Vec<String>, Vec<crate::driver::Record>)> = if let Some(tab) = exp.active_tab() {
@@ -1651,12 +1798,12 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             let sql = confirm.sql_query.clone();
                             let drv_clone = drv.clone();
 
-                            app.toasts.push(ToastKind::Info, "executing safe UPDATE...".to_string());
+                            app.toasts.push(ToastKind::Info, "executing confirmed statement...".to_string());
                             match drv_clone.execute(&cref.namespace, &sql).await {
                                 Ok(res) => {
                                     app.toasts.push(
                                         ToastKind::Success,
-                                        format!("updated successfully (rows affected: {})", res.rows_affected),
+                                        format!("executed successfully (rows affected: {})", res.rows_affected),
                                     );
                                     exp.sql_confirm_modal = None;
 
@@ -1676,6 +1823,41 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 Err(e) => {
                                     app.toasts.push(ToastKind::Error, format!("UPDATE failed: {e:#}"));
                                     exp.sql_confirm_modal = None;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
+                    // Enter on an ERD tab with a keyboard-selected node
+                    // (`.`/`,` moves the selection) opens its DDL — the same
+                    // path as a mouse click on the node.
+                    if exp.ddl_popup.is_none()
+                        && exp.focused_pane == FocusedPane::Workspace
+                        && key.code == KeyCode::Enter
+                    {
+                        let cref: Option<crate::driver::CollectionRef> = (|| {
+                            let WorkspaceTab::Erd(erd) = exp.active_tab()? else {
+                                return None;
+                            };
+                            let idx = erd.selected_node?;
+                            let node = &erd.scene.as_ref()?.scene.nodes[idx];
+                            Some(crate::driver::CollectionRef {
+                                namespace: erd.namespace.clone(),
+                                name: node.id.clone(),
+                            })
+                        })();
+                        if let Some(cref) = cref {
+                            let drv_clone = drv.clone();
+                            match drv_clone.definition(&cref).await {
+                                Ok(ddl) => {
+                                    exp.ddl_popup = Some((cref, ddl));
+                                }
+                                Err(e) => {
+                                    app.toasts.push(
+                                        ToastKind::Error,
+                                        format!("failed to fetch DDL: {e:#}"),
+                                    );
                                 }
                             }
                             continue;
@@ -1739,7 +1921,14 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                                 // Metadata fetch failure is non-fatal: tab still loads,
                                                 // just without the NULL-set capability.
                                                 let meta_res = drv_clone.collection_meta(&cref_clone).await;
-                                                let rec_res = drv_clone.records(&cref_clone, Page::default()).await;
+                                                let rec_res = drv_clone.records(
+                                                    &cref_clone,
+                                                    Page {
+                                                        offset: 0,
+                                                        limit: app.config.effective_page_size(),
+                                                    },
+                                                )
+                                                .await;
                                                 match rec_res {
                                                     Ok(rec_page) => {
                                                         let column_meta = meta_res
@@ -1781,7 +1970,20 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                     }
                                 }
                             }
-                            KeyCode::F(2) => {
+                            KeyCode::Char('g') | KeyCode::Char('G') => {
+                                // Roadmap M3.6: ERD entry is capability-gated.
+                                // If the active driver can't lay out an ERD,
+                                // tell the user instead of opening an empty tab.
+                                if !exp
+                                    .driver_capabilities
+                                    .contains(crate::driver::Capabilities::ERD)
+                                {
+                                    app.toasts.push(
+                                        ToastKind::Warning,
+                                        "this driver does not support ERD diagrams".to_string(),
+                                    );
+                                    continue;
+                                }
                                 if let Some(node) = exp.selected_node() {
                                     let target_ns = match &node.kind {
                                         TreeNodeKind::Database(ns) => ns.clone(),
@@ -1837,8 +2039,39 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 exp.namespaces.first().cloned().unwrap_or(crate::driver::Namespace("mysql".to_string()))
                             };
 
+                            // Snapshot the console text before mutating state so
+                            // we can decide whether the statement is destructive
+                            // (M2.10 guard) without holding a borrow on the tab.
+                            let query_text = if let Some(WorkspaceTab::Console(c)) = exp.active_tab() {
+                                c.text()
+                            } else {
+                                continue;
+                            };
+
+                            // Destructive statement guard: DROP / TRUNCATE /
+                            // DELETE-without-WHERE must be confirmed before they
+                            // run. Reuses the SQL-confirm modal (Enter = execute,
+                            // Esc = cancel) with a placeholder collection — the
+                            // confirm path only needs the namespace.
+                            if is_destructive_statement(&query_text) {
+                                app.toasts.push(
+                                    ToastKind::Warning,
+                                    "destructive statement detected — confirm to execute".to_string(),
+                                );
+                                exp.sql_confirm_modal = Some(
+                                    crate::ui::screens::explorer::SqlConfirmModalState {
+                                        collection: crate::driver::CollectionRef {
+                                            namespace: active_ns,
+                                            name: "(console)".to_string(),
+                                        },
+                                        sql_query: query_text,
+                                        row_idx: 0,
+                                    },
+                                );
+                                continue;
+                            }
+
                             if let Some(WorkspaceTab::Console(console)) = exp.active_tab_mut() {
-                                let query_text = console.text();
                                 let drv_clone = drv.clone();
                                 console.is_executing = true;
                                 console.execution_error = None;
@@ -2062,6 +2295,12 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                     app.handle_key(key);
                 }
             }
+            }
+                Event::Mouse(mouse) => {
+                    app.handle_mouse(mouse).await?;
+                }
+                _ => {}
+            }
         }
 
         if last_tick.elapsed() >= TICK_CAP {
@@ -2111,4 +2350,161 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::{CollectionRef, Namespace, Record, Value};
+
+    fn cref(ns: &str, tbl: &str) -> CollectionRef {
+        CollectionRef {
+            namespace: Namespace(ns.to_string()),
+            name: tbl.to_string(),
+        }
+    }
+
+    fn row(values: Vec<Value>) -> Record {
+        Record { values }
+    }
+
+    #[test]
+    fn test_quote_ident_by_dialect() {
+        // PostgreSQL → double quotes
+        assert_eq!(quote_ident("users", "PostgreSQL 15.3"), "\"users\"");
+        assert_eq!(quote_ident("order_items", "postgres"), "\"order_items\"");
+        // MySQL → backticks
+        assert_eq!(quote_ident("users", "MySQL 8.0"), "`users`");
+        assert_eq!(quote_ident("order items", "mysql"), "`order items`");
+        // SQL Server → brackets
+        assert_eq!(quote_ident("users", "Microsoft SQL Server 2019"), "[users]");
+        // SQLite → backticks (accepted by SQLite)
+        assert_eq!(quote_ident("users", "SQLite 3.45"), "`users`");
+        // Unknown driver defaults to PG double-quote
+        assert_eq!(quote_ident("users", "MongoDB"), "\"users\"");
+    }
+
+    #[test]
+    fn test_quote_ident_escapes_inner_quote() {
+        // An identifier containing the quote char must double it up.
+        assert_eq!(quote_ident("a\"b", "postgres"), "\"a\"\"b\"");
+        assert_eq!(quote_ident("a`b", "mysql"), "`a``b`");
+        assert_eq!(quote_ident("a]b", "sql server"), "[a]]b]");
+    }
+
+    #[test]
+    fn test_single_row_suffix_by_dialect() {
+        assert_eq!(single_row_suffix("MySQL 8.0"), " LIMIT 1");
+        assert_eq!(single_row_suffix("MariaDB 10.11"), " LIMIT 1");
+        assert_eq!(single_row_suffix("PostgreSQL 15.3"), "");
+        assert_eq!(single_row_suffix("Microsoft SQL Server 2019"), "");
+        assert_eq!(single_row_suffix("SQLite 3.45"), "");
+    }
+
+    #[test]
+    fn test_escape_string_literal_doubles_quotes() {
+        assert_eq!(escape_string_literal("plain"), "plain");
+        assert_eq!(escape_string_literal("O'Brien"), "O''Brien");
+        assert_eq!(escape_string_literal("it's ''quoted''"), "it''s ''''quoted''''");
+    }
+
+    #[test]
+    fn test_render_buffer_sql_sentinel_and_quotes() {
+        assert_eq!(render_buffer_sql(NULL_SENTINEL), "NULL");
+        assert_eq!(render_buffer_sql("hello"), "'hello'");
+        assert_eq!(render_buffer_sql(""), "''");
+        assert_eq!(render_buffer_sql("O'Brien"), "'O''Brien'");
+    }
+
+    #[test]
+    fn test_build_where_pk_prefer_and_quote() {
+        let cols = vec!["id".to_string(), "name".to_string()];
+        let rec = row(vec![Value::Int(42), Value::String("ada".to_string())]);
+        let pk = vec!["id".to_string()];
+
+        // PostgreSQL: PK column double-quoted, int rendered as quoted literal.
+        let sql = build_where_for_row(&cols, &rec, &pk, "PostgreSQL 15.3").unwrap();
+        assert_eq!(sql, "\"id\" = '42'");
+
+        // MySQL: backtick.
+        let sql = build_where_for_row(&cols, &rec, &pk, "MySQL 8.0").unwrap();
+        assert_eq!(sql, "`id` = '42'");
+    }
+
+    #[test]
+    fn test_build_where_null_pk_uses_is_null() {
+        let cols = vec!["id".to_string(), "name".to_string()];
+        let rec = row(vec![Value::Null, Value::String("ada".to_string())]);
+        let pk = vec!["id".to_string()];
+        let sql = build_where_for_row(&cols, &rec, &pk, "postgres").unwrap();
+        assert_eq!(sql, "\"id\" IS NULL");
+    }
+
+    #[test]
+    fn test_build_where_falls_back_to_all_columns() {
+        let cols = vec!["a".to_string(), "b".to_string()];
+        let rec = row(vec![Value::Int(1), Value::Null]);
+        // No PK → every column participates; NULL → IS NULL.
+        let sql = build_where_for_row(&cols, &rec, &[], "postgres").unwrap();
+        assert_eq!(sql, "\"a\" = '1' AND \"b\" IS NULL");
+    }
+
+    #[test]
+    fn test_build_where_empty_returns_none() {
+        // Zero-column table → no WHERE at all → None (caller bails out).
+        assert_eq!(build_where_for_row(&[], &row(vec![]), &[], "postgres"), None);
+    }
+
+    #[test]
+    fn test_build_insert_skips_none_and_quotes_by_dialect() {
+        let c = cref("shop", "orders");
+        let fields = vec![
+            ("id".to_string(), Some("5".to_string())),
+            ("user_id".to_string(), Some(NULL_SENTINEL.to_string())),
+            ("note".to_string(), None), // skip → server DEFAULT
+        ];
+
+        let pg = build_insert_sql(&c, &fields, "PostgreSQL 15.3").unwrap();
+        assert_eq!(
+            pg,
+            "INSERT INTO \"shop\".\"orders\" (\"id\", \"user_id\") VALUES ('5', NULL);"
+        );
+
+        let my = build_insert_sql(&c, &fields, "MySQL 8.0").unwrap();
+        assert_eq!(
+            my,
+            "INSERT INTO `shop`.`orders` (`id`, `user_id`) VALUES ('5', NULL);"
+        );
+    }
+
+    #[test]
+    fn test_build_insert_all_skipped_returns_none() {
+        let c = cref("shop", "orders");
+        let fields = vec![("id".to_string(), None)];
+        assert_eq!(build_insert_sql(&c, &fields, "postgres"), None);
+    }
+
+    #[test]
+    fn test_is_destructive_statement() {
+        // DROP / TRUNCATE always trip the guard.
+        assert!(is_destructive_statement("DROP TABLE users;"));
+        assert!(is_destructive_statement("drop database app;"));
+        assert!(is_destructive_statement("TRUNCATE TABLE audit_log;"));
+        // DELETE without WHERE is destructive.
+        assert!(is_destructive_statement("DELETE FROM users;"));
+        assert!(is_destructive_statement("DELETE FROM users"));
+        // DELETE with WHERE is allowed through.
+        assert!(!is_destructive_statement("DELETE FROM users WHERE id = 5;"));
+        // ALTER that DROPs a column is destructive.
+        assert!(is_destructive_statement("ALTER TABLE users DROP COLUMN email;"));
+        // ALTER that ADDs is safe.
+        assert!(!is_destructive_statement("ALTER TABLE users ADD COLUMN bio TEXT;"));
+        // A benign SELECT is safe even if a later chunk is destructive.
+        assert!(is_destructive_statement("SELECT * FROM users; DROP TABLE users;"));
+        // Case-insensitive.
+        assert!(is_destructive_statement("  drop  table  users  "));
+        // Empty / whitespace → safe.
+        assert!(!is_destructive_statement(""));
+        assert!(!is_destructive_statement("   "));
+    }
 }

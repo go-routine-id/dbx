@@ -16,8 +16,11 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
 
-/// How long a toast stays visible before `tick` removes it.
+/// How long a normal toast stays visible before `tick` removes it.
 pub const TOAST_TTL: Duration = Duration::from_secs(3);
+/// Errors carry more detail (SQL messages, paths, causes), so give them
+/// longer to read than an info/success blip.
+pub const ERROR_TTL: Duration = Duration::from_secs(7);
 /// Maximum number of toasts visible at once.
 pub const MAX_VISIBLE: usize = 3;
 /// Fixed box height (1 content line + top/bottom border).
@@ -31,10 +34,21 @@ pub enum ToastKind {
     Info,
 }
 
+impl ToastKind {
+    /// Longer-lived errors vs. short-lived info/success.
+    fn ttl(self) -> Duration {
+        match self {
+            ToastKind::Error => ERROR_TTL,
+            _ => TOAST_TTL,
+        }
+    }
+}
+
 struct Toast {
     kind: ToastKind,
     message: String,
     created: Instant,
+    ttl: Duration,
 }
 
 #[derive(Default)]
@@ -52,11 +66,12 @@ impl Toasts {
             kind,
             message: message.into(),
             created: Instant::now(),
+            ttl: kind.ttl(),
         });
     }
 
     pub fn tick(&mut self) {
-        self.items.retain(|t| t.created.elapsed() < TOAST_TTL);
+        self.items.retain(|t| t.created.elapsed() < t.ttl);
     }
 
     pub fn render(&self, f: &mut Frame, area: Rect, theme: &Theme) {

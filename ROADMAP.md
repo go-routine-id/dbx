@@ -95,17 +95,22 @@ cancel kills a sleeping query **server-side** (verified in tests, 2.9).
 
 **Goal:** in-terminal ER diagram via [flowmaid](https://github.com/go-routine-id/flowmaid).
 
-**Deliverable:** `ctrl+g` opens a pannable/zoomable ERD of the current
+**Deliverable:** `g` opens a pannable/zoomable ERD of the current
 schema; selecting a table opens its DDL.
+
+> Status: **mostly implemented (Aug 2026)** — see [README.md](README.md).
+> The shortcut is `g` (not `ctrl+g` as originally scoped). Painter = the
+> `flowmaid_spike` (M0 0.8) ported into `src/ui/screens/erd.rs`; pan/zoom/select
+> (`hjkl`, `+`/`-`, `.`/`,`, `Enter`) and mouse-click → DDL are done.
 
 | # | Task | Output |
 |---|------|--------|
-| 3.1 | Relation graph in driver | `relation_graph()`: FK edges from `information_schema.KEY_COLUMN_USAGE`, junction-table (M:N) detection |
-| 3.2 | Mermaid generator | `RelationGraph` → `erDiagram` text (entities + relationships + labels) |
-| 3.3 | ratatui painter for flowmaid `Scene` | Render nodes as boxes + edges as unicode lines/beziers onto a canvas widget (reference: flowcli; **approach already validated by the M0 spike, 0.8**) |
-| 3.4 | View interactions | `hjkl`/arrows pan, `+`/`-` zoom, `/` find table, node selection via flowmaid `hit_test` |
-| 3.5 | Node actions | `enter` → DDL popup (P1); edge re-route on node move via flowmaid `route()` (stretch) |
-| 3.6 | Capability gating | ERD entry hidden when driver lacks `ERD` capability |
+| 3.1 | Relation graph in driver | FK edges from `information_schema` / `pg_constraint`; junction-table (M:N) detection (**done** — via `CollectionMeta.foreign_keys`) |
+| 3.2 | Mermaid generator | `RelationGraph` → `erDiagram` text (entities + relationships + labels) — **superseded**: we build `flowmaid::model::ErDiagram` directly from metadata, no Mermaid text round-trip |
+| 3.3 | ratatui painter for flowmaid `Scene` | Render nodes as boxes + edges as unicode lines/beziers onto a canvas widget (**done** — validated by the M0 spike, 0.8) |
+| 3.4 | View interactions | `hjkl`/arrows pan (**done**), `+`/`-` zoom (**done**), `/` find table (**todo**), node selection via `hit_test` (**done** — mouse + `.`/`,` keyboard) |
+| 3.5 | Node actions | `Enter` → DDL popup (**done**); edge re-route on node move via flowmaid `route()` (**stretch, todo**) |
+| 3.6 | Capability gating | ERD entry hidden when driver lacks `ERD` capability (**done**) |
 
 **Done when:** a schema with 20+ tables + FKs renders a legible diagram,
 panning/zooming is smooth (per-cell snap acceptable), selecting a table shows

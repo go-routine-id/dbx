@@ -27,6 +27,9 @@ pub struct ExportModalState {
     pub target_path: String,
     pub active_field: usize, // 0: Format selector, 1: Path input
     pub default_table_name: String,
+    /// Set when the user pressed Enter on an existing path and we asked them
+    /// to confirm overwriting. Cleared when the modal is (re)opened.
+    pub confirm_overwrite: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +119,10 @@ pub struct ExplorerState {
     pub tables: std::collections::HashMap<String, Vec<Collection>>,
     pub tree_nodes: Vec<TreeNode>,
     pub selected_tree_index: usize,
+    /// First tree-node row currently visible in the tree pane. Adjusted on
+    /// every draw so `selected_tree_index` stays in view when the list is
+    /// taller than the viewport.
+    pub tree_scroll: usize,
 
     // Right Workspace Tabs (Tables & Query Consoles)
     pub tabs: Vec<WorkspaceTab>,
@@ -123,6 +130,9 @@ pub struct ExplorerState {
 
     // Modals
     pub ddl_popup: Option<(CollectionRef, String)>,
+    /// Rect of the DDL popup as last painted, used to dismiss it on a click
+    /// outside the popup. Only meaningful while `ddl_popup` is `Some`.
+    pub ddl_popup_area: Option<Rect>,
     pub export_modal: Option<ExportModalState>,
     pub cell_edit_modal: Option<CellEditModalState>,
     pub sql_confirm_modal: Option<SqlConfirmModalState>,
@@ -147,9 +157,11 @@ impl ExplorerState {
             tables: std::collections::HashMap::new(),
             tree_nodes,
             selected_tree_index: 0,
+            tree_scroll: 0,
             tabs: Vec::new(),
             active_tab_index: 0,
             ddl_popup: None,
+            ddl_popup_area: None,
             export_modal: None,
             cell_edit_modal: None,
             sql_confirm_modal: None,
@@ -215,7 +227,7 @@ impl ExplorerState {
 pub fn render_explorer(
     f: &mut Frame,
     area: Rect,
-    state: &ExplorerState,
+    state: &mut ExplorerState,
     theme: &Theme,
 ) {
     let main_chunks = Layout::default()
@@ -229,8 +241,8 @@ pub fn render_explorer(
     render_tree(f, main_chunks[0], state, theme);
     render_workspace(f, main_chunks[1], state, theme);
 
-    if let Some((cref, ddl)) = &state.ddl_popup {
-        render_ddl_popup(f, area, cref, ddl, theme);
+    if let Some((cref, ddl)) = state.ddl_popup.clone() {
+        state.ddl_popup_area = Some(render_ddl_popup(f, area, &cref, &ddl, theme));
     }
 
     if let Some(export_modal) = &state.export_modal {
@@ -250,7 +262,7 @@ pub fn render_explorer(
     }
 }
 
-fn render_tree(f: &mut Frame, area: Rect, state: &ExplorerState, theme: &Theme) {
+fn render_tree(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme: &Theme) {
     let is_focused = state.focused_pane == FocusedPane::Tree;
     let border_style = if is_focused { theme.accent() } else { theme.border() };
 
@@ -271,9 +283,29 @@ fn render_tree(f: &mut Frame, area: Rect, state: &ExplorerState, theme: &Theme) 
         return;
     }
 
+    // Follow-scroll: the tree can be taller than the pane. We know the
+    // viewport height here, so lazily nudge `tree_scroll` so the selected
+    // row stays visible after every navigation / expansion. This is
+    // idempotent, so drawing every frame is harmless.
+    let visible = inner.height as usize;
+    let len = state.tree_nodes.len();
+    let sel = state.selected_tree_index;
+    if state.tree_scroll > sel {
+        state.tree_scroll = sel;
+    }
+    let max_scroll = len.saturating_sub(visible);
+    if state.tree_scroll > max_scroll {
+        state.tree_scroll = max_scroll;
+    }
+    if sel >= state.tree_scroll.saturating_add(visible) {
+        state.tree_scroll = sel.saturating_add(1).saturating_sub(visible);
+    }
+
+    let end = (state.tree_scroll + visible).min(len);
     let mut lines = Vec::new();
-    for (i, node) in state.tree_nodes.iter().enumerate() {
-        let is_sel = i == state.selected_tree_index && is_focused;
+    for i in state.tree_scroll..end {
+        let node = &state.tree_nodes[i];
+        let is_sel = i == sel && is_focused;
         let line = match &node.kind {
             TreeNodeKind::Database(ns) => {
                 let prefix = if node.is_loading {
@@ -294,8 +326,10 @@ fn render_tree(f: &mut Frame, area: Rect, state: &ExplorerState, theme: &Theme) 
                 ])
             }
             TreeNodeKind::Table(cref, count) => {
+                // Row count comes from the information schema / planner
+                // estimate, so it's approximate — mark it with `~`.
                 let count_str = count
-                    .map(|c| format!(" ({})", c))
+                    .map(|c| format!(" (~{})", c))
                     .unwrap_or_default();
                 let style = if is_sel {
                     theme.selected()
@@ -316,7 +350,7 @@ fn render_tree(f: &mut Frame, area: Rect, state: &ExplorerState, theme: &Theme) 
     f.render_widget(p, inner);
 }
 
-fn render_workspace(f: &mut Frame, area: Rect, state: &ExplorerState, theme: &Theme) {
+fn render_workspace(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme: &Theme) {
     let is_focused = state.focused_pane == FocusedPane::Workspace;
     let border_style = if is_focused { theme.accent() } else { theme.border() };
 
@@ -371,7 +405,7 @@ fn render_workspace(f: &mut Frame, area: Rect, state: &ExplorerState, theme: &Th
     f.render_widget(Paragraph::new(Line::from(tab_spans)), chunks[0]);
 
     // 2. Active Tab Body
-    if let Some(tab) = state.active_tab() {
+    if let Some(tab) = state.active_tab_mut() {
         match tab {
             WorkspaceTab::Table(data_tab) => {
                 render_grid(f, chunks[1], data_tab, is_focused, theme);
@@ -512,13 +546,15 @@ fn render_grid(f: &mut Frame, area: Rect, tab: &DataTab, is_focused: bool, theme
     f.render_stateful_widget(table, area, &mut state);
 }
 
+/// Renders the DDL popup and returns its `Rect` so callers can hit-test a
+/// mouse click (click outside → dismiss).
 fn render_ddl_popup(
     f: &mut Frame,
     area: Rect,
     cref: &CollectionRef,
     ddl: &str,
     theme: &Theme,
-) {
+) -> Rect {
     let width = 75.min(area.width.saturating_sub(4));
     let height = 24.min(area.height.saturating_sub(2));
 
@@ -544,6 +580,8 @@ fn render_ddl_popup(
 
     let p = Paragraph::new(ddl).style(theme.base());
     f.render_widget(p, inner);
+
+    popup_area
 }
 
 fn render_export_modal(

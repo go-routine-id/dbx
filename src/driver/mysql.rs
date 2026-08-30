@@ -77,6 +77,7 @@ impl Driver for MySqlDriver {
             | Capabilities::QUERY_TEXT
             | Capabilities::DDL
             | Capabilities::ERD
+            | Capabilities::EXPLAIN
             | Capabilities::EDIT_DATA
     }
 

@@ -104,17 +104,27 @@ pub struct ConfirmDeleteModal {
 
 impl ConnectionForm {
     pub fn new_empty() -> Self {
+        // Environment-provided defaults so the form isn't hardcoded to a
+        // specific machine. All of these are optional; a connection is still
+        // valid with empty fields (host/port fall back to driver defaults
+        // when building the `ConnectionConfig`).
+        let env_default = |key: &str| std::env::var(key).unwrap_or_default();
+        let env_port = env_default("DBX_DEFAULT_PORT");
         Self {
             is_editing: false,
             original_name: None,
             focused_field: FormField::Name,
-            name: "Local MySQL".to_string(),
+            name: String::new(),
             driver: DriverType::MySql,
-            host: "127.0.0.1".to_string(),
-            port: "3306".to_string(),
-            user: "root".to_string(),
-            password: "".to_string(),
-            database: "".to_string(),
+            host: env_default("DBX_DEFAULT_HOST"),
+            port: if env_port.is_empty() {
+                DriverType::MySql.default_port().to_string()
+            } else {
+                env_port
+            },
+            user: env_default("DBX_DEFAULT_USER"),
+            password: env_default("DBX_DEFAULT_PASSWORD"),
+            database: env_default("DBX_DEFAULT_DATABASE"),
             last_test_result: None,
         }
     }

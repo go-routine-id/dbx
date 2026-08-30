@@ -76,6 +76,7 @@ impl Driver for PostgresDriver {
             | Capabilities::QUERY_TEXT
             | Capabilities::DDL
             | Capabilities::ERD
+            | Capabilities::EXPLAIN
             | Capabilities::EDIT_DATA
     }
 
