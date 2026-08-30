@@ -76,6 +76,29 @@ click outside a popup to dismiss it. Consequence: **selecting/copying text in
 the terminal requires holding `Shift`** (standard for TUI apps with mouse
 support). Mouse capture is released automatically when the app exits.
 
+## Configuration
+
+Config lives in `config.toml` (`~/.config/dbx/config.toml`, or `$DBX_CONFIG` /
+`--config`). Keys:
+
+| Key | Default | Description |
+|---|---|---|
+| `connections` | `[]` | Saved connection entries |
+| `page_size` | `50` | Rows fetched per page in the data grid |
+
+Environment variables:
+
+| Env | Description |
+|---|---|
+| `DBX_CONFIG` | Config file path override (same as `--config`) |
+| `DBX_DEFAULT_HOST` | Default host pre-filled in the "New Connection" form |
+| `DBX_DEFAULT_PORT` | Default port pre-filled in the form |
+| `DBX_DEFAULT_USER` | Default username pre-filled in the form |
+| `DBX_DEFAULT_PASSWORD` | Default password pre-filled in the form |
+| `DBX_DEFAULT_DATABASE` | Default database pre-filled in the form |
+
+Passwords may reference environment variables directly: `password = "$ENV:MY_DB_PASS"`.
+
 ## Tech
 
 Built in Rust with [ratatui](https://github.com/ratatui-org/ratatui),

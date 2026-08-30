@@ -128,11 +128,18 @@ impl ErdTab {
     /// feed the model straight into flowmaid's scene.
     pub fn generate_from_meta(&mut self, collections: &[CollectionMeta]) {
         let er = build_er_diagram(collections);
-        let scene = er::scene(&er);
-        self.scene_w = scene.scene.width;
-        self.scene_h = scene.scene.height;
-        self.scene = Some(scene);
-        self.last_error = None;
+        match layout(&er) {
+            Ok(scene) => {
+                self.scene_w = scene.scene.width;
+                self.scene_h = scene.scene.height;
+                self.scene = Some(scene);
+                self.last_error = None;
+            }
+            Err(e) => {
+                self.scene = None;
+                self.last_error = Some(e);
+            }
+        }
         self.is_loading = false;
     }
 
@@ -143,11 +150,18 @@ impl ErdTab {
     pub fn generate_from_mermaid(&mut self, mermaid: &str) {
         match parse_document(mermaid) {
             Ok(Document::Er(er)) => {
-                let scene = er::scene(&er);
-                self.scene_w = scene.scene.width;
-                self.scene_h = scene.scene.height;
-                self.scene = Some(scene);
-                self.last_error = None;
+                match layout(&er) {
+                    Ok(scene) => {
+                        self.scene_w = scene.scene.width;
+                        self.scene_h = scene.scene.height;
+                        self.scene = Some(scene);
+                        self.last_error = None;
+                    }
+                    Err(e) => {
+                        self.scene = None;
+                        self.last_error = Some(e);
+                    }
+                }
             }
             Ok(_) => {
                 self.scene = None;
@@ -249,6 +263,17 @@ impl ErdTab {
     }
 }
 
+/// Run flowmaid's layout engine defensively. `er::scene` is **infallible**
+/// (it panics rather than returning a `Result` on malformed input), which
+/// would take down the whole TUI. Our input comes from structured schema
+/// metadata so panics are unlikely, but a single layout panic shouldn't end
+/// the user's session — catch it and surface it as a renderable error
+/// instead.
+fn layout(er: &ErDiagram) -> Result<ErScene, String> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| er::scene(er)))
+        .map_err(|_| "diagram layout panicked inside flowmaid".to_string())
+}
+
 /// Build a `flowmaid::model::ErDiagram` from driver-level metadata.
 ///
 /// FK relationships are walked and emitted as `Relation`s. We do not
@@ -294,16 +319,21 @@ fn build_er_diagram(collections: &[CollectionMeta]) -> ErDiagram {
     // Relations. All FKs are treated as identifying (`--`) — the driver's
     // metadata doesn't carry a non-identifying flag, and a TUI ERD
     // doesn't usually need to distinguish them.
+    //
+    // A FK may reference a table in ANOTHER namespace. Instead of dropping
+    // the relationship, we draw it to an "external entity" placeholder whose
+    // name is `schema.table` — it renders as a small grey box with no
+    // columns, so cross-schema relationships stay visible.
     let ns = collections.first().map(|m| m.reference.namespace.clone());
     for meta in collections {
         for fk in &meta.foreign_keys {
-            if Some(&fk.ref_namespace) != ns.as_ref() {
-                continue; // cross-namespace FK — skip
-            }
-            if !er.entities.iter().any(|e| e.name == fk.ref_table) {
-                continue; // referenced table isn't in this ERD
-            }
-            let from = er.ensure_entity(&fk.ref_table);
+            let ref_ns_is_this = Some(&fk.ref_namespace) == ns.as_ref();
+            let parent_name = if ref_ns_is_this {
+                fk.ref_table.clone()
+            } else {
+                format!("{}.{}", fk.ref_namespace.0, fk.ref_table)
+            };
+            let from = er.ensure_entity(&parent_name);
             let to = er.ensure_entity(&meta.reference.name);
             // Cardinality (crow's foot):
             // - card_from (parent side) is always exactly-one: an FK row
@@ -520,7 +550,15 @@ fn draw_tables(
             continue;
         }
 
-        let accent = ACCENTS[i % ACCENTS.len()];
+        // Cross-namespace placeholder entities are named `schema.table` —
+        // render them greyed-out so they read as "external, not in this
+        // schema" at a glance.
+        let is_external = table.name.contains('.');
+        let accent = if is_external {
+            Color::DarkGray
+        } else {
+            ACCENTS[i % ACCENTS.len()]
+        };
         // Selected node: brighter, bold border so it reads as the active
         // target (e.g. for Enter→DDL / click→DDL).
         let is_selected = selected == Some(i);
@@ -839,7 +877,9 @@ mod tests {
     }
 
     #[test]
-    fn test_er_diagram_skips_cross_namespace_fk() {
+    fn test_er_diagram_external_entity_for_cross_namespace_fk() {
+        // A FK to another namespace must NOT be dropped — it targets an
+        // "external entity" placeholder named `schema.table`.
         let users = table("users", vec![col("id", "int", true, false, true)], vec![]);
         let other = table(
             "other",
@@ -853,7 +893,11 @@ mod tests {
             }],
         );
         let er = build_er_diagram(&[users, other]);
-        assert_eq!(er.relations.len(), 0, "cross-namespace FK must be dropped");
+        assert_eq!(er.relations.len(), 1, "cross-namespace FK must be kept");
+        // The parent entity is the external placeholder.
+        let rel = &er.relations[0];
+        assert_eq!(er.entities[rel.from].name, "other_ns.users");
+        assert_eq!(er.entities[rel.to].name, "other");
     }
 
     #[test]

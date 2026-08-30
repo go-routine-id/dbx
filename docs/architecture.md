@@ -59,6 +59,12 @@ capability instead of per database type:
 | `EDIT_DATA`       | inline edit (post-v0.1)          |  ✅   |  ✅   |  ✅   |
 | `EXPLAIN`         | plan viewer                      |  ✅   |  ✅   |  ❌   |
 
+> **`EXPLAIN` status (Aug 2026)**: both MySQL and PostgreSQL drivers set this
+> capability today, but there is **no plan-viewer UI yet** — `EXPLAIN`
+> queries run through the console and return raw rows. The capability is
+> reserved for the future "EXPLAIN viewer (text/XML plan)" feature so the UI
+> can gate on it without a driver change later.
+
 Example: opening ERD on a Redis connection → menu item is hidden, not broken.
 
 ## Trait sketch (stable contract first, methods per capability)

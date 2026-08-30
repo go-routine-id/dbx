@@ -45,8 +45,13 @@ pub struct ConnectionConfig {
     pub ssl: bool,
 }
 
+/// Default connection host when a config entry omits it. Local dev
+/// databases conventionally live on loopback; override per-machine with
+/// `DBX_DEFAULT_HOST`.
+pub const DEFAULT_HOST: &str = "127.0.0.1";
+
 fn default_host() -> String {
-    "127.0.0.1".to_string()
+    std::env::var("DBX_DEFAULT_HOST").unwrap_or_else(|_| DEFAULT_HOST.to_string())
 }
 
 impl ConnectionConfig {

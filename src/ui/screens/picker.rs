@@ -149,7 +149,7 @@ impl ConnectionForm {
         ConnectionConfig {
             name: self.name.trim().to_string(),
             driver: self.driver.clone(),
-            host: if self.host.trim().is_empty() { "127.0.0.1".to_string() } else { self.host.trim().to_string() },
+            host: if self.host.trim().is_empty() { crate::config::DEFAULT_HOST.to_string() } else { self.host.trim().to_string() },
             port: self.port.trim().parse::<u16>().ok(),
             user: if self.user.trim().is_empty() { None } else { Some(self.user.trim().to_string()) },
             password: if self.password.is_empty() { None } else { Some(self.password.clone()) },
