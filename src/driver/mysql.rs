@@ -2,7 +2,7 @@
 //! Translates information_schema metadata and SQL queries into model-agnostic structs.
 
 use std::time::{Duration, Instant};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use sqlx::mysql::{MySqlConnectOptions, MySqlPool, MySqlPoolOptions, MySqlRow};
 use sqlx::{Column, Row, TypeInfo, ValueRef, AssertSqlSafe};
@@ -63,6 +63,27 @@ impl MySqlDriver {
         };
 
         Ok(Self { pool, info })
+    }
+
+    /// Shared helper for the "list object names in a schema" queries.
+    async fn query_collection_names(
+        &self,
+        sql: &'static str,
+        ns: &str,
+        what: &str,
+    ) -> Result<Vec<Collection>> {
+        let rows = sqlx::query(sql)
+            .bind(ns)
+            .fetch_all(&self.pool)
+            .await
+            .with_context(|| format!("failed to list {what}"))?;
+        Ok(rows
+            .iter()
+            .map(|r| Collection {
+                name: r.get::<String, _>(0),
+                estimated_row_count: None,
+            })
+            .collect())
     }
 }
 
@@ -350,6 +371,54 @@ impl Driver for MySqlDriver {
             .with_context(|| format!("failed to get DDL for {}", c))?;
         let ddl: String = row.get(1);
         Ok(ddl)
+    }
+
+    async fn list_views(&self, ns: &Namespace) -> Result<Vec<Collection>> {
+        self.query_collection_names(
+            "SELECT TABLE_NAME FROM information_schema.TABLES \
+             WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'VIEW' ORDER BY TABLE_NAME",
+            &ns.0,
+            "views",
+        )
+        .await
+    }
+
+    async fn list_routines(&self, ns: &Namespace) -> Result<Vec<Collection>> {
+        self.query_collection_names(
+            "SELECT ROUTINE_NAME FROM information_schema.ROUTINES \
+             WHERE ROUTINE_SCHEMA = ? GROUP BY ROUTINE_NAME ORDER BY ROUTINE_NAME",
+            &ns.0,
+            "routines",
+        )
+        .await
+    }
+
+    // list_sequences: MySQL has no first-class sequences — default impl
+    // (empty) is used.
+
+    async fn routine_definition(&self, c: &CollectionRef) -> Result<String> {
+        let row = sqlx::query(
+            "SELECT ROUTINE_DEFINITION FROM information_schema.ROUTINES \
+             WHERE ROUTINE_SCHEMA = ? AND ROUTINE_NAME = ? \
+             ORDER BY ROUTINE_TYPE LIMIT 1",
+        )
+        .bind(&c.namespace.0)
+        .bind(&c.name)
+        .fetch_optional(&self.pool)
+        .await
+        .context("failed to fetch routine definition")?;
+        match row {
+            Some(r) => match r.try_get::<String, _>(0) {
+                // ROUTINE_DEFINITION is NULL for users without SHOW_ROUTINE /
+                // global SELECT — treat as "unavailable" instead of panicking.
+                Ok(def) if !def.is_empty() => Ok(def),
+                _ => Err(anyhow!(
+                    "routine definition unavailable (insufficient privileges): {}",
+                    c
+                )),
+            },
+            None => Err(anyhow!("routine not found: {}", c)),
+        }
     }
 }
 

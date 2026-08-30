@@ -2,7 +2,7 @@
 //! Translates PostgreSQL information_schema, pg_catalog metadata, and SQL queries into model-agnostic structs.
 
 use std::time::{Duration, Instant};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use async_trait::async_trait;
 use sqlx::postgres::{PgConnectOptions, PgPool, PgPoolOptions, PgRow};
 use sqlx::{Column, Row, TypeInfo, ValueRef, AssertSqlSafe};
@@ -63,6 +63,29 @@ impl PostgresDriver {
 
         Ok(Self { pool, info })
     }
+
+    /// Shared helper for the "list object names in a schema" queries
+    /// (views / routines / sequences). Keeps the row→Collection mapping in
+    /// one place instead of five copy-paste sites.
+    async fn query_collection_names(
+        &self,
+        sql: &'static str,
+        ns: &str,
+        what: &str,
+    ) -> Result<Vec<Collection>> {
+        let rows = sqlx::query(sql)
+            .bind(ns)
+            .fetch_all(&self.pool)
+            .await
+            .with_context(|| format!("failed to list {what}"))?;
+        Ok(rows
+            .iter()
+            .map(|r| Collection {
+                name: r.get::<String, _>(0),
+                estimated_row_count: None,
+            })
+            .collect())
+    }
 }
 
 #[async_trait]
@@ -122,7 +145,7 @@ impl Driver for PostgresDriver {
                    c.reltuples::bigint AS estimated_rows \
             FROM pg_class c \
             JOIN pg_namespace n ON n.oid = c.relnamespace \
-            WHERE n.nspname = $1 AND c.relkind IN ('r', 'p', 'v', 'm') \
+            WHERE n.nspname = $1 AND c.relkind IN ('r', 'p') \
             ORDER BY c.relname";
 
         let rows = sqlx::query(sql)
@@ -467,6 +490,58 @@ impl Driver for PostgresDriver {
         ddl.push_str(&lines.join(",\n"));
         ddl.push_str("\n);");
         Ok(ddl)
+    }
+
+    async fn list_views(&self, ns: &Namespace) -> Result<Vec<Collection>> {
+        // pg_class relkind 'v' (view) + 'm' (materialized view) — everything
+        // that isn't a plain/partitioned table. `collections()` only returns
+        // 'r'/'p', so views appear exactly once, under the View node.
+        self.query_collection_names(
+            "SELECT c.relname FROM pg_class c \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relkind IN ('v', 'm') \
+             ORDER BY c.relname",
+            &ns.0,
+            "views",
+        )
+        .await
+    }
+
+    async fn list_routines(&self, ns: &Namespace) -> Result<Vec<Collection>> {
+        self.query_collection_names(
+            "SELECT routine_name FROM information_schema.routines \
+             WHERE routine_schema = $1 GROUP BY routine_name ORDER BY routine_name",
+            &ns.0,
+            "routines",
+        )
+        .await
+    }
+
+    async fn list_sequences(&self, ns: &Namespace) -> Result<Vec<Collection>> {
+        self.query_collection_names(
+            "SELECT sequence_name FROM information_schema.sequences \
+             WHERE sequence_schema = $1 ORDER BY sequence_name",
+            &ns.0,
+            "sequences",
+        )
+        .await
+    }
+
+    async fn routine_definition(&self, c: &CollectionRef) -> Result<String> {
+        let mut conn = self.pool.acquire().await.context("failed to acquire connection from pool")?;
+        let row: Option<(String,)> = sqlx::query_as(
+            "SELECT pg_get_functiondef(p.oid) \
+             FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace \
+             WHERE n.nspname = $1 AND p.proname = $2 \
+             ORDER BY p.oid LIMIT 1",
+        )
+        .bind(&c.namespace.0)
+        .bind(&c.name)
+        .fetch_optional(&mut *conn)
+        .await
+        .context("failed to fetch routine definition")?;
+        row.map(|r| r.0)
+            .ok_or_else(|| anyhow!("routine not found: {}", c))
     }
 }
 

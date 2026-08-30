@@ -27,8 +27,7 @@ use crate::export::{ExportFormat, Exporter};
 use crate::theme::Theme;
 use crate::ui::layout::{self, MIN_HEIGHT, MIN_WIDTH};
 use crate::ui::screens::explorer::{
-    self, DataTab, ExportModalState, ExplorerState, FocusedPane,
-    TreeNodeKind, WorkspaceTab,
+    self, ExportModalState, ExplorerState, FocusedPane, TreeNodeKind, WorkspaceTab,
 };
 use crate::ui::screens::picker::{self, ConfirmDeleteModal, ConnectionForm, FormField};
 use crate::ui::screens::query::{ConsoleSubpane, QueryConsole};
@@ -325,6 +324,50 @@ fn build_insert_row_sql(
         .collect::<Vec<_>>()
         .join(", ");
     format!("INSERT INTO {q_tbl} ({col_list}) VALUES ({value_list});")
+}
+
+/// Open a collection (table OR view) as a data tab: focus it if already
+/// open, otherwise fetch column metadata + first page and push a `DataTab`.
+/// Shared by the tree Enter handler (Table & View nodes) and the object
+/// search — one construction path for every tab.
+async fn open_collection_tab(
+    exp: &mut crate::ui::screens::explorer::ExplorerState,
+    drv: &Arc<dyn crate::driver::Driver>,
+    cref: crate::driver::CollectionRef,
+    page_size: u64,
+    read_only: bool,
+) -> Result<(), String> {
+    if let Some(existing_idx) = exp.tabs.iter().position(|t| match t {
+        WorkspaceTab::Table(tab) => tab.collection == cref,
+        _ => false,
+    }) {
+        exp.active_tab_index = existing_idx;
+        exp.focused_pane = FocusedPane::Workspace;
+        return Ok(());
+    }
+    let meta_res = drv.collection_meta(&cref).await;
+    let rec_res = drv
+        .records(&cref, Page { offset: 0, limit: page_size })
+        .await
+        .map_err(|e| format!("{e:#}"))?;
+    let column_meta = meta_res.map(|m| m.columns).unwrap_or_default();
+    exp.tabs.push(WorkspaceTab::Table(crate::ui::screens::explorer::DataTab {
+        collection: cref,
+        page: rec_res,
+        selected_row: 0,
+        selected_col: 0,
+        scroll_offset_x: 0,
+        column_meta,
+        sort_col: None,
+        sort_dir: crate::ui::screens::explorer::SortDir::Asc,
+        filter: None,
+        filter_editing: false,
+        filter_buffer: String::new(),
+        read_only,
+    }));
+    exp.active_tab_index = exp.tabs.len().saturating_sub(1);
+    exp.focused_pane = FocusedPane::Workspace;
+    Ok(())
 }
 
 /// Roadmap M2.10: detect statements that can destroy data before the query
@@ -883,7 +926,9 @@ impl App {
                             let n = s
                                 .results
                                 .iter()
-                                .filter(|r| r.name.contains(&s.query) || r.namespace.0.contains(&s.query))
+                                .filter(|(r, _)| {
+                                    r.name.contains(&s.query) || r.namespace.0.contains(&s.query)
+                                })
                                 .count();
                             if n > 0 {
                                 s.selected = (s.selected + 1).min(n - 1);
@@ -1118,7 +1163,9 @@ impl App {
                                         }
                                     }
                                     KeyCode::Char('e') | KeyCode::Enter => {
-                                        if !can_edit {
+                                        if t.read_only {
+                                            self.toasts.push(ToastKind::Warning, "this view is read-only".to_string());
+                                        } else if !can_edit {
                                             self.toasts.push(ToastKind::Warning, "active driver does not support editing data");
                                         } else if let Some(row) = t.page.records.get(t.selected_row)
                                             && let Some(col_name) = t.page.columns.get(t.selected_col)
@@ -1167,6 +1214,11 @@ impl App {
                                         KeyCode::Right => c.move_cursor_right(),
                                         KeyCode::Backspace => c.backspace(),
                                         KeyCode::Enter => c.insert_newline(),
+                                        // Ctrl+F: pretty-print the SQL.
+                                        KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                            let formatted = crate::ui::screens::query::format_sql(&c.text());
+                                            c.set_text(formatted);
+                                        }
                                         KeyCode::Char(ch) => {
                                             if !key.modifiers.contains(KeyModifiers::CONTROL) {
                                                 c.insert_char(ch);
@@ -1973,14 +2025,31 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                     {
                         let mut results = Vec::new();
                         for ns in exp.namespaces.clone() {
-                            if let Ok(tbls) = drv.collections(&ns).await {
-                                for t in tbls {
-                                    results.push(crate::driver::CollectionRef {
-                                        namespace: ns.clone(),
-                                        name: t.name,
-                                    });
+                            // Fetch all four object types in parallel per schema.
+                            let (tables, views, routines, seqs) = tokio::join!(
+                                drv.collections(&ns),
+                                drv.list_views(&ns),
+                                drv.list_routines(&ns),
+                                drv.list_sequences(&ns),
+                            );
+                            let mut push = |list: Result<Vec<crate::driver::Collection>, _>,
+                                            kind: crate::ui::screens::explorer::SearchKind| {
+                                if let Ok(objs) = list {
+                                    for o in objs {
+                                        results.push((
+                                            crate::driver::CollectionRef {
+                                                namespace: ns.clone(),
+                                                name: o.name,
+                                            },
+                                            kind,
+                                        ));
+                                    }
                                 }
-                            }
+                            };
+                            push(tables, crate::ui::screens::explorer::SearchKind::Table);
+                            push(views, crate::ui::screens::explorer::SearchKind::View);
+                            push(routines, crate::ui::screens::explorer::SearchKind::Routine);
+                            push(seqs, crate::ui::screens::explorer::SearchKind::Sequence);
                         }
                         exp.object_search = Some(
                             crate::ui::screens::explorer::ObjectSearchState {
@@ -1992,54 +2061,54 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         continue;
                     }
 
-                    // Enter in the object search → open the highlighted object.
+                    // Enter in the object search → open the highlighted object
+                    // according to its kind.
                     if exp.object_search.is_some() && key.code == KeyCode::Enter {
-                        let cref = {
+                        let hit = {
                             let s = exp.object_search.as_ref().unwrap();
-                            let filtered: Vec<crate::driver::CollectionRef> = s
+                            let filtered: Vec<&(
+                                crate::driver::CollectionRef,
+                                crate::ui::screens::explorer::SearchKind,
+                            )> = s
                                 .results
                                 .iter()
-                                .filter(|r| {
+                                .filter(|(r, _)| {
                                     r.name.contains(&s.query)
                                         || r.namespace.0.contains(&s.query)
                                 })
-                                .cloned()
                                 .collect();
-                            filtered.get(s.selected).cloned()
+                            filtered.get(s.selected).map(|(r, k)| (r.clone(), *k))
                         };
                         exp.object_search = None;
-                        if let Some(cref) = cref {
-                            let drv_clone = drv.clone();
-                            let cref_clone = cref.clone();
-                            let meta_res = drv_clone.collection_meta(&cref_clone).await;
-                            let rec_res = drv_clone
-                                .records(
-                                    &cref_clone,
-                                    Page {
-                                        offset: 0,
-                                        limit: app.config.effective_page_size(),
-                                    },
-                                )
-                                .await;
-                            if let Ok(rec_page) = rec_res {
-                                let column_meta = meta_res.map(|m| m.columns).unwrap_or_default();
-                                exp.tabs.push(WorkspaceTab::Table(
-                                    crate::ui::screens::explorer::DataTab {
-                                        collection: cref_clone,
-                                        page: rec_page,
-                                        selected_row: 0,
-                                        selected_col: 0,
-                                        scroll_offset_x: 0,
-                                        column_meta,
-                                        sort_col: None,
-                                        sort_dir: crate::ui::screens::explorer::SortDir::Asc,
-                                        filter: None,
-                                        filter_editing: false,
-                                        filter_buffer: String::new(),
-                                    },
-                                ));
-                                exp.active_tab_index = exp.tabs.len().saturating_sub(1);
-                                exp.focused_pane = FocusedPane::Workspace;
+                        if let Some((cref, kind)) = hit {
+                            use crate::ui::screens::explorer::SearchKind;
+                            match kind {
+                                SearchKind::Table | SearchKind::View => {
+                                    if let Err(e) = open_collection_tab(
+                                        exp,
+                                        drv,
+                                        cref,
+                                        app.config.effective_page_size(),
+                                        kind == SearchKind::View,
+                                    )
+                                    .await
+                                    {
+                                        app.toasts.push(ToastKind::Error, format!("failed to open: {e}"));
+                                    }
+                                }
+                                SearchKind::Routine => {
+                                    match drv.routine_definition(&cref).await {
+                                        Ok(ddl) => exp.ddl_popup = Some((cref, ddl)),
+                                        Err(e) => app.toasts.push(
+                                            ToastKind::Error,
+                                            format!("failed to fetch routine: {e:#}"),
+                                        ),
+                                    }
+                                }
+                                SearchKind::Sequence => {
+                                    let stub = format!("SEQUENCE {}.{}", cref.namespace, cref.name);
+                                    exp.ddl_popup = Some((cref, stub));
+                                }
                             }
                         }
                         continue;
@@ -2088,7 +2157,11 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                         TreeNodeKind::Database(ns) => {
                                             let ns_clone = ns.clone();
                                             let is_expanded = node.is_expanded;
-                                            if !is_expanded && !exp.tables.contains_key(&ns_clone.0) {
+                                            // Fetch every object type the first time this
+                                            // schema is expanded — and retry on re-expand
+                                            // (no permanent gate on `tables`), so a transient
+                                            // view/routine listing failure is re-attempted.
+                                            if !is_expanded {
                                                 if let Some(n) = exp.tree_nodes.iter_mut().find(|n| match &n.kind {
                                                     TreeNodeKind::Database(d) => d == &ns_clone,
                                                     _ => false,
@@ -2096,8 +2169,24 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                                     n.is_loading = true;
                                                 }
                                                 let drv_clone = drv.clone();
-                                                if let Ok(tbls) = drv_clone.collections(&ns_clone).await {
-                                                    exp.tables.insert(ns_clone.0.clone(), tbls);
+                                                // 4 round trips in parallel instead of serial.
+                                                let (tables, views, routines, seqs) = tokio::join!(
+                                                    drv_clone.collections(&ns_clone),
+                                                    drv_clone.list_views(&ns_clone),
+                                                    drv_clone.list_routines(&ns_clone),
+                                                    drv_clone.list_sequences(&ns_clone),
+                                                );
+                                                if let Ok(t) = tables {
+                                                    exp.tables.insert(ns_clone.0.clone(), t);
+                                                }
+                                                if let Ok(v) = views {
+                                                    exp.views.insert(ns_clone.0.clone(), v);
+                                                }
+                                                if let Ok(r) = routines {
+                                                    exp.routines.insert(ns_clone.0.clone(), r);
+                                                }
+                                                if let Ok(s) = seqs {
+                                                    exp.sequences.insert(ns_clone.0.clone(), s);
                                                 }
                                                 if let Some(n) = exp.tree_nodes.iter_mut().find(|n| match &n.kind {
                                                     TreeNodeKind::Database(d) => d == &ns_clone,
@@ -2122,54 +2211,51 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                                 exp.selected_tree_index = new_idx;
                                             }
                                         }
-                                        TreeNodeKind::Table(cref, _) => {
+                                        TreeNodeKind::View(cref) => {
+                                            // A view opens like a table (SELECT *).
+                                            if let Err(e) = open_collection_tab(
+                                                exp,
+                                                drv,
+                                                cref.clone(),
+                                                app.config.effective_page_size(),
+                                                true, // views are read-only
+                                            )
+                                            .await
+                                            {
+                                                app.toasts.push(ToastKind::Error, format!("failed to load view: {e}"));
+                                            }
+                                        }
+                                        TreeNodeKind::Routine(cref) => {
                                             let cref_clone = cref.clone();
-                                            if let Some(existing_idx) = exp.tabs.iter().position(|t| match t {
-                                                WorkspaceTab::Table(tab) => tab.collection == cref_clone,
-                                                _ => false,
-                                            }) {
-                                                exp.active_tab_index = existing_idx;
-                                                exp.focused_pane = FocusedPane::Workspace;
-                                            } else {
-                                                let drv_clone = drv.clone();
-                                                // Fetch records AND column metadata. column_meta drives the
-                                                // cell-edit modal's nullable shortcut (Ctrl+N → set NULL).
-                                                // Metadata fetch failure is non-fatal: tab still loads,
-                                                // just without the NULL-set capability.
-                                                let meta_res = drv_clone.collection_meta(&cref_clone).await;
-                                                let rec_res = drv_clone.records(
-                                                    &cref_clone,
-                                                    Page {
-                                                        offset: 0,
-                                                        limit: app.config.effective_page_size(),
-                                                    },
-                                                )
-                                                .await;
-                                                match rec_res {
-                                                    Ok(rec_page) => {
-                                                        let column_meta = meta_res
-                                                            .map(|m| m.columns)
-                                                            .unwrap_or_default();
-                                                        exp.tabs.push(WorkspaceTab::Table(DataTab {
-                                                            collection: cref_clone,
-                                                            page: rec_page,
-                                                            selected_row: 0,
-                                                            selected_col: 0,
-                                                            scroll_offset_x: 0,
-                                                            column_meta,
-                                                            sort_col: None,
-                                                            sort_dir: crate::ui::screens::explorer::SortDir::Asc,
-                                                            filter: None,
-                                                            filter_editing: false,
-                                                            filter_buffer: String::new(),
-                                                        }));
-                                                        exp.active_tab_index = exp.tabs.len().saturating_sub(1);
-                                                        exp.focused_pane = FocusedPane::Workspace;
-                                                    }
-                                                    Err(e) => {
-                                                        app.toasts.push(ToastKind::Error, format!("failed to load table: {e:#}"));
-                                                    }
+                                            let drv_clone = drv.clone();
+                                            match drv_clone.routine_definition(&cref_clone).await {
+                                                Ok(ddl) => {
+                                                    exp.ddl_popup = Some((cref_clone, ddl));
                                                 }
+                                                Err(e) => {
+                                                    app.toasts.push(ToastKind::Error, format!("failed to fetch routine: {e:#}"));
+                                                }
+                                            }
+                                        }
+                                        TreeNodeKind::Sequence(cref) => {
+                                            // Sequences have no body to render — show a stub so the
+                                            // user at least sees the object resolved.
+                                            exp.ddl_popup = Some((
+                                                cref.clone(),
+                                                format!("SEQUENCE {}.{}", cref.namespace, cref.name),
+                                            ));
+                                        }
+                                        TreeNodeKind::Table(cref, _) => {
+                                            if let Err(e) = open_collection_tab(
+                                                exp,
+                                                drv,
+                                                cref.clone(),
+                                                app.config.effective_page_size(),
+                                                false,
+                                            )
+                                            .await
+                                            {
+                                                app.toasts.push(ToastKind::Error, format!("failed to load table: {e}"));
                                             }
                                         }
                                     }
@@ -2177,16 +2263,35 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             }
                             KeyCode::F(1) => {
                                 if let Some(node) = exp.selected_node() {
-                                    if let TreeNodeKind::Table(cref, _) = &node.kind {
-                                        let cref_clone = cref.clone();
-                                        let drv_clone = drv.clone();
-                                        match drv_clone.definition(&cref_clone).await {
-                                            Ok(ddl) => {
-                                                exp.ddl_popup = Some((cref_clone, ddl));
-                                            }
-                                            Err(e) => {
-                                                app.toasts.push(ToastKind::Error, format!("failed to fetch DDL: {e:#}"));
-                                            }
+                                    let cref = match &node.kind {
+                                        TreeNodeKind::Table(cref, _)
+                                        | TreeNodeKind::View(cref)
+                                        | TreeNodeKind::Routine(cref)
+                                        | TreeNodeKind::Sequence(cref) => cref.clone(),
+                                        TreeNodeKind::Database(_) => continue,
+                                    };
+                                    let drv_clone = drv.clone();
+                                    let def: Result<String, String> = match &node.kind {
+                                        TreeNodeKind::Routine(_) => drv_clone
+                                            .routine_definition(&cref)
+                                            .await
+                                            .map_err(|e| format!("{e:#}")),
+                                        TreeNodeKind::Sequence(_) => Ok(format!(
+                                            "SEQUENCE {}.{}",
+                                            cref.namespace, cref.name
+                                        )),
+                                        // Table → CREATE TABLE; View → synthesised
+                                        // from metadata (driver doesn't expose
+                                        // CREATE VIEW yet).
+                                        _ => drv_clone
+                                            .definition(&cref)
+                                            .await
+                                            .map_err(|e| format!("{e:#}")),
+                                    };
+                                    match def {
+                                        Ok(ddl) => exp.ddl_popup = Some((cref, ddl)),
+                                        Err(e) => {
+                                            app.toasts.push(ToastKind::Error, format!("failed to fetch DDL: {e}"));
                                         }
                                     }
                                 }
@@ -2209,6 +2314,9 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                     let target_ns = match &node.kind {
                                         TreeNodeKind::Database(ns) => ns.clone(),
                                         TreeNodeKind::Table(cref, _) => cref.namespace.clone(),
+                                        TreeNodeKind::View(cref) => cref.namespace.clone(),
+                                        TreeNodeKind::Routine(cref) => cref.namespace.clone(),
+                                        TreeNodeKind::Sequence(cref) => cref.namespace.clone(),
                                     };
 
                                     if let Some(existing_idx) = exp.tabs.iter().position(|t| match t {
@@ -2255,6 +2363,9 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 match &node.kind {
                                     TreeNodeKind::Database(ns) => ns.clone(),
                                     TreeNodeKind::Table(cref, _) => cref.namespace.clone(),
+                                    TreeNodeKind::View(cref) => cref.namespace.clone(),
+                                    TreeNodeKind::Routine(cref) => cref.namespace.clone(),
+                                    TreeNodeKind::Sequence(cref) => cref.namespace.clone(),
                                 }
                             } else {
                                 exp.namespaces.first().cloned().unwrap_or(crate::driver::Namespace("mysql".to_string()))
@@ -2325,6 +2436,17 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                         app.toasts.push(ToastKind::Warning, "active driver does not support editing data".to_string());
                                         continue;
                                     }
+                                    let read_only = exp
+                                        .active_tab()
+                                        .map(|t| match t {
+                                            WorkspaceTab::Table(t) => t.read_only,
+                                            _ => false,
+                                        })
+                                        .unwrap_or(false);
+                                    if read_only {
+                                        app.toasts.push(ToastKind::Warning, "this view is read-only".to_string());
+                                        continue;
+                                    }
                                     // Build WHERE from PK (preferred) or all columns.
                                     // Pull everything we need from immutable borrows,
                                     // then drop them before opening the confirm modal
@@ -2387,6 +2509,17 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                     let can_edit = exp.driver_capabilities.contains(crate::driver::Capabilities::EDIT_DATA);
                                     if !can_edit {
                                         app.toasts.push(ToastKind::Warning, "active driver does not support editing data".to_string());
+                                        continue;
+                                    }
+                                    let read_only = exp
+                                        .active_tab()
+                                        .map(|t| match t {
+                                            WorkspaceTab::Table(t) => t.read_only,
+                                            _ => false,
+                                        })
+                                        .unwrap_or(false);
+                                    if read_only {
+                                        app.toasts.push(ToastKind::Warning, "this view is read-only".to_string());
                                         continue;
                                     }
                                     // Snapshot the active table's column metadata.

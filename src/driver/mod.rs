@@ -200,6 +200,26 @@ pub trait Driver: Send + Sync {
 
     /// DDL capability
     async fn definition(&self, c: &CollectionRef) -> Result<String>;
+
+    // ---- Non-table objects (views / routines / sequences). Default impls
+    // return empty so a driver that doesn't surface them is still valid. ----
+
+    /// Views in a namespace (openable like a table).
+    async fn list_views(&self, _ns: &Namespace) -> Result<Vec<Collection>> {
+        Ok(Vec::new())
+    }
+    /// Stored procedures & functions in a namespace.
+    async fn list_routines(&self, _ns: &Namespace) -> Result<Vec<Collection>> {
+        Ok(Vec::new())
+    }
+    /// Sequences in a namespace.
+    async fn list_sequences(&self, _ns: &Namespace) -> Result<Vec<Collection>> {
+        Ok(Vec::new())
+    }
+    /// Source / DDL of a stored routine.
+    async fn routine_definition(&self, _c: &CollectionRef) -> Result<String> {
+        anyhow::bail!("this driver does not expose routine definitions")
+    }
 }
 
 /// Factory function to instantiate and connect to a driver based on `DriverType`.

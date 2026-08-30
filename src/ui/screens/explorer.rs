@@ -67,13 +67,23 @@ pub struct InsertRowModalState {
     pub focused_field: usize,
 }
 
+/// Kind of object in the object-search results — drives the icon and how
+/// Enter opens it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SearchKind {
+    Table,
+    View,
+    Routine,
+    Sequence,
+}
+
 /// State for the global object-search overlay (`Ctrl+T`). `results` holds
-/// every table/view across all namespaces (fetched once when the overlay
-/// opens); the visible list is filtered by `query` client-side.
+/// every object across all namespaces (fetched once when the overlay opens);
+/// the visible list is filtered by `query` client-side.
 #[derive(Clone, Debug)]
 pub struct ObjectSearchState {
     pub query: String,
-    pub results: Vec<CollectionRef>,
+    pub results: Vec<(CollectionRef, SearchKind)>,
     pub selected: usize,
 }
 
@@ -81,6 +91,9 @@ pub struct ObjectSearchState {
 pub enum TreeNodeKind {
     Database(Namespace),
     Table(CollectionRef, Option<u64>),
+    View(CollectionRef),
+    Routine(CollectionRef),
+    Sequence(CollectionRef),
 }
 
 #[derive(Clone, Debug)]
@@ -130,6 +143,10 @@ pub struct DataTab {
     pub filter_editing: bool,
     /// Text buffer for the filter being typed.
     pub filter_buffer: String,
+    /// `true` for views (may be read-only / not updatable). Disables the
+    /// cell-edit / insert / delete shortcuts so the UI never offers an
+    /// operation that would fail at the DB (or silently mutate base rows).
+    pub read_only: bool,
 }
 
 /// Sort direction for the data grid.
@@ -231,6 +248,11 @@ pub struct ExplorerState {
     pub focused_pane: FocusedPane,
     pub namespaces: Vec<Namespace>,
     pub tables: std::collections::HashMap<String, Vec<Collection>>,
+    /// Non-table objects per namespace (views / routines / sequences), loaded
+    /// lazily when a database node is expanded.
+    pub views: std::collections::HashMap<String, Vec<Collection>>,
+    pub routines: std::collections::HashMap<String, Vec<Collection>>,
+    pub sequences: std::collections::HashMap<String, Vec<Collection>>,
     pub tree_nodes: Vec<TreeNode>,
     pub selected_tree_index: usize,
     /// First tree-node row currently visible in the tree pane. Adjusted on
@@ -270,6 +292,9 @@ impl ExplorerState {
             focused_pane: FocusedPane::Tree,
             namespaces,
             tables: std::collections::HashMap::new(),
+            views: std::collections::HashMap::new(),
+            routines: std::collections::HashMap::new(),
+            sequences: std::collections::HashMap::new(),
             tree_nodes,
             selected_tree_index: 0,
             tree_scroll: 0,
@@ -305,19 +330,42 @@ impl ExplorerState {
                 is_loading: false,
             });
 
-            if is_expanded && let Some(tbls) = self.tables.get(&ns.0) {
-                for tbl in tbls {
-                    nodes.push(TreeNode {
-                        kind: TreeNodeKind::Table(
-                            CollectionRef {
+            if is_expanded {
+                if let Some(tbls) = self.tables.get(&ns.0) {
+                    for tbl in tbls {
+                        nodes.push(TreeNode {
+                            kind: TreeNodeKind::Table(
+                                CollectionRef {
+                                    namespace: ns.clone(),
+                                    name: tbl.name.clone(),
+                                },
+                                tbl.estimated_row_count,
+                            ),
+                            is_expanded: false,
+                            is_loading: false,
+                        });
+                    }
+                }
+                let push_objects = |nodes: &mut Vec<TreeNode>, list: &[Collection], kind: fn(CollectionRef) -> TreeNodeKind| {
+                    for obj in list {
+                        nodes.push(TreeNode {
+                            kind: kind(CollectionRef {
                                 namespace: ns.clone(),
-                                name: tbl.name.clone(),
-                            },
-                            tbl.estimated_row_count,
-                        ),
-                        is_expanded: false,
-                        is_loading: false,
-                    });
+                                name: obj.name.clone(),
+                            }),
+                            is_expanded: false,
+                            is_loading: false,
+                        });
+                    }
+                };
+                if let Some(views) = self.views.get(&ns.0) {
+                    push_objects(&mut nodes, views, TreeNodeKind::View);
+                }
+                if let Some(routines) = self.routines.get(&ns.0) {
+                    push_objects(&mut nodes, routines, TreeNodeKind::Routine);
+                }
+                if let Some(seqs) = self.sequences.get(&ns.0) {
+                    push_objects(&mut nodes, seqs, TreeNodeKind::Sequence);
                 }
             }
         }
@@ -422,10 +470,10 @@ fn render_object_search(f: &mut Frame, area: Rect, state: &ObjectSearchState, th
     ]);
     f.render_widget(Paragraph::new(input_line), chunks[0]);
 
-    let filtered: Vec<&CollectionRef> = state
+    let filtered: Vec<&(CollectionRef, SearchKind)> = state
         .results
         .iter()
-        .filter(|r| {
+        .filter(|(r, _)| {
             r.name.contains(&state.query) || r.namespace.0.contains(&state.query)
         })
         .collect();
@@ -440,16 +488,22 @@ fn render_object_search(f: &mut Frame, area: Rect, state: &ObjectSearchState, th
     let max_rows = (inner.height.saturating_sub(4)) as usize;
     let sel = state.selected.min(filtered.len().saturating_sub(1));
     let start = sel.saturating_sub(max_rows / 2);
-    for (i, r) in filtered.iter().skip(start).take(max_rows).enumerate() {
+    for (i, (r, kind)) in filtered.iter().skip(start).take(max_rows).enumerate() {
         let is_sel = start + i == sel;
         let style = if is_sel {
             theme.selected()
         } else {
             theme.base()
         };
+        let icon = match kind {
+            SearchKind::Table => "📄",
+            SearchKind::View => "👁️",
+            SearchKind::Routine => "⚙️",
+            SearchKind::Sequence => "🔢",
+        };
         lines.push(Line::from(vec![
             Span::styled(if is_sel { "▶ " } else { "  " }, theme.accent()),
-            Span::styled(format!("{}.{}", r.namespace.0, r.name), style),
+            Span::styled(format!("{} {}.{}", icon, r.namespace.0, r.name), style),
         ]));
     }
     f.render_widget(Paragraph::new(lines), chunks[2]);
@@ -542,6 +596,39 @@ fn render_tree(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme: &The
                     Span::styled(count_str, theme.dim()),
                 ])
             }
+            TreeNodeKind::View(cref) => {
+                let style = if is_sel {
+                    theme.selected()
+                } else {
+                    theme.base()
+                };
+                Line::from(vec![
+                    Span::styled("   👁️ ", theme.dim()),
+                    Span::styled(&cref.name, style),
+                ])
+            }
+            TreeNodeKind::Routine(cref) => {
+                let style = if is_sel {
+                    theme.selected()
+                } else {
+                    theme.base()
+                };
+                Line::from(vec![
+                    Span::styled("   ⚙️ ", theme.dim()),
+                    Span::styled(&cref.name, style),
+                ])
+            }
+            TreeNodeKind::Sequence(cref) => {
+                let style = if is_sel {
+                    theme.selected()
+                } else {
+                    theme.base()
+                };
+                Line::from(vec![
+                    Span::styled("   🔢 ", theme.dim()),
+                    Span::styled(&cref.name, style),
+                ])
+            }
         };
         lines.push(line);
     }
@@ -630,11 +717,13 @@ fn render_workspace(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme:
                             .count();
                         format!(" | filter {} ({}/{} shown)", f.display(), shown, data_tab.page.records.len())
                     });
+                    let ro = if data_tab.read_only { " [read-only view]" } else { "" };
                     let footer_text = format!(
-                        " Page {} (showing {} rows{}){} | [s] sort  [/] filter  [n]/[p] page  [w] Close",
+                        " Page {} (showing {} rows{}){}{} | [s] sort  [/] filter  [n]/[p] page  [w] Close",
                         data_tab.page.page + 1,
                         data_tab.page.records.len(),
                         total_str,
+                        ro,
                         filter_badge.unwrap_or_default()
                     );
                     Paragraph::new(Span::styled(footer_text, theme.dim()))

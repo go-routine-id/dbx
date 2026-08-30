@@ -80,6 +80,18 @@ impl QueryConsole {
         self.lines.join("\n")
     }
 
+    /// Replace the whole editor buffer, resetting the cursor to the end.
+    pub fn set_text(&mut self, text: String) {
+        let lines: Vec<String> = if text.trim().is_empty() {
+            vec![String::new()]
+        } else {
+            text.lines().map(|s| s.to_string()).collect()
+        };
+        self.lines = lines;
+        self.cursor_row = self.lines.len().saturating_sub(1);
+        self.cursor_col = self.lines.last().map(|l| l.chars().count()).unwrap_or(0);
+    }
+
     pub fn insert_char(&mut self, c: char) {
         if self.cursor_row >= self.lines.len() {
             self.lines.push(String::new());
@@ -183,6 +195,30 @@ impl QueryConsole {
             }
         }
     }
+}
+
+/// Pretty-print a SQL statement: each main clause keyword starts a new line.
+/// Deliberately minimal (no parser) — it just breaks on clause starters so a
+/// long query becomes scannable. Joined as a single string via `\n`.
+pub fn format_sql(sql: &str) -> String {
+    const CLAUSE_STARTS: &[&str] = &[
+        "SELECT", "FROM", "WHERE", "GROUP", "ORDER", "HAVING", "LIMIT", "UNION",
+        "ON", "VALUES", "SET", "INTO",
+    ];
+    let mut out = String::new();
+    for token in sql.split_whitespace() {
+        let upper = token.to_uppercase();
+        let is_clause = CLAUSE_STARTS.iter().any(|k| upper == *k || upper.starts_with(k));
+        if is_clause && !out.is_empty() && !out.ends_with('\n') {
+            while out.ends_with(' ') {
+                out.pop();
+            }
+            out.push('\n');
+        }
+        out.push_str(token);
+        out.push(' ');
+    }
+    out.trim_end().to_string()
 }
 
 /// Tokenizes a single SQL line and returns highlighted Spans (owned Strings).
@@ -522,6 +558,19 @@ mod tests {
         let theme = Theme::dark();
         let spans = highlight_sql_line("SELECT id, `name` FROM users WHERE id = 42 -- comment", &theme);
         assert!(!spans.is_empty());
+    }
+
+    #[test]
+    fn test_format_sql_breaks_on_clauses() {
+        let f = format_sql("SELECT a, b FROM t WHERE a = 1 ORDER BY b");
+        assert_eq!(f, "SELECT a, b\nFROM t\nWHERE a = 1\nORDER BY b");
+
+        // Case-insensitive clause detection.
+        let f = format_sql("select * from t");
+        assert_eq!(f, "select *\nfrom t");
+
+        // No trailing whitespace.
+        assert!(!f.ends_with(' '));
     }
 }
 
