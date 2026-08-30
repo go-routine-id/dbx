@@ -706,28 +706,26 @@ fn render_editor(
         let mut spans = vec![Span::styled(line_num_str, theme.dim())];
 
         if is_editor_focused && r_idx == console.cursor_row {
-            // Highlight cursor on active line using char indexing
+            // The cursor block sits on the char LEFT of the insertion point —
+            // the one backspace removes — so what's highlighted is exactly
+            // what the user can delete.
             let chars: Vec<char> = line_str.chars().collect();
             let char_count = chars.len();
-            let col = console.cursor_col.min(char_count);
-            let before: String = chars[..col].iter().collect();
-            let cursor_char: String = if col < char_count {
-                chars[col].to_string()
+            let cur = console.cursor_col.min(char_count);
+            if cur > 0 {
+                let before: String = chars[..cur - 1].iter().collect();
+                let cursor_char: String = chars[cur - 1].to_string();
+                let after: String = chars[cur..].iter().collect();
+                spans.extend(highlight_sql_line(&before, theme));
+                spans.push(Span::styled(
+                    cursor_char,
+                    theme.selected().add_modifier(Modifier::REVERSED | Modifier::BOLD),
+                ));
+                spans.extend(highlight_sql_line(&after, theme));
             } else {
-                " ".to_string()
-            };
-            let after: String = if col + 1 <= char_count {
-                chars[col + 1..].iter().collect()
-            } else {
-                String::new()
-            };
-
-            spans.extend(highlight_sql_line(&before, theme));
-            spans.push(Span::styled(
-                cursor_char,
-                theme.selected().add_modifier(Modifier::REVERSED | Modifier::BOLD),
-            ));
-            spans.extend(highlight_sql_line(&after, theme));
+                // Cursor at start of line — nothing to backspace; render plain.
+                spans.extend(highlight_sql_line(line_str, theme));
+            }
         } else {
             spans.extend(highlight_sql_line(line_str, theme));
         }

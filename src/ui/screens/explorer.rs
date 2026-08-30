@@ -36,6 +36,9 @@ pub struct ExportModalState {
 pub struct CellEditModalState {
     pub collection: CollectionRef,
     pub column_name: String,
+    /// The column's SQL data type (e.g. VARCHAR(64), TIMESTAMP) — shown so
+    /// the user knows what kind of value is expected.
+    pub data_type: String,
     pub row_idx: usize,
     pub col_idx: usize,
     pub text_buffer: String,
@@ -79,6 +82,32 @@ pub struct ImportCsvModalState {
     pub path: String,
     pub rows: Vec<Vec<String>>,
     pub parsed: bool,
+}
+
+/// A schema-edit text input in progress.
+#[derive(Clone, Debug)]
+pub enum SchemaInput {
+    /// Adding a column: stage 0 = typing the name, stage 1 = the type.
+    AddColumn { name: String, ty: String, stage: usize },
+    /// Renaming the table — typing the new name.
+    RenameTable { value: String },
+    /// Changing a column's type — typing the new type.
+    ChangeType { column: String, value: String },
+}
+
+/// State for the schema-edit modal (`e` on a table in the tree). Builds an
+/// ALTER TABLE from a small set of operations: drop column, add column,
+/// rename table, change column type.
+#[derive(Clone, Debug)]
+pub struct SchemaEditModalState {
+    pub collection: CollectionRef,
+    pub columns: Vec<ColumnMeta>,
+    pub selected: usize,
+    pub drop_cols: Vec<String>,
+    pub add_cols: Vec<(String, String)>,
+    pub type_changes: Vec<(String, String)>,
+    pub rename_table: Option<String>,
+    pub input: Option<SchemaInput>,
 }
 
 /// Kind of object in the object-search results — drives the icon and how
@@ -314,6 +343,7 @@ pub struct ExplorerState {
     pub insert_row_modal: Option<InsertRowModalState>,
     pub object_search: Option<ObjectSearchState>,
     pub import_csv_modal: Option<ImportCsvModalState>,
+    pub schema_edit_modal: Option<SchemaEditModalState>,
     pub driver_capabilities: crate::driver::Capabilities,
 }
 
@@ -350,6 +380,7 @@ impl ExplorerState {
             insert_row_modal: None,
             object_search: None,
             import_csv_modal: None,
+            schema_edit_modal: None,
             driver_capabilities,
         }
     }
@@ -476,6 +507,126 @@ pub fn render_explorer(
     if let Some(import) = &state.import_csv_modal {
         render_import_csv_modal(f, area, import, theme);
     }
+
+    if let Some(schema) = &state.schema_edit_modal {
+        render_schema_edit_modal(f, area, schema, theme);
+    }
+}
+
+/// Overlay for editing a table's schema (build an ALTER TABLE).
+fn render_schema_edit_modal(
+    f: &mut Frame,
+    area: Rect,
+    modal: &SchemaEditModalState,
+    theme: &Theme,
+) {
+    let width = 64.min(area.width.saturating_sub(4));
+    let height = 20.min(area.height.saturating_sub(2));
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent())
+        .style(theme.panel())
+        .title(format!(
+            " Edit Schema: {}.{} ",
+            modal.collection.namespace.0, modal.collection.name
+        ));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([Constraint::Min(1), Constraint::Length(2)])
+        .split(inner);
+
+    // Follow-scroll: keep the selected column in view when the column list is
+    // taller than the modal (same approach as the tree pane).
+    let visible = (chunks[0].height as usize).max(1);
+    let sel = modal.selected.min(modal.columns.len().saturating_sub(1));
+    let start = sel.saturating_sub(visible / 2);
+    let end = (start + visible).min(modal.columns.len() + modal.add_cols.len());
+
+    let mut lines = Vec::new();
+    for i in start..end {
+        if i < modal.columns.len() {
+            let col = &modal.columns[i];
+            let dropped = modal.drop_cols.contains(&col.name);
+            let is_sel = i == sel;
+            let marker = if dropped {
+                "✗"
+            } else if is_sel {
+                "▶"
+            } else {
+                " "
+            };
+            let style = if dropped {
+                theme.dim()
+            } else if is_sel {
+                theme.selected()
+            } else {
+                theme.base()
+            };
+            let pk = if col.is_primary_key { " PK" } else { "" };
+            let type_change = modal
+                .type_changes
+                .iter()
+                .find(|(c, _)| c == &col.name)
+                .map(|(_, t)| format!(" → {t}"))
+                .unwrap_or_default();
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " {marker} {} {}{type_change}{pk}",
+                    col.name, col.data_type
+                ),
+                style,
+            )));
+        } else {
+            let j = i - modal.columns.len();
+            if let Some((name, ty)) = modal.add_cols.get(j) {
+                lines.push(Line::from(Span::styled(
+                    format!(" + +{name} {ty}"),
+                    theme.success(),
+                )));
+            }
+        }
+    }
+    f.render_widget(Paragraph::new(lines), chunks[0]);
+
+    let hint = if let Some(input) = &modal.input {
+        match input {
+            SchemaInput::AddColumn { name, ty, stage } => {
+                if *stage == 0 {
+                    format!("add column name> {name}█")
+                } else {
+                    format!("add column {name} type> {ty}█")
+                }
+            }
+            SchemaInput::RenameTable { value } => format!("rename table to> {value}█"),
+            SchemaInput::ChangeType { column, value } => {
+                format!("change type of {column} to> {value}█")
+            }
+        }
+    } else {
+        let rename = modal
+            .rename_table
+            .as_ref()
+            .map(|n| format!(" · rename→{n}"))
+            .unwrap_or_default();
+        format!(" ↑/↓ nav · d drop · a add · c type · r rename{rename} · Enter apply · Esc close")
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(hint, theme.dim())).alignment(Alignment::Center),
+        chunks[1],
+    );
 }
 
 /// Centered overlay for CSV import: path input + preview of parsed rows.
@@ -887,12 +1038,25 @@ fn render_grid(f: &mut Frame, area: Rect, tab: &mut DataTab, is_focused: bool, t
     let num_cols = tab.page.columns.len();
     let col_offset = tab.scroll_offset_x.min(num_cols.saturating_sub(1));
 
+    // Horizontal scroll: columns keep a fixed minimum width (16) and only the
+    // ones that fit the pane are rendered — the rest are reached via h/l (or
+    // the col_starts the mouse handler uses). If everything fits, they still
+    // grow to fill the pane.
+    let inner_w = tab.grid_hit_area.map(|r| r.width).unwrap_or(80);
+    let max_visible = (inner_w / 16).max(1) as usize;
+    let num_visible = num_cols.saturating_sub(col_offset).max(1);
+    let show_all = num_visible <= max_visible;
+    let take_n = if show_all { num_visible } else { max_visible };
+
     // Record the rendered x-start of each visible column so mouse clicks map
     // to the exact same widths the Table widget computed.
     if let Some(inner) = tab.grid_hit_area {
-        let num_visible = num_cols.saturating_sub(col_offset).max(1);
-        let col_w = (inner.width / num_visible as u16).max(1);
-        tab.grid_col_starts = (0..num_visible)
+        let col_w = if show_all {
+            (inner.width / num_visible as u16).max(1)
+        } else {
+            16
+        };
+        tab.grid_col_starts = (0..take_n)
             .map(|i| inner.x + (i as u16 * col_w))
             .collect();
     }
@@ -926,6 +1090,7 @@ fn render_grid(f: &mut Frame, area: Rect, tab: &mut DataTab, is_focused: bool, t
         .columns
         .iter()
         .skip(col_offset)
+        .take(take_n)
         .enumerate()
         .map(|(rel_idx, col)| {
             let abs_col = col_offset + rel_idx;
@@ -959,7 +1124,7 @@ fn render_grid(f: &mut Frame, area: Rect, tab: &mut DataTab, is_focused: bool, t
         .enumerate()
         .map(|(r_idx, record)| {
             let is_row_sel = r_idx == tab.selected_row && is_focused;
-            let cells = record.values.iter().skip(col_offset).enumerate().map(|(rel_idx, val)| {
+            let cells = record.values.iter().skip(col_offset).take(take_n).enumerate().map(|(rel_idx, val)| {
                 let abs_col = col_offset + rel_idx;
                 let cell_str = val.display_str();
                 let is_cell_sel = is_row_sel && abs_col == tab.selected_col;
@@ -984,7 +1149,14 @@ fn render_grid(f: &mut Frame, area: Rect, tab: &mut DataTab, is_focused: bool, t
         .columns
         .iter()
         .skip(col_offset)
-        .map(|_| Constraint::Min(16))
+        .take(take_n)
+        .map(|_| {
+            if show_all {
+                Constraint::Min(16)
+            } else {
+                Constraint::Length(16)
+            }
+        })
         .collect();
 
     let table = Table::new(rows, widths)
@@ -999,7 +1171,7 @@ fn render_grid(f: &mut Frame, area: Rect, tab: &mut DataTab, is_focused: bool, t
 }
 
 /// Compare two records on the given column, applying the sort direction.
-fn compare_records(a: &Record, b: &Record, col: usize, dir: SortDir) -> std::cmp::Ordering {
+pub fn compare_records(a: &Record, b: &Record, col: usize, dir: SortDir) -> std::cmp::Ordering {
     let va = a.values.get(col).unwrap_or(&crate::driver::Value::Null);
     let vb = b.values.get(col).unwrap_or(&crate::driver::Value::Null);
     let ord = compare_values(va, vb);
@@ -1170,23 +1342,15 @@ fn render_cell_edit_modal(
 
     // Title carries the NULLABLE badge so the user knows up-front whether
     // they can set this cell to NULL (only on nullable columns).
-    let title = if modal.is_nullable {
-        format!(
-            " Edit Value: {}.{} (Row #{}, Col #{}) [NULLABLE] ",
-            modal.collection.name,
-            modal.column_name,
-            modal.row_idx + 1,
-            modal.col_idx + 1
-        )
-    } else {
-        format!(
-            " Edit Value: {}.{} (Row #{}, Col #{}) ",
-            modal.collection.name,
-            modal.column_name,
-            modal.row_idx + 1,
-            modal.col_idx + 1
-        )
-    };
+    let nullable_tag = if modal.is_nullable { " [NULLABLE]" } else { "" };
+    let title = format!(
+        " Edit Value: {}.{} ({}) (Row #{}, Col #{}){nullable_tag} ",
+        modal.collection.name,
+        modal.column_name,
+        modal.data_type,
+        modal.row_idx + 1,
+        modal.col_idx + 1
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)

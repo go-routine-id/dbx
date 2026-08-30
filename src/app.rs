@@ -336,6 +336,17 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
+/// Move to the next/previous workspace tab (wraps around). No-op with < 2 tabs.
+fn switch_tab(exp: &mut crate::ui::screens::explorer::ExplorerState, delta: isize) {
+    let n = exp.tabs.len();
+    if n < 2 {
+        return;
+    }
+    let cur = exp.active_tab_index as isize;
+    let next = (cur + delta + n as isize).rem_euclid(n as isize);
+    exp.active_tab_index = next as usize;
+}
+
 /// Recompute the console editor's autocomplete suggestions from the text
 /// before the cursor.
 fn refresh_autocomplete(
@@ -446,6 +457,62 @@ async fn refresh_table_page(
     }
 }
 
+/// Build ALTER TABLE statements from the schema-edit operations, using the
+/// dialect-aware identifier quoting.
+fn generate_alter_sql(
+    collection: &crate::driver::CollectionRef,
+    drop_cols: &[String],
+    add_cols: &[(String, String)],
+    type_changes: &[(String, String)],
+    rename_table: Option<&str>,
+    driver_name: &str,
+) -> Option<String> {
+    let q = quote_ident(&collection.namespace.0, driver_name);
+    let t = quote_ident(&collection.name, driver_name);
+    let mut stmts = Vec::new();
+    for col in drop_cols {
+        stmts.push(format!(
+            "ALTER TABLE {q}.{t} DROP COLUMN {};",
+            quote_ident(col, driver_name)
+        ));
+    }
+    for (name, ty) in add_cols {
+        stmts.push(format!(
+            "ALTER TABLE {q}.{t} ADD COLUMN {} {ty};",
+            quote_ident(name, driver_name)
+        ));
+    }
+    for (col, new_type) in type_changes {
+        // Dialect-aware type change: MySQL uses MODIFY COLUMN, PG uses
+        // ALTER COLUMN ... TYPE.
+        if driver_name.to_lowercase().contains("mysql")
+            || driver_name.to_lowercase().contains("maria")
+        {
+            stmts.push(format!(
+                "ALTER TABLE {q}.{t} MODIFY COLUMN {} {new_type};",
+                quote_ident(col, driver_name)
+            ));
+        } else {
+            stmts.push(format!(
+                "ALTER TABLE {q}.{t} ALTER COLUMN {} TYPE {new_type};",
+                quote_ident(col, driver_name)
+            ));
+        }
+    }
+    // Rename LAST so the earlier statements still reference the old name.
+    if let Some(new) = rename_table {
+        stmts.push(format!(
+            "ALTER TABLE {q}.{t} RENAME TO {};",
+            quote_ident(new, driver_name)
+        ));
+    }
+    if stmts.is_empty() {
+        None
+    } else {
+        Some(stmts.join("\n"))
+    }
+}
+
 /// Roadmap M2.10: detect statements that can destroy data before the query
 /// console runs them, so the user gets an explicit confirm dialog.
 ///
@@ -544,7 +611,7 @@ const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-const EXPLORER_HELP_BINDINGS: [(&str, &str); 29] = [
+const EXPLORER_HELP_BINDINGS: [(&str, &str); 30] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
@@ -556,7 +623,7 @@ const EXPLORER_HELP_BINDINGS: [(&str, &str); 29] = [
     ("Alt+F", "open saved favorite queries"),
     ("Ctrl+S", "save current query as favorite"),
     ("Ctrl+F", "pretty-print SQL in the editor"),
-    ("[ / ] (in result)", "previous / next result set"),
+    ("[ / ]", "switch workspace tab (or result set in console)"),
     ("j / Down", "move cursor / selection down"),
     ("k / Up", "move cursor / selection up"),
     ("h / Left", "move cursor / column selection left"),
@@ -569,6 +636,7 @@ const EXPLORER_HELP_BINDINGS: [(&str, &str); 29] = [
     ("Y / Ctrl+Y", "copy active row as formatted JSON to clipboard"),
     ("Ctrl+E", "open export dialog (CSV, JSON, SQL INSERT) for current dataset"),
     ("e / Enter", "edit active cell value (shows safe SQL confirmation)"),
+    ("e (on tree table)", "edit table schema (ALTER: drop/add column, rename)"),
     ("Backspace", "delete selected row (shows safe SQL confirmation)"),
     ("i", "open INSERT-row modal — fill fields, server applies DEFAULT for skipped"),
     ("F1", "view table DDL schema popup"),
@@ -687,6 +755,7 @@ impl App {
             || exp.sql_confirm_modal.is_some()
             || exp.object_search.is_some()
             || exp.import_csv_modal.is_some()
+            || exp.schema_edit_modal.is_some()
         {
             return Ok(());
         }
@@ -947,6 +1016,20 @@ impl App {
                                     1 => "false".to_string(),
                                     _ => NULL_SENTINEL.to_string(),
                                 };
+                                return;
+                            }
+                            // Ctrl+N still sets NULL on a nullable boolean.
+                            KeyCode::Char('n') | KeyCode::Char('N') if plan.is_ctrl => {
+                                if plan.is_nullable {
+                                    let edit = exp.cell_edit_modal.as_mut().unwrap();
+                                    edit.bool_selection = 2;
+                                    edit.text_buffer = NULL_SENTINEL.to_string();
+                                } else {
+                                    self.toasts.push(
+                                        ToastKind::Warning,
+                                        "this column is NOT NULL — cannot set to NULL".to_string(),
+                                    );
+                                }
                                 return;
                             }
                             // Esc falls through to the phase-2 Esc arm (close).
@@ -1236,6 +1319,154 @@ impl App {
                     return;
                 }
 
+                // Schema-edit modal (browse columns / type input).
+                if exp.schema_edit_modal.is_some() {
+                    use crate::ui::screens::explorer::SchemaInput;
+                    let mut close_input = false;
+                    let mut pending_add: Option<(String, String)> = None;
+                    let mut pending_rename: Option<Option<String>> = None;
+                    let mut pending_type_change: Option<(String, String)> = None;
+                    if let Some(input) = &mut exp.schema_edit_modal.as_mut().unwrap().input {
+                        match input {
+                            SchemaInput::AddColumn { name, ty, stage } => match key.code {
+                                KeyCode::Esc => close_input = true,
+                                KeyCode::Backspace => {
+                                    if *stage == 0 {
+                                        name.pop();
+                                    } else {
+                                        ty.pop();
+                                    }
+                                }
+                                KeyCode::Char(c)
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    if *stage == 0 {
+                                        name.push(c);
+                                    } else {
+                                        ty.push(c);
+                                    }
+                                }
+                                KeyCode::Enter => {
+                                    if *stage == 0 {
+                                        *stage = 1;
+                                    } else {
+                                        let n = name.trim().to_string();
+                                        let t = ty.trim().to_string();
+                                        if !n.is_empty() && !t.is_empty() {
+                                            pending_add = Some((n, t));
+                                        }
+                                        close_input = true;
+                                    }
+                                }
+                                _ => {}
+                            },
+                            SchemaInput::RenameTable { value } => match key.code {
+                                KeyCode::Esc => close_input = true,
+                                KeyCode::Backspace => {
+                                    value.pop();
+                                }
+                                KeyCode::Char(c)
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    value.push(c);
+                                }
+                                KeyCode::Enter => {
+                                    let v = value.trim().to_string();
+                                    pending_rename = Some(if v.is_empty() {
+                                        None
+                                    } else {
+                                        Some(v)
+                                    });
+                                    close_input = true;
+                                }
+                                _ => {}
+                            },
+                            SchemaInput::ChangeType { column, value } => match key.code {
+                                KeyCode::Esc => close_input = true,
+                                KeyCode::Backspace => {
+                                    value.pop();
+                                }
+                                KeyCode::Char(c)
+                                    if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    value.push(c);
+                                }
+                                KeyCode::Enter => {
+                                    let v = value.trim().to_string();
+                                    if !v.is_empty() {
+                                        pending_type_change =
+                                            Some((column.clone(), v));
+                                    }
+                                    close_input = true;
+                                }
+                                _ => {}
+                            },
+                        }
+                    } else {
+                        if key.code != KeyCode::Enter {
+                            let s = exp.schema_edit_modal.as_mut().unwrap();
+                            match key.code {
+                                KeyCode::Up | KeyCode::Char('k') => {
+                                    s.selected = s.selected.saturating_sub(1);
+                                }
+                                KeyCode::Down | KeyCode::Char('j') => {
+                                    s.selected =
+                                        (s.selected + 1).min(s.columns.len().saturating_sub(1));
+                                }
+                                KeyCode::Char('d') => {
+                                    if let Some(col) = s.columns.get(s.selected) {
+                                        let n = col.name.clone();
+                                        if s.drop_cols.contains(&n) {
+                                            s.drop_cols.retain(|c| c != &n);
+                                        } else {
+                                            s.drop_cols.push(n);
+                                        }
+                                    }
+                                }
+                                KeyCode::Char('a') => {
+                                    s.input = Some(SchemaInput::AddColumn {
+                                        name: String::new(),
+                                        ty: String::new(),
+                                        stage: 0,
+                                    });
+                                }
+                                KeyCode::Char('r') => {
+                                    s.input = Some(SchemaInput::RenameTable {
+                                        value: s.rename_table.clone().unwrap_or_default(),
+                                    });
+                                }
+                                KeyCode::Char('c') => {
+                                    if let Some(col) = s.columns.get(s.selected) {
+                                        s.input = Some(SchemaInput::ChangeType {
+                                            column: col.name.clone(),
+                                            value: col.data_type.clone(),
+                                        });
+                                    }
+                                }
+                                KeyCode::Esc => exp.schema_edit_modal = None,
+                                _ => {}
+                            }
+                            return;
+                        }
+                        // Enter (browse) → fall through; the event loop applies.
+                    }
+                    if close_input {
+                        exp.schema_edit_modal.as_mut().unwrap().input = None;
+                    }
+                    let s = exp.schema_edit_modal.as_mut().unwrap();
+                    if let Some((n, t)) = pending_add {
+                        s.add_cols.push((n, t));
+                    }
+                    if let Some(rename) = pending_rename {
+                        s.rename_table = rename;
+                    }
+                    if let Some((col, ty)) = pending_type_change {
+                        s.type_changes.retain(|(c, _)| c != &col);
+                        s.type_changes.push((col, ty));
+                    }
+                    return;
+                }
+
                 match key.code {
                     KeyCode::Esc => {
                         // Overlays with their own Esc handler close first, so
@@ -1347,6 +1578,9 @@ impl App {
 
                 match exp.focused_pane {
                     FocusedPane::Tree => match key.code {
+                        // [ / ] switch workspace tabs (free here in the tree).
+                        KeyCode::Char('[') => switch_tab(exp, -1),
+                        KeyCode::Char(']') => switch_tab(exp, 1),
                         KeyCode::Up | KeyCode::Char('k') => {
                             if exp.selected_tree_index > 0 {
                                 exp.selected_tree_index -= 1;
@@ -1402,6 +1636,9 @@ impl App {
                                         }
                                     } else {
                                         match key.code {
+                                        // [ / ] switch workspace tabs (free in a table grid).
+                                        KeyCode::Char('[') => switch_tab(exp, -1),
+                                        KeyCode::Char(']') => switch_tab(exp, 1),
                                     KeyCode::Char('i')
                                         if key.modifiers.contains(KeyModifiers::CONTROL)
                                             && key.modifiers.contains(KeyModifiers::SHIFT) =>
@@ -1477,8 +1714,16 @@ impl App {
                                     KeyCode::Right | KeyCode::Char('l') => {
                                         if !t.page.columns.is_empty() && t.selected_col < t.page.columns.len() - 1 {
                                             t.selected_col += 1;
-                                            if t.selected_col >= t.scroll_offset_x + 6 {
-                                                t.scroll_offset_x = t.selected_col.saturating_sub(5);
+                                            // Keep the selected column inside the
+                                            // rendered window (matches the grid's
+                                            // max_visible, not a hardcoded +6).
+                                            let max_visible = t
+                                                .grid_hit_area
+                                                .map(|r| (r.width / 16).max(1) as usize)
+                                                .unwrap_or(6);
+                                            if t.selected_col >= t.scroll_offset_x + max_visible {
+                                                t.scroll_offset_x =
+                                                    t.selected_col.saturating_sub(max_visible - 1);
                                             }
                                         }
                                     }
@@ -1551,9 +1796,16 @@ impl App {
                                                 crate::driver::Value::Bool(false) => 1,
                                                 _ => 2,
                                             };
+                                            let data_type = t
+                                                .column_meta
+                                                .iter()
+                                                .find(|m| m.name == *col_name)
+                                                .map(|m| m.data_type.clone())
+                                                .unwrap_or_default();
                                             exp.cell_edit_modal = Some(crate::ui::screens::explorer::CellEditModalState {
                                                 collection: t.collection.clone(),
                                                 column_name: col_name.clone(),
+                                                data_type,
                                                 row_idx: t.selected_row,
                                                 col_idx: t.selected_col,
                                                 text_buffer: val.display_str(),
@@ -1716,6 +1968,8 @@ impl App {
                                                 c.result_selected_row = 0;
                                                 c.result_selected_col = 0;
                                                 c.result_scroll_x = 0;
+                                            } else {
+                                                switch_tab(exp, -1);
                                             }
                                         }
                                         KeyCode::Char(']') => {
@@ -1725,6 +1979,8 @@ impl App {
                                                 c.result_selected_row = 0;
                                                 c.result_selected_col = 0;
                                                 c.result_scroll_x = 0;
+                                            } else {
+                                                switch_tab(exp, 1);
                                             }
                                         }
                                         KeyCode::Up | KeyCode::Char('k') => {
@@ -1808,6 +2064,9 @@ impl App {
                                     }
                                 },
                                 WorkspaceTab::Erd(e) => match key.code {
+                                    // [ / ] switch workspace tabs.
+                                    KeyCode::Char('[') => switch_tab(exp, -1),
+                                    KeyCode::Char(']') => switch_tab(exp, 1),
                                     KeyCode::Up | KeyCode::Char('k') => e.scroll_up(),
                                     KeyCode::Down | KeyCode::Char('j') => e.scroll_down(),
                                     KeyCode::Left | KeyCode::Char('h') => e.scroll_left(),
@@ -2285,6 +2544,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 || e.sql_confirm_modal.is_some()
                                 || e.object_search.is_some()
                                 || e.import_csv_modal.is_some()
+                                || e.schema_edit_modal.is_some()
                                 || e.ddl_popup.is_some()
                         })
                         .unwrap_or(false);
@@ -2421,6 +2681,64 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             let col_name = edit.column_name.clone();
                             let new_val_str = edit.text_buffer.clone();
                             let row_idx = edit.row_idx;
+                            let col_idx = edit.col_idx;
+
+                            // No change → skip the UPDATE entirely (don't even
+                            // open the SQL confirm). Compare against the ORIGINAL
+                            // cell VALUE (not its display string, so a literal
+                            // "NULL" string ≠ SQL NULL), and read the row as it
+                            // appears in the filtered/sorted view — row_idx
+                            // indexes the displayed rows, not page.records in
+                            // natural order.
+                            let unchanged = exp
+                                .active_tab()
+                                .map(|tab| match tab {
+                                    WorkspaceTab::Table(t) => {
+                                        let mut rec_refs: Vec<&crate::driver::Record> = t
+                                            .page
+                                            .records
+                                            .iter()
+                                            .filter(|r| {
+                                                t.filter
+                                                    .as_ref()
+                                                    .map(|f| {
+                                                        crate::ui::screens::explorer::record_matches_filter(r, f)
+                                                    })
+                                                    .unwrap_or(true)
+                                            })
+                                            .collect();
+                                        if let Some(sort_col) = t.sort_col {
+                                            rec_refs.sort_by(|a, b| {
+                                                crate::ui::screens::explorer::compare_records(
+                                                    a, b, sort_col, t.sort_dir,
+                                                )
+                                            });
+                                        }
+                                        rec_refs
+                                            .get(row_idx)
+                                            .and_then(|r| r.values.get(col_idx))
+                                            .map(|v| match v {
+                                                crate::driver::Value::Null => {
+                                                    new_val_str == NULL_SENTINEL
+                                                }
+                                                other => {
+                                                    other.display_str() == new_val_str
+                                                        && new_val_str != NULL_SENTINEL
+                                                }
+                                            })
+                                            .unwrap_or(false)
+                                    }
+                                    _ => false,
+                                })
+                                .unwrap_or(false);
+                            if unchanged {
+                                exp.cell_edit_modal = None;
+                                app.toasts.push(
+                                    ToastKind::Info,
+                                    "value unchanged — no update needed".to_string(),
+                                );
+                                continue;
+                            }
 
                             // Fetch table metadata to discover primary keys for exact targeting
                             let drv_clone = drv.clone();
@@ -2614,6 +2932,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         && exp.insert_row_modal.is_none()
                         && exp.sql_confirm_modal.is_none()
                         && exp.import_csv_modal.is_none()
+                        && exp.schema_edit_modal.is_none()
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('t')
                     {
@@ -2705,6 +3024,49 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        continue;
+                    }
+
+                    // Schema edit: Enter applies the ALTER via the SQL-confirm
+                    // modal (which splits + executes each statement).
+                    // Enter only applies the ALTER when NOT typing in an input
+                    // (add/rename/change-type) — handle_key advances those.
+                    if exp
+                        .schema_edit_modal
+                        .as_ref()
+                        .is_some_and(|m| m.input.is_none())
+                        && key.code == KeyCode::Enter
+                    {
+                        let sql = {
+                            let s = exp.schema_edit_modal.as_ref().unwrap();
+                            generate_alter_sql(
+                                &s.collection,
+                                &s.drop_cols,
+                                &s.add_cols,
+                                &s.type_changes,
+                                s.rename_table.as_deref(),
+                                &drv.info().name,
+                            )
+                        };
+                        match sql {
+                            Some(sql) => {
+                                let s = exp.schema_edit_modal.as_ref().unwrap();
+                                exp.sql_confirm_modal = Some(
+                                    crate::ui::screens::explorer::SqlConfirmModalState {
+                                        collection: s.collection.clone(),
+                                        sql_query: sql,
+                                        row_idx: 0,
+                                    },
+                                );
+                            }
+                            None => {
+                                app.toasts.push(
+                                    ToastKind::Warning,
+                                    "no schema changes to apply".to_string(),
+                                );
+                            }
+                        }
+                        exp.schema_edit_modal = None;
                         continue;
                     }
 
@@ -2824,7 +3186,10 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         }
                     }
 
-                    if exp.ddl_popup.is_none() && exp.focused_pane == FocusedPane::Tree {
+                    if exp.ddl_popup.is_none()
+                        && exp.schema_edit_modal.is_none()
+                        && exp.focused_pane == FocusedPane::Tree
+                    {
                         match key.code {
                             KeyCode::Char(' ') | KeyCode::Enter => {
                                 if let Some(node) = exp.selected_node() {
@@ -2935,6 +3300,44 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                         }
                                     }
                                 }
+                            }
+                            KeyCode::Char('e') => {
+                                // Edit schema (ALTER). Gated on the DDL
+                                // capability so a NoSQL driver without
+                                // structured schema just explains instead of
+                                // offering a broken ALTER flow.
+                                if let Some(node) = exp.selected_node() {
+                                    let cref = match &node.kind {
+                                        TreeNodeKind::Table(cref, _, _) => cref.clone(),
+                                        _ => continue,
+                                    };
+                                    if !exp
+                                        .driver_capabilities
+                                        .contains(crate::driver::Capabilities::DDL)
+                                    {
+                                        app.toasts.push(
+                                            ToastKind::Warning,
+                                            "this driver does not support editing schema".to_string(),
+                                        );
+                                        continue;
+                                    }
+                                    let drv_clone = drv.clone();
+                                    if let Ok(meta) = drv_clone.collection_meta(&cref).await {
+                                        exp.schema_edit_modal = Some(
+                                            crate::ui::screens::explorer::SchemaEditModalState {
+                                                collection: cref,
+                                                columns: meta.columns,
+                                                selected: 0,
+                                                drop_cols: Vec::new(),
+                                                add_cols: Vec::new(),
+                                                type_changes: Vec::new(),
+                                                rename_table: None,
+                                                input: None,
+                                            },
+                                        );
+                                    }
+                                }
+                                continue;
                             }
                             KeyCode::F(1) => {
                                 if let Some(node) = exp.selected_node() {
@@ -3576,6 +3979,48 @@ mod tests {
         let c = cref("shop", "orders");
         let fields = vec![("id".to_string(), None)];
         assert_eq!(build_insert_sql(&c, &fields, "postgres"), None);
+    }
+
+    #[test]
+    fn test_generate_alter_sql() {
+        let c = cref("shop", "users");
+        let sql = generate_alter_sql(
+            &c,
+            &["email".to_string()],
+            &[("bio".to_string(), "TEXT".to_string())],
+            &[("name".to_string(), "VARCHAR(64)".to_string())],
+            Some("people"),
+            "PostgreSQL 15",
+        );
+        // Rename comes LAST so earlier statements still reference old name.
+        let expected = "ALTER TABLE \"shop\".\"users\" DROP COLUMN \"email\";\n\
+            ALTER TABLE \"shop\".\"users\" ADD COLUMN \"bio\" TEXT;\n\
+            ALTER TABLE \"shop\".\"users\" ALTER COLUMN \"name\" TYPE VARCHAR(64);\n\
+            ALTER TABLE \"shop\".\"users\" RENAME TO \"people\";";
+        assert_eq!(sql.as_deref(), Some(expected));
+
+        // No operations → None (caller shows a warning instead of empty SQL).
+        assert_eq!(
+            generate_alter_sql(&c, &[], &[], &[], None, "MySQL 8"),
+            None
+        );
+
+        // Dialect-aware quoting AND type-change verb (MySQL MODIFY COLUMN).
+        let sql = generate_alter_sql(
+            &c,
+            &[],
+            &[("bio".to_string(), "TEXT".to_string())],
+            &[("name".to_string(), "VARCHAR(64)".to_string())],
+            None,
+            "MySQL 8",
+        );
+        assert_eq!(
+            sql.as_deref(),
+            Some(
+                "ALTER TABLE `shop`.`users` ADD COLUMN `bio` TEXT;\n\
+                 ALTER TABLE `shop`.`users` MODIFY COLUMN `name` VARCHAR(64);"
+            )
+        );
     }
 
     #[test]
