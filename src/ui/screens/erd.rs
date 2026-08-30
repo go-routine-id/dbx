@@ -35,6 +35,11 @@ const PX_PER_ROW: f64 = 22.0;
 /// Pan step (in pixel space) for hjkl / arrow keys.
 const PAN_STEP_COLS: f64 = 4.0;
 
+/// Extra margin (in terminal cells) allowed when panning past the left/top
+/// edge, so content can be brought comfortably into view instead of hugging
+/// the canvas border.
+const OVERSCROLL_CELLS: f64 = 60.0;
+
 /// Border accents cycled over entities (mirrors flowmaid's per-entity
 /// accent idea, terminal edition).
 const ACCENTS: [Color; 6] = [
@@ -177,7 +182,7 @@ impl ErdTab {
 
     pub fn scroll_up(&mut self) {
         let p = self.view.px_row();
-        self.view.oy = (self.view.oy - p).max(-2.0 * p);
+        self.view.oy = (self.view.oy - p).max(-OVERSCROLL_CELLS * p);
     }
 
     pub fn scroll_down(&mut self) {
@@ -187,7 +192,7 @@ impl ErdTab {
 
     pub fn scroll_left(&mut self) {
         let p = self.view.px_col() * PAN_STEP_COLS;
-        self.view.ox = (self.view.ox - p).max(-2.0 * self.view.px_col());
+        self.view.ox = (self.view.ox - p).max(-OVERSCROLL_CELLS * self.view.px_col());
     }
 
     pub fn scroll_right(&mut self) {
@@ -207,7 +212,7 @@ impl ErdTab {
     pub fn page_up(&mut self) {
         let rows = self.page_rows();
         let p = rows * self.view.px_row();
-        self.view.oy = (self.view.oy - p).max(-2.0 * self.view.px_row());
+        self.view.oy = (self.view.oy - p).max(-OVERSCROLL_CELLS * self.view.px_row());
     }
 
     /// Rows to skip for a page scroll — the canvas height minus one row of
@@ -235,8 +240,8 @@ impl ErdTab {
         let drow = f64::from(dy) * self.view.px_row();
         self.view.ox -= dcol;
         self.view.oy -= drow;
-        self.view.ox = self.view.ox.clamp(-2.0 * self.view.px_col(), self.scene_w);
-        self.view.oy = self.view.oy.clamp(-2.0 * self.view.px_row(), self.scene_h);
+        self.view.ox = self.view.ox.clamp(-OVERSCROLL_CELLS * self.view.px_col(), self.scene_w);
+        self.view.oy = self.view.oy.clamp(-OVERSCROLL_CELLS * self.view.px_row(), self.scene_h);
     }
 
     /// Zoom in toward the current view origin (clamped to a sane range).

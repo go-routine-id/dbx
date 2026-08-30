@@ -60,6 +60,22 @@ pub struct SqlConfirmModalState {
     pub row_idx: usize,
 }
 
+/// Context menu shown when clicking/selecting an ERD node — a short list of
+/// actions to run against that table.
+#[derive(Clone, Debug)]
+pub struct ErdMenuState {
+    pub collection: CollectionRef,
+    pub selected: usize,
+}
+
+/// Labels for the ERD node context menu, indexed by `ErdMenuState.selected`.
+pub const ERD_MENU_OPTIONS: [&str; 4] = [
+    "View DDL",
+    "Open table (rows)",
+    "Edit schema",
+    "Delete table",
+];
+
 /// State for the multi-field INSERT-row modal. One `Option<String>` per
 /// column from the table's metadata. `None` means "skip this column" — the
 /// generated `INSERT` statement omits it, so the server applies the column
@@ -386,7 +402,13 @@ pub struct ExplorerState {
     pub import_csv_modal: Option<ImportCsvModalState>,
     pub schema_edit_modal: Option<SchemaEditModalState>,
     pub create_object_modal: Option<CreateObjectModalState>,
+    pub erd_menu: Option<ErdMenuState>,
     pub driver_capabilities: crate::driver::Capabilities,
+    /// X start of each workspace tab (terminal columns), recorded at draw
+    /// time so a mouse click maps to the right tab.
+    pub tab_starts: Vec<u16>,
+    /// Area of the tab header row from the last draw.
+    pub tab_bar_area: Option<Rect>,
 }
 
 impl ExplorerState {
@@ -424,7 +446,10 @@ impl ExplorerState {
             import_csv_modal: None,
             schema_edit_modal: None,
             create_object_modal: None,
+            erd_menu: None,
             driver_capabilities,
+            tab_starts: Vec::new(),
+            tab_bar_area: None,
         }
     }
 
@@ -558,6 +583,50 @@ pub fn render_explorer(
     if let Some(create) = &state.create_object_modal {
         render_create_object_modal(f, area, create, theme);
     }
+
+    if let Some(menu) = &state.erd_menu {
+        render_erd_menu(f, area, menu, theme);
+    }
+}
+
+/// Small context menu for an ERD node (View DDL / Open rows / Edit schema /
+/// Delete table). `Enter` runs the highlighted action (handled in the event
+/// loop); `Esc` closes.
+fn render_erd_menu(f: &mut Frame, area: Rect, menu: &ErdMenuState, theme: &Theme) {
+    let options = ERD_MENU_OPTIONS;
+    let width = 30.min(area.width.saturating_sub(4));
+    let height = (options.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent())
+        .style(theme.panel())
+        .title(format!(" {} ", menu.collection.name));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let mut lines = Vec::new();
+    for (i, label) in options.iter().enumerate() {
+        let is_sel = i == menu.selected;
+        let style = if is_sel {
+            theme.selected()
+        } else {
+            theme.base()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if is_sel { "▶ " } else { "  " }, theme.accent()),
+            Span::styled(*label, style),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Overlay for creating a schema / table / view / type / function.
@@ -1047,8 +1116,10 @@ fn render_workspace(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme:
         ])
         .split(area);
 
-    // 1. Tab headers
+    // 1. Tab headers — record each tab's x-start so a click can switch tabs.
     let mut tab_spans = Vec::new();
+    let mut tab_starts = Vec::new();
+    let mut x = chunks[0].x;
     for (i, tab) in state.tabs.iter().enumerate() {
         let is_active = i == state.active_tab_index;
         let style = if is_active {
@@ -1061,9 +1132,14 @@ fn render_workspace(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme:
             WorkspaceTab::Console(_) => "⚡",
             WorkspaceTab::Erd(_) => "🗺️",
         };
-        tab_spans.push(Span::styled(format!(" [ {icon} {} ] ", tab.title()), style));
+        let label = format!(" [ {icon} {} ] ", tab.title());
+        tab_starts.push(x);
+        x = x.saturating_add(unicode_width::UnicodeWidthStr::width(label.as_str()) as u16 + 1);
+        tab_spans.push(Span::styled(label, style));
         tab_spans.push(Span::raw(" "));
     }
+    state.tab_starts = tab_starts;
+    state.tab_bar_area = Some(chunks[0]);
     f.render_widget(Paragraph::new(Line::from(tab_spans)), chunks[0]);
 
     // 2. Active Tab Body

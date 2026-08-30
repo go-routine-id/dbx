@@ -869,12 +869,15 @@ impl App {
     /// its DDL (hit-test in scene space); every other mouse gesture is a
     /// no-op. Keyboard navigation remains the primary interaction model.
     async fn handle_mouse(&mut self, mouse: MouseEvent) -> anyhow::Result<()> {
-        // Scroll wheel: move the selection one step in the pane under the
-        // cursor (picker / tree / grid / console result).
-        if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+        // Scroll: two-finger scroll / wheel pans the ERD (all directions) or
+        // moves the selection one step in lists (picker / tree / grid /
+        // console result — vertical only).
+        if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight) {
             let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+            let is_vertical = matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown);
             if matches!(self.mode, ScreenMode::Picker) {
                 if let Some(area) = self.picker_hit_area
+                    && is_vertical
                     && mouse.row >= area.y
                     && mouse.row < area.y + area.height
                 {
@@ -900,6 +903,7 @@ impl App {
                         || e.import_csv_modal.is_some()
                         || e.schema_edit_modal.is_some()
                         || e.create_object_modal.is_some()
+                        || e.erd_menu.is_some()
                 })
                 .unwrap_or(false);
             if modal_open {
@@ -908,7 +912,8 @@ impl App {
             if let Some(exp) = &mut self.explorer_state {
                 // Tree pane.
                 if let Some(area) = exp.tree_hit_area {
-                    if mouse.column >= area.x
+                    if is_vertical
+                        && mouse.column >= area.x
                         && mouse.column < area.x + area.width
                         && mouse.row >= area.y
                         && mouse.row < area.y + area.height
@@ -923,6 +928,7 @@ impl App {
                     match tab {
                         WorkspaceTab::Table(t) => {
                             if let Some(area) = t.grid_hit_area
+                                && is_vertical
                                 && mouse.column >= area.x
                                 && mouse.column < area.x + area.width
                                 && mouse.row >= area.y
@@ -950,6 +956,7 @@ impl App {
                         }
                         WorkspaceTab::Console(c) => {
                             if let Some(area) = c.result_hit_area
+                                && is_vertical
                                 && mouse.column >= area.x
                                 && mouse.column < area.x + area.width
                                 && mouse.row >= area.y
@@ -962,7 +969,8 @@ impl App {
                                 focus_workspace = true;
                             }
                         }
-                        // Figma-like: scroll wheel zooms the ERD.
+                        // Two-finger scroll / wheel pans the ERD in all
+                        // directions (zoom stays on the `+` / `-` keys).
                         WorkspaceTab::Erd(erd) => {
                             if let Some(area) = erd.last_canvas_area
                                 && mouse.column >= area.x
@@ -970,10 +978,12 @@ impl App {
                                 && mouse.row >= area.y
                                 && mouse.row < area.y + area.height
                             {
-                                if up {
-                                    erd.zoom_in();
-                                } else {
-                                    erd.zoom_out();
+                                match mouse.kind {
+                                    MouseEventKind::ScrollUp => erd.scroll_up(),
+                                    MouseEventKind::ScrollDown => erd.scroll_down(),
+                                    MouseEventKind::ScrollLeft => erd.scroll_left(),
+                                    MouseEventKind::ScrollRight => erd.scroll_right(),
+                                    _ => {}
                                 }
                             }
                         }
@@ -1021,9 +1031,8 @@ impl App {
             self.erd_drag = None;
             if was_click {
                 // A click (press + release without drag) on an ERD node opens
-                // its DDL — same as the old press-to-open behaviour. Only when
-                // no other modal has been opened mid-press.
-                let (Some(drv), Some(exp)) = (&self.active_driver, &mut self.explorer_state)
+                // its context menu. Only when no other modal is open.
+                let (Some(_drv), Some(exp)) = (&self.active_driver, &mut self.explorer_state)
                 else {
                     return Ok(());
                 };
@@ -1052,12 +1061,10 @@ impl App {
                             name: node.id.clone(),
                         }
                     };
-                    match drv.definition(&cref).await {
-                        Ok(ddl) => exp.ddl_popup = Some((cref, ddl)),
-                        Err(e) => self
-                            .toasts
-                            .push(ToastKind::Error, format!("failed to fetch DDL: {e:#}")),
-                    }
+                    exp.erd_menu = Some(crate::ui::screens::explorer::ErdMenuState {
+                        collection: cref,
+                        selected: 0,
+                    });
                 }
             }
             return Ok(());
@@ -1111,7 +1118,22 @@ impl App {
             || exp.import_csv_modal.is_some()
             || exp.schema_edit_modal.is_some()
             || exp.create_object_modal.is_some()
+            || exp.erd_menu.is_some()
         {
+            return Ok(());
+        }
+
+        // Click a workspace tab header to switch to that tab.
+        if let Some(bar) = exp.tab_bar_area
+            && mouse.column >= bar.x
+            && mouse.column < bar.x + bar.width
+            && mouse.row >= bar.y
+            && mouse.row < bar.y + bar.height
+        {
+            if let Some(idx) = exp.tab_starts.iter().rposition(|&s| mouse.column >= s) {
+                exp.active_tab_index = idx;
+                exp.focused_pane = FocusedPane::Workspace;
+            }
             return Ok(());
         }
 
@@ -1611,6 +1633,24 @@ impl App {
                 if exp.sql_confirm_modal.is_some() {
                     if key.code == KeyCode::Esc {
                         exp.sql_confirm_modal = None;
+                    }
+                    return;
+                }
+
+                // ERD node context menu: Up/Down navigate, Esc closes, Enter
+                // runs the highlighted action (handled in the async loop).
+                if let Some(menu) = &mut exp.erd_menu {
+                    match key.code {
+                        KeyCode::Esc => exp.erd_menu = None,
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            menu.selected = menu.selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            menu.selected = (menu.selected + 1)
+                                .min(crate::ui::screens::explorer::ERD_MENU_OPTIONS.len() - 1);
+                        }
+                        KeyCode::Enter => {} // handled in the event loop
+                        _ => {}
                     }
                     return;
                 }
@@ -2343,12 +2383,25 @@ impl App {
                                     match c.focused_subpane {
                                     ConsoleSubpane::Editor => match key.code {
                                         KeyCode::Up => {
-                                            c.move_cursor_up();
-                                            c.autocomplete.clear();
+                                            // With suggestions showing, Up/Down cycles the
+                                            // highlighted suggestion (wrap-around); otherwise
+                                            // they move the text cursor.
+                                            if c.autocomplete.is_empty() {
+                                                c.move_cursor_up();
+                                            } else {
+                                                let n = c.autocomplete.len();
+                                                c.autocomplete_selected =
+                                                    (c.autocomplete_selected + n - 1) % n;
+                                            }
                                         }
                                         KeyCode::Down => {
-                                            c.move_cursor_down();
-                                            c.autocomplete.clear();
+                                            if c.autocomplete.is_empty() {
+                                                c.move_cursor_down();
+                                            } else {
+                                                let n = c.autocomplete.len();
+                                                c.autocomplete_selected =
+                                                    (c.autocomplete_selected + 1) % n;
+                                            }
                                         }
                                         KeyCode::Left => {
                                             c.move_cursor_left();
@@ -3758,10 +3811,103 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         continue;
                     }
 
+                    // ERD node context menu: Enter runs the highlighted action.
+                    if exp.erd_menu.is_some() && key.code == KeyCode::Enter {
+                        let (cref, selected) = {
+                            let m = exp.erd_menu.as_ref().unwrap();
+                            (m.collection.clone(), m.selected)
+                        };
+                        exp.erd_menu = None;
+                        match selected {
+                            0 => {
+                                // View DDL
+                                let drv_clone = drv.clone();
+                                match drv_clone.definition(&cref).await {
+                                    Ok(ddl) => exp.ddl_popup = Some((cref, ddl)),
+                                    Err(e) => app.toasts.push(
+                                        ToastKind::Error,
+                                        format!("failed to fetch DDL: {e:#}"),
+                                    ),
+                                }
+                            }
+                            1 => {
+                                // Open table (list rows)
+                                if let Err(e) = open_collection_tab(
+                                    exp,
+                                    drv,
+                                    cref,
+                                    app.config.effective_page_size(),
+                                    false,
+                                )
+                                .await
+                                {
+                                    app.toasts.push(
+                                        ToastKind::Error,
+                                        format!("failed to open table: {e}"),
+                                    );
+                                }
+                            }
+                            2 => {
+                                // Edit schema
+                                if !exp
+                                    .driver_capabilities
+                                    .contains(crate::driver::Capabilities::DDL)
+                                {
+                                    app.toasts.push(
+                                        ToastKind::Warning,
+                                        "this driver does not support editing schema".to_string(),
+                                    );
+                                } else {
+                                    let drv_clone = drv.clone();
+                                    if let Ok(meta) = drv_clone.collection_meta(&cref).await {
+                                        exp.schema_edit_modal = Some(
+                                            crate::ui::screens::explorer::SchemaEditModalState {
+                                                collection: cref,
+                                                columns: meta.columns,
+                                                selected: 0,
+                                                drop_cols: Vec::new(),
+                                                add_cols: Vec::new(),
+                                                type_changes: Vec::new(),
+                                                rename_table: None,
+                                                input: None,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
+                            3 => {
+                                // Delete table (DROP TABLE via SQL confirm)
+                                if !exp
+                                    .driver_capabilities
+                                    .contains(crate::driver::Capabilities::DDL)
+                                {
+                                    app.toasts.push(
+                                        ToastKind::Warning,
+                                        "this driver does not support dropping tables".to_string(),
+                                    );
+                                } else {
+                                    let driver_name = drv.info().name.clone();
+                                    let q_ns = quote_ident(&cref.namespace.0, &driver_name);
+                                    let q_tbl = quote_ident(&cref.name, &driver_name);
+                                    exp.sql_confirm_modal = Some(
+                                        crate::ui::screens::explorer::SqlConfirmModalState {
+                                            collection: cref,
+                                            sql_query: format!("DROP TABLE {q_ns}.{q_tbl};"),
+                                            row_idx: 0,
+                                        },
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
                     // Enter on an ERD tab with a keyboard-selected node
-                    // (`.`/`,` moves the selection) opens its DDL — the same
-                    // path as a mouse click on the node.
+                    // (`.`/`,` moves the selection) opens its context menu —
+                    // the same path as a mouse click on the node.
                     if exp.ddl_popup.is_none()
+                        && exp.erd_menu.is_none()
                         && exp.focused_pane == FocusedPane::Workspace
                         && key.code == KeyCode::Enter
                     {
@@ -3777,18 +3923,10 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             })
                         })();
                         if let Some(cref) = cref {
-                            let drv_clone = drv.clone();
-                            match drv_clone.definition(&cref).await {
-                                Ok(ddl) => {
-                                    exp.ddl_popup = Some((cref, ddl));
-                                }
-                                Err(e) => {
-                                    app.toasts.push(
-                                        ToastKind::Error,
-                                        format!("failed to fetch DDL: {e:#}"),
-                                    );
-                                }
-                            }
+                            exp.erd_menu = Some(crate::ui::screens::explorer::ErdMenuState {
+                                collection: cref,
+                                selected: 0,
+                            });
                             continue;
                         }
                     }
