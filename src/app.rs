@@ -724,26 +724,39 @@ impl App {
                     && mouse.row >= area.y
                     && mouse.row < area.y + area.height
                 {
+                    let rel_row = mouse.row - area.y;
                     // Table header (1) + bottom_margin (1) = 2 rows before data.
-                    let data_row = (mouse.row - area.y).saturating_sub(2) as usize;
-                    // Bound against the *displayed* (filtered) rows.
-                    let visible = t
-                        .filter
-                        .as_ref()
-                        .map(|f| {
-                            t.page
-                                .records
-                                .iter()
-                                .filter(|r| crate::ui::screens::explorer::record_matches_filter(r, f))
-                                .count()
-                        })
-                        .unwrap_or(t.page.records.len());
-                    if data_row < visible {
-                        t.selected_row = data_row;
+                    if rel_row >= 2 {
+                        let data_row = (rel_row - 2) as usize;
+                        // Bound against the *displayed* (filtered) rows.
+                        let visible = t
+                            .filter
+                            .as_ref()
+                            .map(|f| {
+                                t.page
+                                    .records
+                                    .iter()
+                                    .filter(|r| crate::ui::screens::explorer::record_matches_filter(r, f))
+                                    .count()
+                            })
+                            .unwrap_or(t.page.records.len());
+                        if data_row < visible {
+                            t.selected_row = data_row;
+                        }
                     }
-                    // Column widths are Constraint::Min(16) but grow to fill —
-                    // this is an approximation.
-                    let col_visible = mouse.column.saturating_sub(area.x) / 16;
+                    // Column width: when all columns fit, each is roughly
+                    // area/visible; when they overflow, scroll mode keeps ~16
+                    // cells per column. Clicking the header row selects the
+                    // column only.
+                    let visible_cols = t
+                        .page
+                        .columns
+                        .len()
+                        .saturating_sub(t.scroll_offset_x)
+                        .max(1);
+                    let avg = area.width / visible_cols as u16;
+                    let col_width = if avg >= 16 { avg } else { 16 };
+                    let col_visible = mouse.column.saturating_sub(area.x) / col_width;
                     t.selected_col = (col_visible as usize + t.scroll_offset_x)
                         .min(t.page.columns.len().saturating_sub(1));
                     focus_workspace = true;
@@ -757,12 +770,19 @@ impl App {
                     && mouse.row < area.y + area.height
                 {
                     if let Some(res) = &c.last_result {
+                        let rel_row = mouse.row - area.y;
                         // Table header (1) + bottom_margin (1) = 2 rows.
-                        let data_row = (mouse.row - area.y).saturating_sub(2) as usize;
-                        if data_row < res.records.len() {
-                            c.result_selected_row = data_row;
+                        if rel_row >= 2 {
+                            let data_row = (rel_row - 2) as usize;
+                            if data_row < res.records.len() {
+                                c.result_selected_row = data_row;
+                            }
                         }
-                        let col_visible = mouse.column.saturating_sub(area.x) / 16;
+                        let visible_cols =
+                            res.columns.len().saturating_sub(c.result_scroll_x).max(1);
+                        let avg = area.width / visible_cols as u16;
+                        let col_width = if avg >= 16 { avg } else { 16 };
+                        let col_visible = mouse.column.saturating_sub(area.x) / col_width;
                         c.result_selected_col = (col_visible as usize + c.result_scroll_x)
                             .min(res.columns.len().saturating_sub(1));
                         c.focused_subpane = ConsoleSubpane::Result;
