@@ -152,13 +152,17 @@ impl Driver for MySqlDriver {
             .bind(&ns.0)
             .fetch_all(&self.pool)
             .await
+            .map_err(|e| {
+                eprintln!("[dbx] mysql collections query error: {e}");
+                e
+            })
             .with_context(|| format!("failed to list tables in schema {}", ns.0))?;
 
         let mut cols = Vec::new();
         for r in rows {
             let name: String = r.get(0);
             let row_est: Option<i64> = r.try_get(1).ok();
-            let size: Option<u64> = r.try_get(2).ok();
+            let size = size_bytes_from_row(&r, 2);
             cols.push(Collection {
                 name,
                 estimated_row_count: row_est.map(|v| v.max(0) as u64),
@@ -436,6 +440,24 @@ impl Driver for MySqlDriver {
             None => Err(anyhow!("routine not found: {}", c)),
         }
     }
+}
+
+/// Decode a size column that may come back as signed / unsigned / numeric or
+/// string depending on the query — try each representation.
+fn size_bytes_from_row(row: &MySqlRow, idx: usize) -> Option<u64> {
+    if let Ok(v) = row.try_get::<i64, _>(idx) {
+        return Some(v.max(0) as u64);
+    }
+    if let Ok(v) = row.try_get::<u64, _>(idx) {
+        return Some(v);
+    }
+    if let Ok(v) = row.try_get::<f64, _>(idx) {
+        return Some(v.max(0.0) as u64);
+    }
+    if let Ok(v) = row.try_get::<String, _>(idx) {
+        return v.trim().parse().ok();
+    }
+    None
 }
 
 /// Converts a dynamic sqlx MySQL row into our generic `Record`

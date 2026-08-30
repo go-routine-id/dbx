@@ -161,7 +161,7 @@ impl Driver for PostgresDriver {
                      (SELECT sum(pg_total_relation_size(inhrelid)) \
                       FROM pg_inherits WHERE inhparent = c.oid), \
                      pg_total_relation_size(c.oid) \
-                   ) AS size_bytes \
+                   )::bigint AS size_bytes \
             FROM pg_class c \
             JOIN pg_namespace n ON n.oid = c.relnamespace \
             WHERE n.nspname = $1 AND c.relkind IN ('r', 'p') \
@@ -171,17 +171,21 @@ impl Driver for PostgresDriver {
             .bind(&ns.0)
             .fetch_all(&self.pool)
             .await
+            .map_err(|e| {
+                eprintln!("[dbx] pg collections query error: {e}");
+                e
+            })
             .with_context(|| format!("failed to list tables in schema {}", ns.0))?;
 
         let mut cols = Vec::new();
         for r in rows {
             let name: String = r.get(0);
             let row_est: Option<i64> = r.try_get(1).ok();
-            let size: Option<i64> = r.try_get(2).ok();
+            let size = size_bytes_from_row(&r, 2);
             cols.push(Collection {
                 name,
                 estimated_row_count: row_est.map(|v| v.max(0) as u64),
-                estimated_size_bytes: size.map(|v| v.max(0) as u64),
+                estimated_size_bytes: size,
             });
         }
         Ok(cols)
@@ -564,6 +568,22 @@ impl Driver for PostgresDriver {
         row.map(|r| r.0)
             .ok_or_else(|| anyhow!("routine not found: {}", c))
     }
+}
+
+/// Decode a size column that may come back as `INT8` or `NUMERIC` (Postgres
+/// has no unsigned int8, and `sum()` widens to numeric) or a string —
+/// try each representation so the code stays driver-agnostic.
+fn size_bytes_from_row(row: &PgRow, idx: usize) -> Option<u64> {
+    if let Ok(v) = row.try_get::<i64, _>(idx) {
+        return Some(v.max(0) as u64);
+    }
+    if let Ok(v) = row.try_get::<f64, _>(idx) {
+        return Some(v.max(0.0) as u64);
+    }
+    if let Ok(v) = row.try_get::<String, _>(idx) {
+        return v.trim().parse().ok();
+    }
+    None
 }
 
 /// Converts a dynamic sqlx PostgreSQL row into our generic `Record`

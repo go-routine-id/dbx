@@ -691,13 +691,12 @@ fn render_tree(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme: &The
                     Span::styled(format!("📁 {}", ns.0), style),
                 ])
             }
-            TreeNodeKind::Table(cref, count, size) => {
-                // Size is the primary metadata (fits the narrow tree pane);
-                // row count is the fallback when the driver has no size.
+            TreeNodeKind::Table(cref, _count, size) => {
+                // Size is the only metadata shown in the tree — no fallback
+                // to the row count (that estimate is less useful and the pane
+                // is narrow).
                 let meta = if let Some(s) = size {
                     format!(" (~{})", format_size(*s))
-                } else if let Some(c) = count {
-                    format!(" (~{c} rows)")
                 } else {
                     String::new()
                 };
