@@ -326,6 +326,16 @@ fn build_insert_row_sql(
     format!("INSERT INTO {q_tbl} ({col_list}) VALUES ({value_list});")
 }
 
+/// Expand a leading `~/` to the user's home directory.
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return std::path::PathBuf::from(home).join(rest);
+        }
+    }
+    std::path::PathBuf::from(path)
+}
+
 /// Recompute the console editor's autocomplete suggestions from the text
 /// before the cursor.
 fn refresh_autocomplete(
@@ -389,6 +399,49 @@ async fn open_collection_tab(
     exp.active_tab_index = exp.tabs.len().saturating_sub(1);
     exp.focused_pane = FocusedPane::Workspace;
     Ok(())
+}
+
+/// Build an INSERT where every value is a quoted string literal — used by
+/// CSV import so a cell whose text happens to equal the `__DBX_NULL__`
+/// sentinel is inserted as that literal, never as SQL NULL.
+fn build_insert_literal_sql(
+    table: &str,
+    columns: &[String],
+    values: &[String],
+    driver_name: &str,
+) -> String {
+    let q_tbl = quote_ident(table, driver_name);
+    let col_list = columns
+        .iter()
+        .map(|c| quote_ident(c, driver_name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let val_list = values
+        .iter()
+        .map(|v| format!("'{}'", escape_string_literal(v)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("INSERT INTO {q_tbl} ({col_list}) VALUES ({val_list});")
+}
+
+/// Re-fetch the active table tab's current page (shared by insert-row,
+/// sql-confirm and CSV-import so page-offset semantics stay consistent).
+async fn refresh_table_page(
+    exp: &mut crate::ui::screens::explorer::ExplorerState,
+    drv: &Arc<dyn crate::driver::Driver>,
+    cref: &crate::driver::CollectionRef,
+) {
+    if let Some(WorkspaceTab::Table(t)) = exp.active_tab_mut() {
+        if t.collection == *cref {
+            let cur_page = Page {
+                offset: t.page.page * t.page.page_size,
+                limit: t.page.page_size,
+            };
+            if let Ok(refreshed) = drv.records(cref, cur_page).await {
+                t.page = refreshed;
+            }
+        }
+    }
 }
 
 /// Roadmap M2.10: detect statements that can destroy data before the query
@@ -1013,7 +1066,8 @@ impl App {
                         }
                         KeyCode::Enter => {
                             if !imp.parsed {
-                                match std::fs::read_to_string(&imp.path) {
+                                let resolved = expand_tilde(&imp.path);
+                                match std::fs::read_to_string(&resolved) {
                                     Ok(content) => {
                                         imp.rows = crate::export::parse_csv(&content);
                                         imp.parsed = true;
@@ -2041,6 +2095,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 || e.insert_row_modal.is_some()
                                 || e.sql_confirm_modal.is_some()
                                 || e.object_search.is_some()
+                                || e.import_csv_modal.is_some()
                                 || e.ddl_popup.is_some()
                         })
                         .unwrap_or(false);
@@ -2280,21 +2335,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                             // window. If it doesn't (e.g.
                                             // sorted descending), the user can
                                             // navigate manually.
-                                            if let Some(WorkspaceTab::Table(t)) =
-                                                exp.active_tab_mut()
-                                            {
-                                                if t.collection == cref_clone {
-                                                    let cur_page = Page {
-                                                        offset: t.page.page * t.page.page_size,
-                                                        limit: t.page.page_size,
-                                                    };
-                                                    if let Ok(refreshed) =
-                                                        drv_clone.records(&cref_clone, cur_page).await
-                                                    {
-                                                        t.page = refreshed;
-                                                    }
-                                                }
-                                            }
+                                            refresh_table_page(exp, drv, &cref_clone).await;
                                         }
                                         Err(e) => {
                                             app.toasts.push(
@@ -2358,17 +2399,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                     exp.sql_confirm_modal = None;
 
                                     // Refresh active table tab
-                                    if let Some(WorkspaceTab::Table(t)) = exp.active_tab_mut() {
-                                        if t.collection == cref {
-                                            let cur_page = Page {
-                                                offset: t.page.page * t.page.page_size,
-                                                limit: t.page.page_size,
-                                            };
-                                            if let Ok(refreshed) = drv_clone.records(&cref, cur_page).await {
-                                                t.page = refreshed;
-                                            }
-                                        }
-                                    }
+                                    refresh_table_page(exp, drv, &cref).await;
                                 }
                                 Some(e) => {
                                     app.toasts.push(ToastKind::Error, format!("UPDATE failed: {e}"));
@@ -2387,6 +2418,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         && exp.cell_edit_modal.is_none()
                         && exp.insert_row_modal.is_none()
                         && exp.sql_confirm_modal.is_none()
+                        && exp.import_csv_modal.is_none()
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('t')
                     {
@@ -2481,23 +2513,35 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         continue;
                     }
 
-                    // CSV import: Enter on a parsed file inserts the rows.
-                    if exp.import_csv_modal.is_some() && key.code == KeyCode::Enter {
+                    // CSV import: Enter on a PARSED file inserts the rows. The
+                    // first Enter (read the file) must fall through to
+                    // handle_key — gating on `parsed` keeps them distinct.
+                    if exp
+                        .import_csv_modal
+                        .as_ref()
+                        .is_some_and(|m| m.parsed)
+                        && key.code == KeyCode::Enter
+                    {
                         let snapshot = {
                             let m = exp.import_csv_modal.as_ref().unwrap();
-                            if !m.parsed {
-                                None
-                            } else {
-                                Some((
-                                    m.rows.clone(),
-                                    exp.active_tab().and_then(|t| match t {
+                            Some((
+                                m.rows.clone(),
+                                exp.active_tab().and_then(|t| match t {
                                         WorkspaceTab::Table(t) => Some(t.collection.clone()),
                                         _ => None,
                                     }),
                                 ))
-                            }
                         };
                         if let Some((rows, Some(cref))) = snapshot {
+                            // Need a header row + at least one data row.
+                            if rows.len() < 2 || rows[0].is_empty() {
+                                app.toasts.push(
+                                    ToastKind::Error,
+                                    "CSV has no data rows (need a header + at least one row)".to_string(),
+                                );
+                                exp.import_csv_modal = None;
+                                continue;
+                            }
                             let drv_clone = drv.clone();
                             let driver_name = drv.info().name.clone();
                             let headers = rows.first().cloned().unwrap_or_default();
@@ -2513,20 +2557,17 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                     ));
                                     break;
                                 }
-                                let fields: Vec<(String, Option<String>)> = headers
-                                    .iter()
-                                    .zip(row.iter())
-                                    .map(|(h, v)| (h.clone(), Some(v.clone())))
-                                    .collect();
-                                if let Some(sql) =
-                                    build_insert_sql(&cref, &fields, &driver_name)
-                                {
-                                    match drv_clone.execute(&cref.namespace, &sql).await {
-                                        Ok(_) => inserted += 1,
-                                        Err(e) => {
-                                            fail = Some(format!("{e:#}"));
-                                            break;
-                                        }
+                                let sql = build_insert_literal_sql(
+                                    &cref.name,
+                                    &headers,
+                                    row,
+                                    &driver_name,
+                                );
+                                match drv_clone.execute(&cref.namespace, &sql).await {
+                                    Ok(_) => inserted += 1,
+                                    Err(e) => {
+                                        fail = Some(format!("{e:#}"));
+                                        break;
                                     }
                                 }
                             }
@@ -2544,19 +2585,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                         format!("imported {inserted} rows"),
                                     );
                                     // Refresh the table tab.
-                                    if let Some(WorkspaceTab::Table(t)) = exp.active_tab_mut() {
-                                        if t.collection == cref {
-                                            let cur_page = Page {
-                                                offset: t.page.page * t.page.page_size,
-                                                limit: t.page.page_size,
-                                            };
-                                            if let Ok(refreshed) =
-                                                drv_clone.records(&cref, cur_page).await
-                                            {
-                                                t.page = refreshed;
-                                            }
-                                        }
-                                    }
+                                    refresh_table_page(exp, drv, &cref).await;
                                 }
                             }
                         } else {

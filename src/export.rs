@@ -190,39 +190,49 @@ pub fn resolve_path(path_str: &str) -> Result<PathBuf> {
 }
 
 /// Parse a CSV string into rows of fields, honouring double-quoted fields
-/// (quotes, commas and doubled `""` inside quotes). Blank lines are skipped.
+/// (quotes, commas and doubled `""` inside quotes), multi-line quoted
+/// fields (RFC 4180), UTF-8 BOM and CRLF. Blank lines are skipped.
 pub fn parse_csv(content: &str) -> Vec<Vec<String>> {
+    let content = content.trim_start_matches('\u{feff}');
     let mut rows = Vec::new();
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let mut row = Vec::new();
-        let mut field = String::new();
-        let mut in_quotes = false;
-        let mut chars = line.chars().peekable();
-        while let Some(c) = chars.next() {
-            if in_quotes {
-                if c == '"' {
-                    if chars.peek() == Some(&'"') {
-                        field.push('"');
-                        chars.next();
-                    } else {
-                        in_quotes = false;
-                    }
+    let mut row = Vec::new();
+    let mut field = String::new();
+    let mut in_quotes = false;
+
+    let mut chars = content.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    field.push('"');
+                    chars.next();
                 } else {
-                    field.push(c);
+                    in_quotes = false;
                 }
             } else {
-                match c {
-                    '"' => in_quotes = true,
-                    ',' => row.push(std::mem::take(&mut field)),
-                    _ => field.push(c),
+                field.push(c);
+            }
+            continue;
+        }
+        match c {
+            '"' => in_quotes = true,
+            ',' => row.push(std::mem::take(&mut field)),
+            '\n' => {
+                row.push(std::mem::take(&mut field));
+                if row.iter().any(|f| !f.is_empty()) {
+                    rows.push(std::mem::take(&mut row));
                 }
             }
+            '\r' => {} // CRLF: drop the CR
+            _ => field.push(c),
         }
-        row.push(field);
-        rows.push(row);
+    }
+    // Last line (no trailing newline).
+    if !field.is_empty() || !row.is_empty() {
+        row.push(std::mem::take(&mut field));
+        if row.iter().any(|f| !f.is_empty()) {
+            rows.push(row);
+        }
     }
     rows
 }
@@ -246,6 +256,22 @@ mod tests {
         assert_eq!(rows[0], vec!["a,b".to_string(), "say \"hi\"".to_string()]);
         // Blank lines skipped.
         assert_eq!(parse_csv("a\n\nb\n").len(), 2);
+    }
+
+    #[test]
+    fn test_parse_csv_multiline_bom_crlf() {
+        // UTF-8 BOM stripped from the first header cell.
+        let rows = parse_csv("\u{feff}id,name\n1,x\n");
+        assert_eq!(rows[0][0], "id");
+
+        // RFC 4180 multi-line quoted field survives as one field.
+        let rows = parse_csv("a,b\nx,\"line1\nline2\"\n");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1][1], "line1\nline2");
+
+        // CRLF handled.
+        let rows = parse_csv("a,b\r\n1,2\r\n");
+        assert_eq!(rows[1], vec!["1".to_string(), "2".to_string()]);
     }
 
     #[test]
