@@ -9,7 +9,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, Paragraph, Row as TableRow, Table, TableState,
 };
 
-use crate::driver::{Collection, CollectionRef, ColumnMeta, Namespace, RecordPage};
+use crate::driver::{Collection, CollectionRef, ColumnMeta, Namespace, Record, RecordPage};
 use crate::export::ExportFormat;
 use crate::theme::Theme;
 use crate::ui::screens::erd::{self, ErdTab};
@@ -67,6 +67,16 @@ pub struct InsertRowModalState {
     pub focused_field: usize,
 }
 
+/// State for the global object-search overlay (`Ctrl+T`). `results` holds
+/// every table/view across all namespaces (fetched once when the overlay
+/// opens); the visible list is filtered by `query` client-side.
+#[derive(Clone, Debug)]
+pub struct ObjectSearchState {
+    pub query: String,
+    pub results: Vec<CollectionRef>,
+    pub selected: usize,
+}
+
 #[derive(Clone, Debug)]
 pub enum TreeNodeKind {
     Database(Namespace),
@@ -110,6 +120,110 @@ pub struct DataTab {
     /// Empty for tabs opened before this field existed or for query-console
     /// tabs that don't bind to a single table.
     pub column_meta: Vec<ColumnMeta>,
+    /// Active client-side sort (column index into `page.columns`) + direction.
+    /// `None` = natural order.
+    pub sort_col: Option<usize>,
+    pub sort_dir: SortDir,
+    /// Active client-side filter, applied on top of the sort.
+    pub filter: Option<FilterExpr>,
+    /// `true` while the user is typing a filter expression in the footer.
+    pub filter_editing: bool,
+    /// Text buffer for the filter being typed.
+    pub filter_buffer: String,
+}
+
+/// Sort direction for the data grid.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SortDir {
+    Asc,
+    Desc,
+}
+
+/// Comparison operator for a client-side row filter.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterOp {
+    Eq,
+    Ne,
+    Gt,
+    Lt,
+    Contains,
+}
+
+/// A parsed client-side filter: keep rows where `col op value` holds.
+#[derive(Clone, Debug)]
+pub struct FilterExpr {
+    pub col: usize,
+    pub op: FilterOp,
+    pub value: String,
+}
+
+impl FilterExpr {
+    /// Re-render the expression as a string (used to pre-fill the edit box).
+    pub fn display(&self) -> String {
+        let sym = match self.op {
+            FilterOp::Eq => "=",
+            FilterOp::Ne => "!=",
+            FilterOp::Gt => ">",
+            FilterOp::Lt => "<",
+            FilterOp::Contains => "~",
+        };
+        format!("{} {sym} {}", self.col, self.value)
+    }
+}
+
+/// Parse a footer filter expression of the form `col op value` (e.g.
+/// `status = paid`, `amount > 100`, `name ~ ada`). The operator is detected
+/// by scanning for the first known symbol; column matches by exact name.
+pub fn parse_filter(buf: &str, columns: &[String]) -> Option<FilterExpr> {
+    let buf = buf.trim();
+    if buf.is_empty() {
+        return None;
+    }
+    for (sym, op) in [
+        ("!=", FilterOp::Ne),
+        ("=", FilterOp::Eq),
+        (">", FilterOp::Gt),
+        ("<", FilterOp::Lt),
+        ("~", FilterOp::Contains),
+    ] {
+        if let Some(pos) = buf.find(sym) {
+            let col_name = buf[..pos].trim();
+            let value = buf[pos + sym.len()..].trim().to_string();
+            if value.is_empty() {
+                return None;
+            }
+            let col = columns.iter().position(|c| c == col_name)?;
+            return Some(FilterExpr { col, op, value });
+        }
+    }
+    None
+}
+
+/// Does `record` satisfy the filter? Non-numeric `Gt`/`Lt` fall back to
+/// string comparison; `Eq`/`Ne`/`Contains` always use the display string.
+fn record_matches_filter(record: &Record, f: &FilterExpr) -> bool {
+    let Some(val) = record.values.get(f.col) else {
+        return false;
+    };
+    let cell = val.display_str();
+    match f.op {
+        FilterOp::Eq => cell == f.value,
+        FilterOp::Ne => cell != f.value,
+        FilterOp::Contains => cell.contains(&f.value),
+        FilterOp::Gt => match numeric_pair(&cell, &f.value) {
+            Some((a, b)) => a > b,
+            None => cell > f.value,
+        },
+        FilterOp::Lt => match numeric_pair(&cell, &f.value) {
+            Some((a, b)) => a < b,
+            None => cell < f.value,
+        },
+    }
+}
+
+/// Parse two strings as numbers; `Some((a, b))` when both parse.
+fn numeric_pair(a: &str, b: &str) -> Option<(f64, f64)> {
+    Some((a.parse::<f64>().ok()?, b.parse::<f64>().ok()?))
 }
 
 #[derive(Clone, Debug)]
@@ -137,6 +251,7 @@ pub struct ExplorerState {
     pub cell_edit_modal: Option<CellEditModalState>,
     pub sql_confirm_modal: Option<SqlConfirmModalState>,
     pub insert_row_modal: Option<InsertRowModalState>,
+    pub object_search: Option<ObjectSearchState>,
     pub driver_capabilities: crate::driver::Capabilities,
 }
 
@@ -166,6 +281,7 @@ impl ExplorerState {
             cell_edit_modal: None,
             sql_confirm_modal: None,
             insert_row_modal: None,
+            object_search: None,
             driver_capabilities,
         }
     }
@@ -260,6 +376,90 @@ pub fn render_explorer(
     if let Some(confirm_modal) = &state.sql_confirm_modal {
         render_sql_confirm_modal(f, area, confirm_modal, theme);
     }
+
+    if let Some(search) = &state.object_search {
+        render_object_search(f, area, search, theme);
+    }
+}
+
+/// Centered overlay for the object search (`Ctrl+T`): a text input at the
+/// top, live-filtered list of matching objects below. `Enter` opens the
+/// highlighted object (handled in the event loop).
+fn render_object_search(f: &mut Frame, area: Rect, state: &ObjectSearchState, theme: &Theme) {
+    let width = 60.min(area.width.saturating_sub(4));
+    let height = 18.min(area.height.saturating_sub(2));
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent())
+        .style(theme.panel())
+        .title(" Search Objects (Ctrl+T) ");
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(1), // input
+            Constraint::Length(1), // match count
+            Constraint::Min(1),    // list
+            Constraint::Length(1), // footer
+        ])
+        .split(inner);
+
+    let input_line = Line::from(vec![
+        Span::styled("> ", theme.accent().add_modifier(Modifier::BOLD)),
+        Span::styled(format!("{}█", state.query), theme.base()),
+    ]);
+    f.render_widget(Paragraph::new(input_line), chunks[0]);
+
+    let filtered: Vec<&CollectionRef> = state
+        .results
+        .iter()
+        .filter(|r| {
+            r.name.contains(&state.query) || r.namespace.0.contains(&state.query)
+        })
+        .collect();
+
+    let match_line = Line::from(Span::styled(
+        format!("{} match(es) | ↑/↓ navigate · Enter open · Esc cancel", filtered.len()),
+        theme.dim(),
+    ));
+    f.render_widget(Paragraph::new(match_line), chunks[1]);
+
+    let mut lines = Vec::new();
+    let max_rows = (inner.height.saturating_sub(4)) as usize;
+    let sel = state.selected.min(filtered.len().saturating_sub(1));
+    let start = sel.saturating_sub(max_rows / 2);
+    for (i, r) in filtered.iter().skip(start).take(max_rows).enumerate() {
+        let is_sel = start + i == sel;
+        let style = if is_sel {
+            theme.selected()
+        } else {
+            theme.base()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(if is_sel { "▶ " } else { "  " }, theme.accent()),
+            Span::styled(format!("{}.{}", r.namespace.0, r.name), style),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), chunks[2]);
+
+    let footer = Line::from(vec![
+        Span::styled("[↑/↓] Navigate  ", theme.dim()),
+        Span::styled("[Enter] Open  ", theme.accent()),
+        Span::styled("[Esc] Cancel", theme.dim()),
+    ]);
+    f.render_widget(Paragraph::new(footer).alignment(Alignment::Center), chunks[3]);
 }
 
 fn render_tree(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme: &Theme) {
@@ -410,19 +610,35 @@ fn render_workspace(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme:
             WorkspaceTab::Table(data_tab) => {
                 render_grid(f, chunks[1], data_tab, is_focused, theme);
 
-                // 3. Pagination Footer
-                let total_str = data_tab
-                    .page
-                    .total_records
-                    .map(|t| format!(" of {} total", t))
-                    .unwrap_or_default();
-                let footer_text = format!(
-                    " Page {} (showing {} rows{}) | [n] Next Page  [p] Prev Page  [w] Close Tab",
-                    data_tab.page.page + 1,
-                    data_tab.page.records.len(),
-                    total_str
-                );
-                let p = Paragraph::new(Span::styled(footer_text, theme.dim()));
+                // 3. Pagination Footer. While the user is typing a filter, the
+                // footer becomes the filter input line.
+                let p = if data_tab.filter_editing {
+                    let input = format!("[filter] {}_ [Enter] apply  [Esc] cancel", data_tab.filter_buffer);
+                    Paragraph::new(Span::styled(input, theme.accent()))
+                } else {
+                    let total_str = data_tab
+                        .page
+                        .total_records
+                        .map(|t| format!(" of {} total", t))
+                        .unwrap_or_default();
+                    let filter_badge = data_tab.filter.as_ref().map(|f| {
+                        let shown = data_tab
+                            .page
+                            .records
+                            .iter()
+                            .filter(|r| record_matches_filter(r, f))
+                            .count();
+                        format!(" | filter {} ({}/{} shown)", f.display(), shown, data_tab.page.records.len())
+                    });
+                    let footer_text = format!(
+                        " Page {} (showing {} rows{}){} | [s] sort  [/] filter  [n]/[p] page  [w] Close",
+                        data_tab.page.page + 1,
+                        data_tab.page.records.len(),
+                        total_str,
+                        filter_badge.unwrap_or_default()
+                    );
+                    Paragraph::new(Span::styled(footer_text, theme.dim()))
+                };
                 f.render_widget(p, chunks[2]);
             }
             WorkspaceTab::Console(console) => {
@@ -479,6 +695,17 @@ fn render_grid(f: &mut Frame, area: Rect, tab: &DataTab, is_focused: bool, theme
         .fg(theme.accent);
     let row_highlight_style = theme.selected();
 
+    // Sort indicator on the active sort column header.
+    let sort_indicator = |abs_col: usize| -> &'static str {
+        match tab.sort_col {
+            Some(c) if c == abs_col => match tab.sort_dir {
+                SortDir::Asc => " ↑",
+                SortDir::Desc => " ↓",
+            },
+            _ => "",
+        }
+    };
+
     let header_cells = tab
         .page
         .columns
@@ -496,13 +723,23 @@ fn render_grid(f: &mut Frame, area: Rect, tab: &DataTab, is_focused: bool, theme
             } else {
                 theme.accent().add_modifier(Modifier::BOLD)
             };
-            Cell::from(Span::styled(col, style))
+            Cell::from(Span::styled(format!("{col}{}", sort_indicator(abs_col)), style))
         });
     let header = TableRow::new(header_cells).height(1).bottom_margin(1);
 
-    let rows: Vec<TableRow> = tab
+    // Client-side filter then sort. We copy row *references* (not the
+    // records) so `page.records` keeps its natural order for pagination.
+    let mut rec_refs: Vec<&Record> = tab
         .page
         .records
+        .iter()
+        .filter(|r| tab.filter.as_ref().map(|f| record_matches_filter(r, f)).unwrap_or(true))
+        .collect();
+    if let Some(sort_col) = tab.sort_col {
+        rec_refs.sort_by(|a, b| compare_records(a, b, sort_col, tab.sort_dir));
+    }
+
+    let rows: Vec<TableRow> = rec_refs
         .iter()
         .enumerate()
         .map(|(r_idx, record)| {
@@ -544,6 +781,49 @@ fn render_grid(f: &mut Frame, area: Rect, tab: &DataTab, is_focused: bool, theme
     state.select(Some(tab.selected_row));
 
     f.render_stateful_widget(table, area, &mut state);
+}
+
+/// Compare two records on the given column, applying the sort direction.
+fn compare_records(a: &Record, b: &Record, col: usize, dir: SortDir) -> std::cmp::Ordering {
+    let va = a.values.get(col).unwrap_or(&crate::driver::Value::Null);
+    let vb = b.values.get(col).unwrap_or(&crate::driver::Value::Null);
+    let ord = compare_values(va, vb);
+    match dir {
+        SortDir::Asc => ord,
+        SortDir::Desc => ord.reverse(),
+    }
+}
+
+/// Order two cell values for client-side sorting. NULLs sort first
+/// (ascending); numeric-like values compare numerically; everything else
+/// falls back to the display string.
+fn compare_values(a: &crate::driver::Value, b: &crate::driver::Value) -> std::cmp::Ordering {
+    use crate::driver::Value;
+    match (a, b) {
+        (Value::Null, Value::Null) => std::cmp::Ordering::Equal,
+        (Value::Null, _) => std::cmp::Ordering::Less,
+        (_, Value::Null) => std::cmp::Ordering::Greater,
+        (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
+        _ => {
+            if let (Some(x), Some(y)) = (value_as_number(a), value_as_number(b)) {
+                x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal)
+            } else {
+                a.display_str().cmp(&b.display_str())
+            }
+        }
+    }
+}
+
+/// Interpret a cell value as a number for sorting, if it's numeric-like.
+fn value_as_number(v: &crate::driver::Value) -> Option<f64> {
+    use crate::driver::Value;
+    match v {
+        Value::Int(i) => Some(*i as f64),
+        Value::UInt(u) => Some(*u as f64),
+        Value::Float(f) => Some(*f),
+        Value::Decimal(s) => s.parse::<f64>().ok(),
+        _ => None,
+    }
 }
 
 /// Renders the DDL popup and returns its `Rect` so callers can hit-test a
@@ -990,3 +1270,98 @@ fn render_insert_row_modal(
     f.render_widget(Paragraph::new(action).alignment(Alignment::Center), chunks[action_idx]);
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::driver::Value;
+
+    fn record(values: Vec<Value>) -> Record {
+        Record { values }
+    }
+
+    #[test]
+    fn test_compare_values_numeric() {
+        use std::cmp::Ordering;
+        // 10 < 2 numerically (not lexicographically).
+        assert_eq!(
+            compare_values(&Value::Int(10), &Value::Int(2)),
+            Ordering::Greater
+        );
+        // Int vs Decimal cross-type.
+        assert_eq!(
+            compare_values(&Value::Int(2), &Value::Decimal("10.5".to_string())),
+            Ordering::Less
+        );
+        // Float.
+        assert_eq!(
+            compare_values(&Value::Float(1.5), &Value::Float(1.25)),
+            Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_compare_values_null_sorts_first() {
+        use std::cmp::Ordering;
+        assert_eq!(compare_values(&Value::Null, &Value::Int(1)), Ordering::Less);
+        assert_eq!(compare_values(&Value::Int(1), &Value::Null), Ordering::Greater);
+        assert_eq!(compare_values(&Value::Null, &Value::Null), Ordering::Equal);
+    }
+
+    #[test]
+    fn test_compare_records_respects_direction() {
+        use crate::driver::Value;
+        let a = record(vec![Value::Int(1)]);
+        let b = record(vec![Value::Int(2)]);
+        assert_eq!(compare_records(&a, &b, 0, SortDir::Asc), std::cmp::Ordering::Less);
+        assert_eq!(compare_records(&a, &b, 0, SortDir::Desc), std::cmp::Ordering::Greater);
+    }
+
+    #[test]
+    fn test_parse_filter() {
+        let cols = vec!["status".to_string(), "amount".to_string(), "name".to_string()];
+        let f = parse_filter("status = paid", &cols).expect("parse");
+        assert_eq!(f.col, 0);
+        assert_eq!(f.op, FilterOp::Eq);
+        assert_eq!(f.value, "paid");
+
+        let f = parse_filter("amount > 100", &cols).expect("parse");
+        assert_eq!(f.col, 1);
+        assert_eq!(f.op, FilterOp::Gt);
+
+        let f = parse_filter("name ~ ada", &cols).expect("parse");
+        assert_eq!(f.col, 2);
+        assert_eq!(f.op, FilterOp::Contains);
+
+        // Unknown column / malformed → None.
+        assert!(parse_filter("nope = 1", &cols).is_none());
+        assert!(parse_filter("status >", &cols).is_none());
+        assert!(parse_filter("", &cols).is_none());
+    }
+
+    #[test]
+    fn test_record_matches_filter() {
+        use crate::driver::Value;
+        let cols = vec!["status".to_string(), "amount".to_string(), "name".to_string()];
+        let rec = record(vec![
+            Value::String("paid".to_string()),
+            Value::Decimal("150.50".to_string()),
+            Value::String("ada lovelace".to_string()),
+        ]);
+
+        let eq = parse_filter("status = paid", &cols).unwrap();
+        assert!(record_matches_filter(&rec, &eq));
+        let ne = parse_filter("status != pending", &cols).unwrap();
+        assert!(record_matches_filter(&rec, &ne));
+
+        // Numeric comparison (not lexicographic).
+        let gt = parse_filter("amount > 100", &cols).unwrap();
+        assert!(record_matches_filter(&rec, &gt));
+        let lt = parse_filter("amount < 100", &cols).unwrap();
+        assert!(!record_matches_filter(&rec, &lt));
+
+        // Contains (case-sensitive, like a LIKE without wildcards).
+        let cont = parse_filter("name ~ lovelace", &cols).unwrap();
+        assert!(record_matches_filter(&rec, &cont));
+    }
+}

@@ -302,6 +302,31 @@ fn build_insert_sql(
     ))
 }
 
+/// Build a single-row `INSERT` for copy-to-clipboard (row-as-INSERT), using
+/// the dialect-aware identifier quoting + value rendering. Unlike
+/// `Exporter::format_sql_insert` (which hardcodes backticks for the export
+/// file), this is safe on PostgreSQL too.
+fn build_insert_row_sql(
+    table: &str,
+    columns: &[String],
+    row: &crate::driver::Record,
+    driver_name: &str,
+) -> String {
+    let q_tbl = quote_ident(table, driver_name);
+    let col_list = columns
+        .iter()
+        .map(|c| quote_ident(c, driver_name))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let value_list = row
+        .values
+        .iter()
+        .map(render_value_sql)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("INSERT INTO {q_tbl} ({col_list}) VALUES ({value_list});")
+}
+
 /// Roadmap M2.10: detect statements that can destroy data before the query
 /// console runs them, so the user gets an explicit confirm dialog.
 ///
@@ -377,10 +402,11 @@ const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-const EXPLORER_HELP_BINDINGS: [(&str, &str); 19] = [
+const EXPLORER_HELP_BINDINGS: [(&str, &str); 22] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
+    ("Ctrl+T", "search all objects / jump to a table"),
     ("Ctrl+Enter / F5", "execute SQL query in active console"),
     ("j / Down", "move cursor / selection down"),
     ("k / Up", "move cursor / selection up"),
@@ -388,6 +414,8 @@ const EXPLORER_HELP_BINDINGS: [(&str, &str); 19] = [
     ("l / Right", "move cursor / column selection right"),
     ("Space", "expand / collapse database node in tree"),
     ("Enter", "open table in workspace grid"),
+    ("s", "sort data grid by active column (asc → desc → off)"),
+    ("/", "filter data grid rows (col op value, e.g. status = paid)"),
     ("y / c", "copy active cell value to system clipboard"),
     ("Y / Ctrl+Y", "copy active row as formatted JSON to clipboard"),
     ("Ctrl+E", "open export dialog (CSV, JSON, SQL INSERT) for current dataset"),
@@ -843,6 +871,30 @@ impl App {
                     return;
                 }
 
+                // Object search overlay owns all keys while it's open.
+                if let Some(s) = &mut exp.object_search {
+                    match key.code {
+                        KeyCode::Esc => exp.object_search = None,
+                        KeyCode::Backspace => {
+                            s.query.pop();
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => s.selected = s.selected.saturating_sub(1),
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let n = s
+                                .results
+                                .iter()
+                                .filter(|r| r.name.contains(&s.query) || r.namespace.0.contains(&s.query))
+                                .count();
+                            if n > 0 {
+                                s.selected = (s.selected + 1).min(n - 1);
+                            }
+                        }
+                        KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => s.query.push(c),
+                        _ => {}
+                    }
+                    return;
+                }
+
                 match key.code {
                     KeyCode::Esc => {
                         self.mode = ScreenMode::Picker;
@@ -933,7 +985,74 @@ impl App {
                         let can_edit = exp.driver_capabilities.contains(crate::driver::Capabilities::EDIT_DATA);
                         if let Some(tab) = exp.active_tab_mut() {
                             match tab {
-                                WorkspaceTab::Table(t) => match key.code {
+                                WorkspaceTab::Table(t) => {
+                                    if t.filter_editing {
+                                        // Filter input mode: every key feeds the
+                                        // filter buffer until Enter/Esc.
+                                        match key.code {
+                                            KeyCode::Esc => t.filter_editing = false,
+                                            KeyCode::Enter => {
+                                                t.filter =
+                                                    crate::ui::screens::explorer::parse_filter(
+                                                        &t.filter_buffer,
+                                                        &t.page.columns,
+                                                    );
+                                                t.filter_editing = false;
+                                            }
+                                            KeyCode::Backspace => {
+                                                t.filter_buffer.pop();
+                                            }
+                                            KeyCode::Char(c)
+                                                if !key.modifiers
+                                                    .contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                t.filter_buffer.push(c);
+                                            }
+                                            _ => {}
+                                        }
+                                    } else {
+                                        match key.code {
+                                    KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                        // Copy the selected row as an INSERT statement.
+                                        if let Some(row) = t.page.records.get(t.selected_row) {
+                                            let driver_name = self
+                                                .active_driver
+                                                .as_ref()
+                                                .map(|d| d.info().name.clone())
+                                                .unwrap_or_default();
+                                            let sql = build_insert_row_sql(
+                                                &t.collection.name,
+                                                &t.page.columns,
+                                                row,
+                                                &driver_name,
+                                            );
+                                            match ClipboardManager::set_text(&sql) {
+                                                Ok(_) => self.toasts.push(
+                                                    ToastKind::Success,
+                                                    "copied row as INSERT to clipboard".to_string(),
+                                                ),
+                                                Err(e) => self.toasts.push(ToastKind::Error, e),
+                                            }
+                                        }
+                                    }
+                                    KeyCode::Char('s') => {
+                                        // Client-side sort on the selected column:
+                                        // off → asc → desc → off.
+                                        let col = t.selected_col;
+                                        t.sort_col = match t.sort_col {
+                                            Some(c) if c == col => match t.sort_dir {
+                                                crate::ui::screens::explorer::SortDir::Asc => {
+                                                    t.sort_dir = crate::ui::screens::explorer::SortDir::Desc;
+                                                    Some(col)
+                                                }
+                                                crate::ui::screens::explorer::SortDir::Desc => None,
+                                            },
+                                            _ => {
+                                                t.sort_dir = crate::ui::screens::explorer::SortDir::Asc;
+                                                Some(col)
+                                            }
+                                        };
+                                    }
                                     KeyCode::Up | KeyCode::Char('k') => {
                                         if t.selected_row > 0 {
                                             t.selected_row -= 1;
@@ -1026,7 +1145,19 @@ impl App {
                                             });
                                         }
                                     }
+                                    KeyCode::Char('/') => {
+                                        // Enter filter-editing mode; pre-fill the
+                                        // current filter so it can be tweaked.
+                                        t.filter_editing = true;
+                                        t.filter_buffer = t
+                                            .filter
+                                            .as_ref()
+                                            .map(|f| f.display())
+                                            .unwrap_or_default();
+                                    }
                                     _ => {}
+                                }
+                                    }
                                 },
                                 WorkspaceTab::Console(c) => match c.focused_subpane {
                                     ConsoleSubpane::Editor => match key.code {
@@ -1829,6 +1960,91 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         }
                     }
 
+                    // Object search (Ctrl+T): open the overlay and fetch every
+                    // collection across all namespaces into the result list.
+                    if exp.object_search.is_none()
+                        && exp.ddl_popup.is_none()
+                        && exp.export_modal.is_none()
+                        && exp.cell_edit_modal.is_none()
+                        && exp.insert_row_modal.is_none()
+                        && exp.sql_confirm_modal.is_none()
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('t')
+                    {
+                        let mut results = Vec::new();
+                        for ns in exp.namespaces.clone() {
+                            if let Ok(tbls) = drv.collections(&ns).await {
+                                for t in tbls {
+                                    results.push(crate::driver::CollectionRef {
+                                        namespace: ns.clone(),
+                                        name: t.name,
+                                    });
+                                }
+                            }
+                        }
+                        exp.object_search = Some(
+                            crate::ui::screens::explorer::ObjectSearchState {
+                                query: String::new(),
+                                results,
+                                selected: 0,
+                            },
+                        );
+                        continue;
+                    }
+
+                    // Enter in the object search → open the highlighted object.
+                    if exp.object_search.is_some() && key.code == KeyCode::Enter {
+                        let cref = {
+                            let s = exp.object_search.as_ref().unwrap();
+                            let filtered: Vec<crate::driver::CollectionRef> = s
+                                .results
+                                .iter()
+                                .filter(|r| {
+                                    r.name.contains(&s.query)
+                                        || r.namespace.0.contains(&s.query)
+                                })
+                                .cloned()
+                                .collect();
+                            filtered.get(s.selected).cloned()
+                        };
+                        exp.object_search = None;
+                        if let Some(cref) = cref {
+                            let drv_clone = drv.clone();
+                            let cref_clone = cref.clone();
+                            let meta_res = drv_clone.collection_meta(&cref_clone).await;
+                            let rec_res = drv_clone
+                                .records(
+                                    &cref_clone,
+                                    Page {
+                                        offset: 0,
+                                        limit: app.config.effective_page_size(),
+                                    },
+                                )
+                                .await;
+                            if let Ok(rec_page) = rec_res {
+                                let column_meta = meta_res.map(|m| m.columns).unwrap_or_default();
+                                exp.tabs.push(WorkspaceTab::Table(
+                                    crate::ui::screens::explorer::DataTab {
+                                        collection: cref_clone,
+                                        page: rec_page,
+                                        selected_row: 0,
+                                        selected_col: 0,
+                                        scroll_offset_x: 0,
+                                        column_meta,
+                                        sort_col: None,
+                                        sort_dir: crate::ui::screens::explorer::SortDir::Asc,
+                                        filter: None,
+                                        filter_editing: false,
+                                        filter_buffer: String::new(),
+                                    },
+                                ));
+                                exp.active_tab_index = exp.tabs.len().saturating_sub(1);
+                                exp.focused_pane = FocusedPane::Workspace;
+                            }
+                        }
+                        continue;
+                    }
+
                     // Enter on an ERD tab with a keyboard-selected node
                     // (`.`/`,` moves the selection) opens its DDL — the same
                     // path as a mouse click on the node.
@@ -1941,6 +2157,11 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                                             selected_col: 0,
                                                             scroll_offset_x: 0,
                                                             column_meta,
+                                                            sort_col: None,
+                                                            sort_dir: crate::ui::screens::explorer::SortDir::Asc,
+                                                            filter: None,
+                                                            filter_editing: false,
+                                                            filter_buffer: String::new(),
                                                         }));
                                                         exp.active_tab_index = exp.tabs.len().saturating_sub(1);
                                                         exp.focused_pane = FocusedPane::Workspace;
@@ -2482,6 +2703,28 @@ mod tests {
         let c = cref("shop", "orders");
         let fields = vec![("id".to_string(), None)];
         assert_eq!(build_insert_sql(&c, &fields, "postgres"), None);
+    }
+
+    #[test]
+    fn test_build_insert_row_sql_dialect() {
+        let columns = vec!["id".to_string(), "name".to_string(), "note".to_string()];
+        let row = Record {
+            values: vec![
+                Value::Int(7),
+                Value::String("O'Brien".to_string()),
+                Value::Null,
+            ],
+        };
+        let pg = build_insert_row_sql("users", &columns, &row, "PostgreSQL 15.3");
+        assert_eq!(
+            pg,
+            "INSERT INTO \"users\" (\"id\", \"name\", \"note\") VALUES ('7', 'O''Brien', NULL);"
+        );
+        let my = build_insert_row_sql("users", &columns, &row, "MySQL 8.0");
+        assert_eq!(
+            my,
+            "INSERT INTO `users` (`id`, `name`, `note`) VALUES ('7', 'O''Brien', NULL);"
+        );
     }
 
     #[test]
