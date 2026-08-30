@@ -12,6 +12,43 @@ multi-tab consoles, inspect DDL, visualize ERD, and edit table data inline
 (insert / update / delete) — all without leaving your terminal. Works great
 over SSH.
 
+## Install
+
+Prebuilt binaries ship on every [release](https://github.com/go-routine-id/dbx/releases/latest).
+
+### macOS
+
+```bash
+# Apple Silicon (M1/M2/M3)
+curl -L -o dbx https://github.com/go-routine-id/dbx/releases/download/v0.1.0/dbx-macos-arm64
+chmod +x dbx && sudo mv dbx /usr/local/bin/
+
+# Intel
+curl -L -o dbx https://github.com/go-routine-id/dbx/releases/download/v0.1.0/dbx-macos-x86_64
+chmod +x dbx && sudo mv dbx /usr/local/bin/
+```
+
+Gatekeeper may block the unsigned binary — allow it with `xattr -d com.apple.quarantine /usr/local/bin/dbx`.
+
+### Linux (x86_64)
+
+```bash
+curl -L -o dbx https://github.com/go-routine-id/dbx/releases/download/v0.1.0/dbx-linux-x86_64
+chmod +x dbx && sudo mv dbx /usr/local/bin/
+```
+
+### Windows (x64)
+
+Download `dbx-windows-x86_64.exe` from the [latest release](https://github.com/go-routine-id/dbx/releases/latest), rename it to `dbx.exe`, and drop it into a folder on your `PATH`.
+
+### Run
+
+```bash
+dbx
+```
+
+Press `a` to add a connection, `t` to test-ping it, then `Enter` to connect.
+
 ## Features
 
 | | Feature |
