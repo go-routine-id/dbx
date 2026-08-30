@@ -65,6 +65,7 @@ and the rest of the app just works.
 | `g` | **Generate ERD** for the selected database |
 | `0` (in ERD tab) | Reset ERD viewport (pan + zoom) |
 | `h` / `j` / `k` / `l` (in ERD tab) | Pan ERD viewport |
+| `PageUp` / `PageDown` (in ERD tab) | Scroll ERD viewport one page |
 | `+` / `-` (in ERD tab) | Zoom in / out |
 | `.` / `,` (in ERD tab) | Select next / previous node |
 | `Enter` (on ERD node) | Open that table's DDL |

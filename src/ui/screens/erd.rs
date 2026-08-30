@@ -195,6 +195,31 @@ impl ErdTab {
         self.view.ox = (self.view.ox + p).min(self.scene_w);
     }
 
+    /// Scroll one viewport's worth (a "page") vertically. Uses the
+    /// last-painted canvas height, falling back to a sensible default before
+    /// the first draw. Clamped like the single-row scroll.
+    pub fn page_down(&mut self) {
+        let rows = self.page_rows();
+        let p = rows * self.view.px_row();
+        self.view.oy = (self.view.oy + p).min(self.scene_h);
+    }
+
+    pub fn page_up(&mut self) {
+        let rows = self.page_rows();
+        let p = rows * self.view.px_row();
+        self.view.oy = (self.view.oy - p).max(-2.0 * self.view.px_row());
+    }
+
+    /// Rows to skip for a page scroll — the canvas height minus one row of
+    /// overlap so the previous screen's last row stays visible for context.
+    fn page_rows(&self) -> f64 {
+        f64::from(
+            self.last_canvas_area
+                .map(|r| r.height.saturating_sub(1).max(1))
+                .unwrap_or(10),
+        )
+    }
+
     /// Recentre the viewport (offset = 0,0, zoom = 1.0). Bound to `0` like
     /// the spike.
     pub fn reset_view(&mut self) {

@@ -2602,6 +2602,8 @@ impl App {
                                     KeyCode::Down | KeyCode::Char('j') => e.scroll_down(),
                                     KeyCode::Left | KeyCode::Char('h') => e.scroll_left(),
                                     KeyCode::Right | KeyCode::Char('l') => e.scroll_right(),
+                                    KeyCode::PageDown => e.page_down(),
+                                    KeyCode::PageUp => e.page_up(),
                                     KeyCode::Char('0') => e.reset_view(),
                                     // Keyboard node selection (`.`/`,` next/prev);
                                     // Enter → DDL is handled in the event loop
