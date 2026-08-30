@@ -50,6 +50,8 @@ pub struct QueryConsole {
     /// Empty = nothing to offer.
     pub autocomplete: Vec<String>,
     pub autocomplete_selected: usize,
+    /// Result-pane inner area from the last draw — maps a mouse click to a cell.
+    pub result_hit_area: Option<Rect>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -101,6 +103,7 @@ impl QueryConsole {
             popup: None,
             autocomplete: Vec::new(),
             autocomplete_selected: 0,
+            result_hit_area: None,
         }
     }
 
@@ -546,7 +549,7 @@ pub fn highlight_sql_line(line: &str, theme: &Theme) -> Vec<Span<'static>> {
 pub fn render_query_console(
     f: &mut Frame,
     area: Rect,
-    console: &QueryConsole,
+    console: &mut QueryConsole,
     is_tab_focused: bool,
     theme: &Theme,
 ) {
@@ -736,7 +739,7 @@ fn render_editor(
 fn render_result(
     f: &mut Frame,
     area: Rect,
-    console: &QueryConsole,
+    console: &mut QueryConsole,
     is_tab_focused: bool,
     theme: &Theme,
 ) {
@@ -771,6 +774,7 @@ fn render_result(
         .border_style(border_style)
         .style(theme.base())
         .title(title);
+    console.result_hit_area = Some(block.inner(area));
 
     if let Some(err) = &console.execution_error {
         let inner = block.inner(area);

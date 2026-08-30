@@ -156,6 +156,8 @@ pub struct DataTab {
     /// cell-edit / insert / delete shortcuts so the UI never offers an
     /// operation that would fail at the DB (or silently mutate base rows).
     pub read_only: bool,
+    /// Grid inner area from the last draw — maps a mouse click to a cell.
+    pub grid_hit_area: Option<Rect>,
 }
 
 /// Sort direction for the data grid.
@@ -227,7 +229,7 @@ pub fn parse_filter(buf: &str, columns: &[String]) -> Option<FilterExpr> {
 
 /// Does `record` satisfy the filter? Non-numeric `Gt`/`Lt` fall back to
 /// string comparison; `Eq`/`Ne`/`Contains` always use the display string.
-fn record_matches_filter(record: &Record, f: &FilterExpr) -> bool {
+pub fn record_matches_filter(record: &Record, f: &FilterExpr) -> bool {
     let Some(val) = record.values.get(f.col) else {
         return false;
     };
@@ -270,6 +272,8 @@ pub struct ExplorerState {
     /// every draw so `selected_tree_index` stays in view when the list is
     /// taller than the viewport.
     pub tree_scroll: usize,
+    /// Tree-pane inner area from the last draw — maps a mouse click to a node.
+    pub tree_hit_area: Option<Rect>,
 
     // Right Workspace Tabs (Tables & Query Consoles)
     pub tabs: Vec<WorkspaceTab>,
@@ -311,6 +315,7 @@ impl ExplorerState {
             tree_nodes,
             selected_tree_index: 0,
             tree_scroll: 0,
+            tree_hit_area: None,
             tabs: Vec::new(),
             active_tab_index: 0,
             ddl_popup: None,
@@ -610,6 +615,7 @@ fn render_tree(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme: &The
 
     let inner = block.inner(area);
     f.render_widget(block, area);
+    state.tree_hit_area = Some(inner);
 
     if state.tree_nodes.is_empty() {
         let p = Paragraph::new(Span::styled("No databases found", theme.dim()))
@@ -829,12 +835,13 @@ fn render_workspace(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme:
     }
 }
 
-fn render_grid(f: &mut Frame, area: Rect, tab: &DataTab, is_focused: bool, theme: &Theme) {
+fn render_grid(f: &mut Frame, area: Rect, tab: &mut DataTab, is_focused: bool, theme: &Theme) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(if is_focused { theme.accent() } else { theme.border() })
         .style(theme.base());
+    tab.grid_hit_area = Some(block.inner(area));
 
     if tab.page.records.is_empty() {
         let inner = block.inner(area);

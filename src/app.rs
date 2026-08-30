@@ -395,6 +395,7 @@ async fn open_collection_tab(
         filter_editing: false,
         filter_buffer: String::new(),
         read_only,
+        grid_hit_area: None,
     }));
     exp.active_tab_index = exp.tabs.len().saturating_sub(1);
     exp.focused_pane = FocusedPane::Workspace;
@@ -608,6 +609,8 @@ pub struct App {
     active_connection_name: Option<String>,
     /// Full config of the active connection — used for reconnect.
     active_connection: Option<crate::config::ConnectionConfig>,
+    /// Picker-pane area from the last draw — maps a mouse click to a connection.
+    picker_hit_area: Option<Rect>,
 }
 
 impl App {
@@ -629,6 +632,7 @@ impl App {
             connecting: false,
             active_connection_name: None,
             active_connection: None,
+            picker_hit_area: None,
         }
     }
 
@@ -639,9 +643,20 @@ impl App {
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return Ok(());
         }
-        if !matches!(self.mode, ScreenMode::Connected) {
+
+        // S1: click a connection row to select it (Enter still connects).
+        if matches!(self.mode, ScreenMode::Picker) {
+            if let Some(area) = self.picker_hit_area {
+                if mouse.row >= area.y && mouse.row < area.y + area.height {
+                    let idx = (mouse.row - area.y).saturating_sub(1) as usize;
+                    if idx < self.config.connections.len() {
+                        self.selected_connection = idx;
+                    }
+                }
+            }
             return Ok(());
         }
+
         let (Some(drv), Some(exp)) = (&self.active_driver, &mut self.explorer_state) else {
             return Ok(());
         };
@@ -669,35 +684,119 @@ impl App {
             || exp.cell_edit_modal.is_some()
             || exp.insert_row_modal.is_some()
             || exp.sql_confirm_modal.is_some()
+            || exp.object_search.is_some()
+            || exp.import_csv_modal.is_some()
         {
             return Ok(());
         }
+
+        // S2 tree: click a node to select it (Enter/Space still open).
+        // `tree_hit_area` is border-excluded and nodes start at its top with
+        // NO header row, so the row maps 1:1 (plus scroll). Column is checked
+        // so a click in the workspace pane isn't swallowed by the tree.
+        if let Some(area) = exp.tree_hit_area {
+            if mouse.column >= area.x
+                && mouse.column < area.x + area.width
+                && mouse.row >= area.y
+                && mouse.row < area.y + area.height
+            {
+                let idx = (mouse.row - area.y) as usize + exp.tree_scroll;
+                if idx < exp.tree_nodes.len() {
+                    exp.selected_tree_index = idx;
+                    exp.focused_pane = FocusedPane::Tree;
+                    return Ok(());
+                }
+            }
+        }
+
+        // S2 workspace: click a cell / row / ERD node.
+        let mut focus_workspace = false;
         let Some(tab) = exp.active_tab_mut() else {
             return Ok(());
         };
-        let WorkspaceTab::Erd(erd) = tab else {
-            return Ok(());
-        };
-        let Some(idx) = erd.node_at_mouse(mouse.column, mouse.row) else {
-            return Ok(());
-        };
-        erd.selected_node = Some(idx);
-        let cref = {
-            let Some(scene) = &erd.scene else { return Ok(()) };
-            let node = &scene.scene.nodes[idx];
-            crate::driver::CollectionRef {
-                namespace: erd.namespace.clone(),
-                name: node.id.clone(),
+        match tab {
+            WorkspaceTab::Table(t) => {
+                let Some(area) = t.grid_hit_area else { return Ok(()) };
+                // Column check so a click on empty sidebar space below the
+                // tree doesn't fall through to the grid.
+                if mouse.column >= area.x
+                    && mouse.column < area.x + area.width
+                    && mouse.row >= area.y
+                    && mouse.row < area.y + area.height
+                {
+                    // Table header (1) + bottom_margin (1) = 2 rows before data.
+                    let data_row = (mouse.row - area.y).saturating_sub(2) as usize;
+                    // Bound against the *displayed* (filtered) rows.
+                    let visible = t
+                        .filter
+                        .as_ref()
+                        .map(|f| {
+                            t.page
+                                .records
+                                .iter()
+                                .filter(|r| crate::ui::screens::explorer::record_matches_filter(r, f))
+                                .count()
+                        })
+                        .unwrap_or(t.page.records.len());
+                    if data_row < visible {
+                        t.selected_row = data_row;
+                    }
+                    // Column widths are Constraint::Min(16) but grow to fill —
+                    // this is an approximation.
+                    let col_visible = mouse.column.saturating_sub(area.x) / 16;
+                    t.selected_col = (col_visible as usize + t.scroll_offset_x)
+                        .min(t.page.columns.len().saturating_sub(1));
+                    focus_workspace = true;
+                }
             }
-        };
-        match drv.definition(&cref).await {
-            Ok(ddl) => {
-                exp.ddl_popup = Some((cref, ddl));
+            WorkspaceTab::Console(c) => {
+                let Some(area) = c.result_hit_area else { return Ok(()) };
+                if mouse.column >= area.x
+                    && mouse.column < area.x + area.width
+                    && mouse.row >= area.y
+                    && mouse.row < area.y + area.height
+                {
+                    if let Some(res) = &c.last_result {
+                        // Table header (1) + bottom_margin (1) = 2 rows.
+                        let data_row = (mouse.row - area.y).saturating_sub(2) as usize;
+                        if data_row < res.records.len() {
+                            c.result_selected_row = data_row;
+                        }
+                        let col_visible = mouse.column.saturating_sub(area.x) / 16;
+                        c.result_selected_col = (col_visible as usize + c.result_scroll_x)
+                            .min(res.columns.len().saturating_sub(1));
+                        c.focused_subpane = ConsoleSubpane::Result;
+                        focus_workspace = true;
+                    }
+                }
             }
-            Err(e) => {
-                self.toasts
-                    .push(ToastKind::Error, format!("failed to fetch DDL: {e:#}"));
+            WorkspaceTab::Erd(erd) => {
+                let Some(idx) = erd.node_at_mouse(mouse.column, mouse.row) else {
+                    return Ok(());
+                };
+                erd.selected_node = Some(idx);
+                let cref = {
+                    let Some(scene) = &erd.scene else { return Ok(()) };
+                    let node = &scene.scene.nodes[idx];
+                    crate::driver::CollectionRef {
+                        namespace: erd.namespace.clone(),
+                        name: node.id.clone(),
+                    }
+                };
+                // Borrow of `erd` ends here; NLL lets us touch `exp` again.
+                match drv.definition(&cref).await {
+                    Ok(ddl) => {
+                        exp.ddl_popup = Some((cref, ddl));
+                    }
+                    Err(e) => {
+                        self.toasts
+                            .push(ToastKind::Error, format!("failed to fetch DDL: {e:#}"));
+                    }
+                }
             }
+        }
+        if focus_workspace {
+            exp.focused_pane = FocusedPane::Workspace;
         }
         Ok(())
     }
@@ -1088,6 +1187,31 @@ impl App {
 
                 match key.code {
                     KeyCode::Esc => {
+                        // Overlays with their own Esc handler close first, so
+                        // Esc still dismisses them (don't hijack into
+                        // back-one-level or the picker).
+                        if let Some(tab) = exp.active_tab_mut() {
+                            match tab {
+                                WorkspaceTab::Table(t) if t.filter_editing => {
+                                    t.filter_editing = false;
+                                    return;
+                                }
+                                WorkspaceTab::Console(c) if c.popup.is_some() => {
+                                    c.popup = None;
+                                    return;
+                                }
+                                _ => {}
+                            }
+                        }
+                        // Back one level at a time instead of jumping straight
+                        // to the connection picker: an active workspace tab
+                        // first returns focus to the tree, then Esc again (on
+                        // the tree) disconnects back to the picker. Modals are
+                        // already dismissed by their own handlers above.
+                        if exp.focused_pane == FocusedPane::Workspace {
+                            exp.focused_pane = FocusedPane::Tree;
+                            return;
+                        }
                         self.mode = ScreenMode::Picker;
                         self.active_driver = None;
                         self.explorer_state = None;
@@ -1870,6 +1994,7 @@ impl App {
         // Body
         match self.mode {
             ScreenMode::Picker => {
+                self.picker_hit_area = Some(layout.body);
                 picker::render_picker(
                     f,
                     layout.body,
