@@ -65,14 +65,78 @@ pub enum ConsoleSubpane {
     Result,
 }
 
-/// A simple picker shown over the console: `items` are `(label, payload)`
-/// — for history both are the query text; for favorites label = name,
-/// payload = SQL. Enter loads `payload` into the editor.
+/// A single entry in the console picker.
+#[derive(Clone, Debug)]
+pub struct ConsolePopupItem {
+    /// Display text (for collections this already includes a `[collection]`
+    /// badge prefix).
+    pub label: String,
+    /// SQL loaded into the editor on Enter.
+    pub payload: String,
+    /// `(collection, name)` used to delete this entry; `None` for history.
+    pub delete_key: Option<(String, String)>,
+}
+
+/// What kind of list the picker shows (drives hints + whether `d` deletes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsolePopupMode {
+    History,
+    Collections,
+}
+
+/// A searchable picker shown over the console. `all_items` is the full list;
+/// `items` is the live-search-filtered view actually rendered / navigated.
 #[derive(Clone, Debug)]
 pub struct ConsolePopup {
     pub title: String,
-    pub items: Vec<(String, String)>,
+    pub all_items: Vec<ConsolePopupItem>,
+    pub items: Vec<ConsolePopupItem>,
     pub selected: usize,
+    /// Live search filter (empty = show everything).
+    pub filter: String,
+    pub mode: ConsolePopupMode,
+}
+
+impl ConsolePopup {
+    pub fn new(title: String, items: Vec<ConsolePopupItem>, mode: ConsolePopupMode) -> Self {
+        let mut popup = Self {
+            title,
+            all_items: items.clone(),
+            items,
+            selected: 0,
+            filter: String::new(),
+            mode,
+        };
+        popup.rebuild();
+        popup
+    }
+
+    /// Re-filter `items` from `all_items` using `filter`, and clamp `selected`.
+    pub fn rebuild(&mut self) {
+        let f = self.filter.to_lowercase();
+        self.items = if f.is_empty() {
+            self.all_items.clone()
+        } else {
+            self.all_items
+                .iter()
+                .filter(|i| i.label.to_lowercase().contains(&f))
+                .cloned()
+                .collect()
+        };
+        if self.selected >= self.items.len() {
+            self.selected = self.items.len().saturating_sub(1);
+        }
+    }
+
+    pub fn push_filter(&mut self, ch: char) {
+        self.filter.push(ch);
+        self.rebuild();
+    }
+
+    pub fn pop_filter(&mut self) {
+        self.filter.pop();
+        self.rebuild();
+    }
 }
 
 impl QueryConsole {
@@ -836,10 +900,10 @@ fn render_autocomplete(f: &mut Frame, area: Rect, console: &QueryConsole, theme:
     f.render_widget(Paragraph::new(lines), inner);
 }
 
-/// Centered picker overlay for history / favorites.
+/// Centered searchable picker overlay for history / saved queries.
 fn render_console_popup(f: &mut Frame, area: Rect, popup: &ConsolePopup, theme: &Theme) {
-    let width = 72.min(area.width.saturating_sub(4));
-    let height = 16.min(area.height.saturating_sub(2));
+    let width = 78.min(area.width.saturating_sub(4));
+    let height = 18.min(area.height.saturating_sub(2));
     let popup_area = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -857,17 +921,24 @@ fn render_console_popup(f: &mut Frame, area: Rect, popup: &ConsolePopup, theme: 
     let inner = block.inner(popup_area);
     f.render_widget(block, popup_area);
 
-    // List on top, hint pinned to the bottom row (not overlaying the list).
+    // Search bar (top), list (middle), hint pinned to the bottom row.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .constraints([Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
         .split(inner);
 
-    let max_rows = chunks[0].height as usize;
+    let search = Line::from(vec![
+        Span::styled("/ ", theme.dim()),
+        Span::styled(popup.filter.clone(), theme.base()),
+        Span::styled("█", theme.accent()),
+    ]);
+    f.render_widget(Paragraph::new(search), chunks[0]);
+
+    let max_rows = chunks[1].height as usize;
     let sel = popup.selected.min(popup.items.len().saturating_sub(1));
     let start = sel.saturating_sub(max_rows / 2);
     let mut lines = Vec::new();
-    for (i, (label, _)) in popup.items.iter().skip(start).take(max_rows).enumerate() {
+    for (i, item) in popup.items.iter().skip(start).take(max_rows).enumerate() {
         let is_sel = start + i == sel;
         let style = if is_sel {
             theme.selected()
@@ -876,16 +947,22 @@ fn render_console_popup(f: &mut Frame, area: Rect, popup: &ConsolePopup, theme: 
         };
         lines.push(Line::from(vec![
             Span::styled(if is_sel { "▶ " } else { "  " }, theme.accent()),
-            Span::styled(label.clone(), style),
+            Span::styled(item.label.clone(), style),
         ]));
     }
-    f.render_widget(Paragraph::new(lines), chunks[0]);
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled("  no matches", theme.dim())));
+    }
+    f.render_widget(Paragraph::new(lines), chunks[1]);
 
-    let hint = Line::from(Span::styled(
-        " ↑/↓ navigate · Enter load · Esc close ",
-        theme.dim(),
-    ));
-    f.render_widget(Paragraph::new(hint), chunks[1]);
+    let hint = match popup.mode {
+        ConsolePopupMode::Collections => " ↑/↓ navigate · type search · Enter load · d delete · Esc close ",
+        ConsolePopupMode::History => " ↑/↓ navigate · type search · Enter load · Esc close ",
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(hint, theme.dim()))),
+        chunks[2],
+    );
 }
 
 fn render_editor(

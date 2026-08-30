@@ -135,6 +135,24 @@ fn default_page_size() -> u64 {
     DEFAULT_PAGE_SIZE
 }
 
+/// A single saved query within a [`QueryCollection`].
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct SavedQuery {
+    pub name: String,
+    pub sql: String,
+    /// Optional description (not yet surfaced in the UI — reserved).
+    #[serde(default)]
+    pub description: String,
+}
+
+/// A named collection of saved queries (e.g. "reporting", "migrations").
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct QueryCollection {
+    pub name: String,
+    #[serde(default)]
+    pub queries: Vec<SavedQuery>,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(default)]
@@ -145,8 +163,12 @@ pub struct AppConfig {
     /// to [`DEFAULT_PAGE_SIZE`].
     #[serde(default = "default_page_size")]
     pub page_size: u64,
-    /// Saved query favorites: `(name, sql)`.
+    /// Organized saved queries: named collections → list of saved queries.
     #[serde(default)]
+    pub query_collections: Vec<QueryCollection>,
+    /// Legacy flat favorites. Kept only to migrate pre-collections configs on
+    /// load; emptied by the migration and never re-serialized once empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub favorites: Vec<(String, String)>,
     /// Last executed queries per connection name (most recent first).
     #[serde(default)]
@@ -165,6 +187,94 @@ impl AppConfig {
         history.retain(|h| h != q);
         history.insert(0, q.to_string());
         history.truncate(50);
+    }
+
+    /// Move legacy flat `favorites` into a "Default" collection (one-time,
+    /// on load). Clears `favorites` so it isn't re-serialized afterwards.
+    pub fn migrate_legacy_favorites(&mut self) {
+        let legacy = std::mem::take(&mut self.favorites);
+        if legacy.is_empty() {
+            return;
+        }
+        let queries: Vec<SavedQuery> = legacy
+            .into_iter()
+            .map(|(name, sql)| SavedQuery {
+                name,
+                sql,
+                description: String::new(),
+            })
+            .collect();
+        if let Some(col) = self
+            .query_collections
+            .iter_mut()
+            .find(|c| c.name == "Default")
+        {
+            col.queries.extend(queries);
+        } else {
+            self.query_collections.insert(
+                0,
+                QueryCollection {
+                    name: "Default".to_string(),
+                    queries,
+                },
+            );
+        }
+    }
+
+    /// Save a query into the named collection (creating it if needed), with
+    /// name de-duplication within that collection. Returns the final
+    /// `(collection, name)`.
+    pub fn save_query(
+        &mut self,
+        collection: &str,
+        name: &str,
+        sql: &str,
+    ) -> (String, String) {
+        let col = if let Some(c) = self
+            .query_collections
+            .iter_mut()
+            .find(|c| c.name == collection)
+        {
+            c
+        } else {
+            self.query_collections.push(QueryCollection {
+                name: collection.to_string(),
+                queries: Vec::new(),
+            });
+            self.query_collections.last_mut().expect("just pushed")
+        };
+        // Disambiguate duplicates so a later save never overwrites an earlier.
+        let mut final_name = name.to_string();
+        let mut i = 2;
+        while col.queries.iter().any(|q| q.name == final_name) {
+            final_name = format!("{name} ({i})");
+            i += 1;
+        }
+        col.queries.push(SavedQuery {
+            name: final_name.clone(),
+            sql: sql.to_string(),
+            description: String::new(),
+        });
+        (collection.to_string(), final_name)
+    }
+
+    /// Remove a query by `(collection, name)`, dropping its collection when it
+    /// becomes empty. Returns `true` if a query was removed.
+    pub fn delete_query(&mut self, collection: &str, name: &str) -> bool {
+        let mut removed = false;
+        if let Some(col) = self
+            .query_collections
+            .iter_mut()
+            .find(|c| c.name == collection)
+        {
+            let before = col.queries.len();
+            col.queries.retain(|q| q.name != name);
+            removed = col.queries.len() != before;
+        }
+        if removed {
+            self.query_collections.retain(|c| !c.queries.is_empty());
+        }
+        removed
     }
 }
 
@@ -204,8 +314,9 @@ impl AppConfig {
         }
         let content = fs::read_to_string(path)
             .with_context(|| format!("failed to read config from {}", path.display()))?;
-        let config: AppConfig = toml::from_str(&content)
+        let mut config: AppConfig = toml::from_str(&content)
             .with_context(|| format!("failed to parse TOML config at {}", path.display()))?;
+        config.migrate_legacy_favorites();
         Ok(config)
     }
 
@@ -274,5 +385,42 @@ mod tests {
         cfg.push_history("prod", "SELECT * FROM big");
         assert_eq!(cfg.query_history.get("prod").unwrap().len(), 1);
         assert_eq!(cfg.query_history.get("dev").unwrap().len(), 2);
+    }
+
+    #[test]
+    fn test_migrate_legacy_favorites() {
+        let mut cfg = AppConfig::default();
+        cfg.favorites = vec![
+            ("users".to_string(), "SELECT * FROM users".to_string()),
+            ("orders".to_string(), "SELECT * FROM orders".to_string()),
+        ];
+        cfg.migrate_legacy_favorites();
+        // Legacy field is cleared so it isn't re-serialized.
+        assert!(cfg.favorites.is_empty());
+        assert_eq!(cfg.query_collections.len(), 1);
+        assert_eq!(cfg.query_collections[0].name, "Default");
+        assert_eq!(cfg.query_collections[0].queries.len(), 2);
+    }
+
+    #[test]
+    fn test_save_query_dedup_and_delete() {
+        let mut cfg = AppConfig::default();
+        let (col, name) = cfg.save_query("Default", "users", "SELECT 1");
+        assert_eq!((col.as_str(), name.as_str()), ("Default", "users"));
+        // Duplicate name within the collection is disambiguated.
+        let (_, name2) = cfg.save_query("Default", "users", "SELECT 2");
+        assert_eq!(name2, "users (2)");
+        // A different collection is created on demand.
+        cfg.save_query("reporting", "daily", "SELECT 3");
+        assert_eq!(cfg.query_collections.len(), 2);
+
+        // Delete removes the query; deleting the last query drops the collection.
+        assert!(cfg.delete_query("Default", "users"));
+        assert!(!cfg.delete_query("Default", "users")); // already gone
+        assert!(cfg.delete_query("Default", "users (2)"));
+        assert_eq!(
+            cfg.query_collections.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["reporting"]
+        );
     }
 }

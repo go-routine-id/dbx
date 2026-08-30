@@ -30,7 +30,9 @@ use crate::ui::screens::explorer::{
     self, ExportModalState, ExplorerState, FocusedPane, TreeNodeKind, WorkspaceTab,
 };
 use crate::ui::screens::picker::{self, ConfirmDeleteModal, ConnectionForm, FormField};
-use crate::ui::screens::query::{ConsoleSubpane, QueryConsole};
+use crate::ui::screens::query::{
+    ConsolePopup, ConsolePopupItem, ConsolePopupMode, ConsoleSubpane, QueryConsole,
+};
 use crate::ui::widgets::{help, spinner::Spinner, statusbar, toast::ToastKind, toast::Toasts};
 
 /// How long the event poll waits before a tick fires (spinner/toast cadence).
@@ -2282,11 +2284,49 @@ impl App {
                                                 let payload = popup
                                                     .items
                                                     .get(popup.selected)
-                                                    .map(|(_, p)| p.clone());
+                                                    .map(|i| i.payload.clone());
                                                 c.popup = None;
                                                 if let Some(sql) = payload {
                                                     c.set_text(sql);
                                                 }
+                                            }
+                                            KeyCode::Backspace => {
+                                                popup.pop_filter();
+                                            }
+                                            // `d` deletes the highlighted saved query.
+                                            KeyCode::Char('d')
+                                                if popup.mode == ConsolePopupMode::Collections
+                                                    && !key
+                                                        .modifiers
+                                                        .contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                let key = popup
+                                                    .items
+                                                    .get(popup.selected)
+                                                    .and_then(|i| i.delete_key.clone());
+                                                if let Some((collection, name)) = key
+                                                    && self.config.delete_query(&collection, &name)
+                                                {
+                                                    let _ = self.config.save(&self.config_path);
+                                                    self.toasts.push(
+                                                        ToastKind::Success,
+                                                        format!("deleted '{name}' from '{collection}'"),
+                                                    );
+                                                    popup.all_items.retain(|i| {
+                                                        match &i.delete_key {
+                                                            Some((c, n)) => {
+                                                                !(c == &collection && n == &name)
+                                                            }
+                                                            None => true,
+                                                        }
+                                                    });
+                                                    popup.rebuild();
+                                                }
+                                            }
+                                            KeyCode::Char(ch)
+                                                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                popup.push_filter(ch);
                                             }
                                             _ => {}
                                         }
@@ -2323,32 +2363,47 @@ impl App {
                                         // Backspace erase byte, so it must stay free.)
                                         KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::ALT) => {
                                             let conn = self.active_connection_name.clone().unwrap_or_default();
-                                            let items = self
+                                            let items: Vec<ConsolePopupItem> = self
                                                 .config
                                                 .query_history
                                                 .get(&conn)
                                                 .cloned()
                                                 .unwrap_or_default()
                                                 .into_iter()
-                                                .map(|q| (q.clone(), q))
+                                                .map(|q| ConsolePopupItem {
+                                                    label: q.clone(),
+                                                    payload: q,
+                                                    delete_key: None,
+                                                })
                                                 .collect();
-                                            c.popup = Some(crate::ui::screens::query::ConsolePopup {
-                                                title: format!("Query History ({conn})"),
+                                            c.popup = Some(ConsolePopup::new(
+                                                format!("Query History ({conn})"),
                                                 items,
-                                                selected: 0,
-                                            });
+                                                ConsolePopupMode::History,
+                                            ));
                                         }
-                                        // Alt+F: open saved favorite queries.
+                                        // Alt+F: open the saved-query collections.
                                         // (Ctrl+Shift+F is unreliable: crossterm drops
                                         // the SHIFT modifier on most terminals.)
                                         KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::ALT) => {
-                                            c.popup = Some(crate::ui::screens::query::ConsolePopup {
-                                                title: "Saved Queries".to_string(),
-                                                items: self.config.favorites.clone(),
-                                                selected: 0,
-                                            });
+                                            let mut items: Vec<ConsolePopupItem> = Vec::new();
+                                            for col in &self.config.query_collections {
+                                                for q in &col.queries {
+                                                    items.push(ConsolePopupItem {
+                                                        label: format!("[{}] {}", col.name, q.name),
+                                                        payload: q.sql.clone(),
+                                                        delete_key: Some((col.name.clone(), q.name.clone())),
+                                                    });
+                                                }
+                                            }
+                                            items.sort_by(|a, b| a.label.cmp(&b.label));
+                                            c.popup = Some(ConsolePopup::new(
+                                                "Saved Queries".to_string(),
+                                                items,
+                                                ConsolePopupMode::Collections,
+                                            ));
                                         }
-                                        // Ctrl+S: save the current query as a favorite.
+                                        // Ctrl+S: save the current query into a collection.
                                         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                             let sql = c.text();
                                             let name = c
@@ -2363,23 +2418,18 @@ impl App {
                                             } else {
                                                 name
                                             };
-                                            // Disambiguate duplicates so a later favorite
-                                            // never silently overwrites an earlier one.
-                                            let mut name = base.clone();
-                                            let mut i = 2;
-                                            while self.config.favorites.iter().any(|(n, _)| n == &name) {
-                                                name = format!("{base} ({i})");
-                                                i += 1;
-                                            }
-                                            self.config.favorites.push((name.clone(), sql));
+                                            // Save into the "Default" collection (dedup
+                                            // handled inside `save_query`).
+                                            let (collection, name) =
+                                                self.config.save_query("Default", &base, &sql);
                                             match self.config.save(&self.config_path) {
                                                 Ok(_) => self.toasts.push(
                                                     ToastKind::Success,
-                                                    format!("saved favorite '{name}'"),
+                                                    format!("saved '{name}' to '{collection}'"),
                                                 ),
                                                 Err(e) => self.toasts.push(
                                                     ToastKind::Error,
-                                                    format!("failed to save favorite: {e:#}"),
+                                                    format!("failed to save query: {e:#}"),
                                                 ),
                                             }
                                         }
