@@ -956,7 +956,7 @@ fn render_console_popup(f: &mut Frame, area: Rect, popup: &ConsolePopup, theme: 
     f.render_widget(Paragraph::new(lines), chunks[1]);
 
     let hint = match popup.mode {
-        ConsolePopupMode::Collections => " ↑/↓ navigate · type search · Enter load · d delete · Esc close ",
+        ConsolePopupMode::Collections => " ↑/↓ navigate · type search · Enter load · Ctrl+D delete · Esc close ",
         ConsolePopupMode::History => " ↑/↓ navigate · type search · Enter load · Esc close ",
     };
     f.render_widget(

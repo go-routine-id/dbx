@@ -141,7 +141,7 @@ pub struct SavedQuery {
     pub name: String,
     pub sql: String,
     /// Optional description (not yet surfaced in the UI — reserved).
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub description: String,
 }
 
@@ -193,31 +193,10 @@ impl AppConfig {
     /// on load). Clears `favorites` so it isn't re-serialized afterwards.
     pub fn migrate_legacy_favorites(&mut self) {
         let legacy = std::mem::take(&mut self.favorites);
-        if legacy.is_empty() {
-            return;
-        }
-        let queries: Vec<SavedQuery> = legacy
-            .into_iter()
-            .map(|(name, sql)| SavedQuery {
-                name,
-                sql,
-                description: String::new(),
-            })
-            .collect();
-        if let Some(col) = self
-            .query_collections
-            .iter_mut()
-            .find(|c| c.name == "Default")
-        {
-            col.queries.extend(queries);
-        } else {
-            self.query_collections.insert(
-                0,
-                QueryCollection {
-                    name: "Default".to_string(),
-                    queries,
-                },
-            );
+        for (name, sql) in legacy {
+            // Reuses `save_query` so names are de-duplicated against anything
+            // already present in the "Default" collection.
+            self.save_query("Default", &name, &sql);
         }
     }
 

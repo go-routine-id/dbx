@@ -762,8 +762,8 @@ const EXPLORER_HELP_BINDINGS: [(&str, &str); 31] = [
     ("Ctrl+R", "reconnect after a dropped connection"),
     ("Ctrl+Shift+I", "import rows from a CSV file into the active table"),
     ("Alt+H", "open query history for this connection"),
-    ("Alt+F", "open saved favorite queries"),
-    ("Ctrl+S", "save current query as favorite"),
+    ("Alt+F", "open saved query collections"),
+    ("Ctrl+S", "save current query to a collection"),
     ("Ctrl+F", "pretty-print SQL in the editor"),
     ("[ / ]", "switch workspace tab (or result set in console)"),
     ("j / Down", "move cursor / selection down"),
@@ -2272,11 +2272,14 @@ impl App {
                                     // History / favorites picker owns all keys.
                                     if let Some(popup) = &mut c.popup {
                                         match key.code {
-                                            KeyCode::Esc => c.popup = None,
-                                            KeyCode::Up | KeyCode::Char('k') => {
+                                            KeyCode::Esc => {
+                                                c.popup = None;
+                                                c.autocomplete.clear();
+                                            }
+                                            KeyCode::Up => {
                                                 popup.selected = popup.selected.saturating_sub(1);
                                             }
-                                            KeyCode::Down | KeyCode::Char('j') => {
+                                            KeyCode::Down => {
                                                 popup.selected = (popup.selected + 1)
                                                     .min(popup.items.len().saturating_sub(1));
                                             }
@@ -2293,10 +2296,12 @@ impl App {
                                             KeyCode::Backspace => {
                                                 popup.pop_filter();
                                             }
-                                            // `d` deletes the highlighted saved query.
+                                            // Ctrl+D deletes the highlighted saved query.
+                                            // (Modifier key, so it never clashes with the
+                                            // plain-letter search filter.)
                                             KeyCode::Char('d')
                                                 if popup.mode == ConsolePopupMode::Collections
-                                                    && !key
+                                                    && key
                                                         .modifiers
                                                         .contains(KeyModifiers::CONTROL) =>
                                             {
@@ -2371,11 +2376,14 @@ impl App {
                                                 .unwrap_or_default()
                                                 .into_iter()
                                                 .map(|q| ConsolePopupItem {
-                                                    label: q.clone(),
+                                                    // Single-line label so a multi-line query
+                                                    // doesn't break the list layout.
+                                                    label: q.lines().next().unwrap_or("").to_string(),
                                                     payload: q,
                                                     delete_key: None,
                                                 })
                                                 .collect();
+                                            c.autocomplete.clear();
                                             c.popup = Some(ConsolePopup::new(
                                                 format!("Query History ({conn})"),
                                                 items,
@@ -2397,6 +2405,7 @@ impl App {
                                                 }
                                             }
                                             items.sort_by(|a, b| a.label.cmp(&b.label));
+                                            c.autocomplete.clear();
                                             c.popup = Some(ConsolePopup::new(
                                                 "Saved Queries".to_string(),
                                                 items,
@@ -2406,6 +2415,14 @@ impl App {
                                         // Ctrl+S: save the current query into a collection.
                                         KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                             let sql = c.text();
+                                            // Don't save a blank editor.
+                                            if sql.trim().is_empty() {
+                                                self.toasts.push(
+                                                    ToastKind::Warning,
+                                                    "nothing to save — editor is empty".to_string(),
+                                                );
+                                                return;
+                                            }
                                             let name = c
                                                 .lines
                                                 .first()
