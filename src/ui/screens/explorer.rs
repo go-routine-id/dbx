@@ -84,6 +84,47 @@ pub struct ImportCsvModalState {
     pub parsed: bool,
 }
 
+/// What kind of object to create with the create-object modal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateKind {
+    Schema,
+    Table,
+    View,
+    Type,
+    Function,
+}
+
+impl CreateKind {
+    pub const ALL: [CreateKind; 5] = [CreateKind::Schema, CreateKind::Table, CreateKind::View, CreateKind::Type, CreateKind::Function];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            CreateKind::Schema => "schema",
+            CreateKind::Table => "table",
+            CreateKind::View => "view",
+            CreateKind::Type => "data type",
+            CreateKind::Function => "function",
+        }
+    }
+
+    /// Move to the previous/next kind (wraps around).
+    pub fn cycle(self, dir: isize) -> CreateKind {
+        let idx = Self::ALL.iter().position(|k| *k == self).unwrap_or(0);
+        let n = Self::ALL.len() as isize;
+        Self::ALL[((idx as isize + dir + n) % n) as usize]
+    }
+}
+
+/// State for the create-object modal (`a` in the tree). Pick a kind and type
+/// a name; Enter generates a CREATE statement shown in the SQL-confirm modal.
+#[derive(Clone, Debug)]
+pub struct CreateObjectModalState {
+    /// Schema context for the new object (empty for CREATE SCHEMA).
+    pub namespace: Namespace,
+    pub kind: CreateKind,
+    pub name: String,
+}
+
 /// A schema-edit text input in progress.
 #[derive(Clone, Debug)]
 pub enum SchemaInput {
@@ -344,6 +385,7 @@ pub struct ExplorerState {
     pub object_search: Option<ObjectSearchState>,
     pub import_csv_modal: Option<ImportCsvModalState>,
     pub schema_edit_modal: Option<SchemaEditModalState>,
+    pub create_object_modal: Option<CreateObjectModalState>,
     pub driver_capabilities: crate::driver::Capabilities,
 }
 
@@ -381,6 +423,7 @@ impl ExplorerState {
             object_search: None,
             import_csv_modal: None,
             schema_edit_modal: None,
+            create_object_modal: None,
             driver_capabilities,
         }
     }
@@ -511,6 +554,72 @@ pub fn render_explorer(
     if let Some(schema) = &state.schema_edit_modal {
         render_schema_edit_modal(f, area, schema, theme);
     }
+
+    if let Some(create) = &state.create_object_modal {
+        render_create_object_modal(f, area, create, theme);
+    }
+}
+
+/// Overlay for creating a schema / table / view / type / function.
+fn render_create_object_modal(
+    f: &mut Frame,
+    area: Rect,
+    modal: &CreateObjectModalState,
+    theme: &Theme,
+) {
+    let width = 56.min(area.width.saturating_sub(4));
+    let height = 10.min(area.height.saturating_sub(2));
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent())
+        .style(theme.panel())
+        .title(" Create Object ");
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)])
+        .split(inner);
+
+    // Kind picker.
+    let mut kind_line = String::new();
+    for (i, k) in CreateKind::ALL.iter().enumerate() {
+        let mark = if *k == modal.kind { "▶" } else { " " };
+        kind_line.push_str(&format!(" {mark}{} ", k.label()));
+        if i < CreateKind::ALL.len() - 1 {
+            kind_line.push('|');
+        }
+    }
+    f.render_widget(
+        Paragraph::new(Span::styled(kind_line, theme.accent())),
+        chunks[0],
+    );
+
+    let name_line = Line::from(vec![
+        Span::styled(
+            format!("name> "),
+            theme.accent().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("{}█", modal.name), theme.base()),
+    ]);
+    f.render_widget(Paragraph::new(name_line), chunks[1]);
+
+    let hint = Line::from(Span::styled(
+        " ←/→ or ↑/↓ pick kind · type name · Enter review · Esc cancel",
+        theme.dim(),
+    ));
+    f.render_widget(Paragraph::new(hint).alignment(Alignment::Center), chunks[2]);
 }
 
 /// Overlay for editing a table's schema (build an ALTER TABLE).

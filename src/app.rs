@@ -336,6 +336,17 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
     std::path::PathBuf::from(path)
 }
 
+/// Move a selection one step within `n` items (clamped, no wrap).
+fn step_selection(sel: &mut usize, n: usize, up: bool) {
+    if n > 0 {
+        if up {
+            *sel = sel.saturating_sub(1);
+        } else {
+            *sel = (*sel + 1).min(n - 1);
+        }
+    }
+}
+
 /// Move to the next/previous workspace tab (wraps around). No-op with < 2 tabs.
 fn switch_tab(exp: &mut crate::ui::screens::explorer::ExplorerState, delta: isize) {
     let n = exp.tabs.len();
@@ -513,6 +524,53 @@ fn generate_alter_sql(
     }
 }
 
+/// Build a CREATE statement for a new object. Uses simple templates — the
+/// SQL-confirm modal lets the user refine before executing.
+fn generate_create_sql(
+    ns: &crate::driver::Namespace,
+    kind: crate::ui::screens::explorer::CreateKind,
+    name: &str,
+    driver_name: &str,
+) -> Option<String> {
+    let mysql = driver_name.to_lowercase().contains("mysql")
+        || driver_name.to_lowercase().contains("maria");
+    let qn = quote_ident(name, driver_name);
+    let ns_q = quote_ident(&ns.0, driver_name);
+    match kind {
+        crate::ui::screens::explorer::CreateKind::Schema => Some(format!("CREATE SCHEMA {qn};")),
+        crate::ui::screens::explorer::CreateKind::Table => {
+            let id_col = if mysql {
+                "id INT AUTO_INCREMENT PRIMARY KEY"
+            } else {
+                "id BIGSERIAL PRIMARY KEY"
+            };
+            Some(format!("CREATE TABLE {ns_q}.{qn} ({id_col});"))
+        }
+        crate::ui::screens::explorer::CreateKind::View => {
+            Some(format!("CREATE VIEW {ns_q}.{qn} AS SELECT 1;"))
+        }
+        crate::ui::screens::explorer::CreateKind::Type => {
+            // MySQL has no standalone CREATE TYPE — report as unsupported.
+            if mysql {
+                None
+            } else {
+                Some(format!("CREATE TYPE {ns_q}.{qn} AS ENUM ('value');"))
+            }
+        }
+        crate::ui::screens::explorer::CreateKind::Function => {
+            if mysql {
+                Some(format!(
+                    "CREATE FUNCTION {ns_q}.{qn}() RETURNS INT DETERMINISTIC RETURN 1;"
+                ))
+            } else {
+                Some(format!(
+                    "CREATE FUNCTION {ns_q}.{qn}() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;"
+                ))
+            }
+        }
+    }
+}
+
 /// Roadmap M2.10: detect statements that can destroy data before the query
 /// console runs them, so the user gets an explicit confirm dialog.
 ///
@@ -595,7 +653,7 @@ const EXPLORER_HINTS: [(&str, &str); 12] = [
     ("y/Y", "copy cell/row"),
     ("Ctrl+E", "export"),
     ("e", "edit cell"),
-    ("Backspace", "delete row"),
+    ("x", "delete row"),
     ("i", "insert row"),
     ("w", "close tab"),
     ("Esc", "picker"),
@@ -611,7 +669,7 @@ const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-const EXPLORER_HELP_BINDINGS: [(&str, &str); 30] = [
+const EXPLORER_HELP_BINDINGS: [(&str, &str); 31] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
@@ -637,7 +695,8 @@ const EXPLORER_HELP_BINDINGS: [(&str, &str); 30] = [
     ("Ctrl+E", "open export dialog (CSV, JSON, SQL INSERT) for current dataset"),
     ("e / Enter", "edit active cell value (shows safe SQL confirmation)"),
     ("e (on tree table)", "edit table schema (ALTER: drop/add column, rename)"),
-    ("Backspace", "delete selected row (shows safe SQL confirmation)"),
+    ("a (in tree)", "create schema / table / view / type / function"),
+    ("x", "delete selected row (shows safe SQL confirmation)"),
     ("i", "open INSERT-row modal — fill fields, server applies DEFAULT for skipped"),
     ("F1", "view table DDL schema popup"),
     ("n / p", "next / previous page in data grid"),
@@ -709,6 +768,109 @@ impl App {
     /// its DDL (hit-test in scene space); every other mouse gesture is a
     /// no-op. Keyboard navigation remains the primary interaction model.
     async fn handle_mouse(&mut self, mouse: MouseEvent) -> anyhow::Result<()> {
+        // Scroll wheel: move the selection one step in the pane under the
+        // cursor (picker / tree / grid / console result).
+        if matches!(mouse.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown) {
+            let up = matches!(mouse.kind, MouseEventKind::ScrollUp);
+            if matches!(self.mode, ScreenMode::Picker) {
+                if let Some(area) = self.picker_hit_area
+                    && mouse.row >= area.y
+                    && mouse.row < area.y + area.height
+                {
+                    step_selection(
+                        &mut self.selected_connection,
+                        self.config.connections.len(),
+                        up,
+                    );
+                }
+                return Ok(());
+            }
+            // Don't scroll a list behind an open modal.
+            let modal_open = self
+                .explorer_state
+                .as_ref()
+                .map(|e| {
+                    e.ddl_popup.is_some()
+                        || e.export_modal.is_some()
+                        || e.cell_edit_modal.is_some()
+                        || e.insert_row_modal.is_some()
+                        || e.sql_confirm_modal.is_some()
+                        || e.object_search.is_some()
+                        || e.import_csv_modal.is_some()
+                        || e.schema_edit_modal.is_some()
+                        || e.create_object_modal.is_some()
+                })
+                .unwrap_or(false);
+            if modal_open {
+                return Ok(());
+            }
+            if let Some(exp) = &mut self.explorer_state {
+                // Tree pane.
+                if let Some(area) = exp.tree_hit_area {
+                    if mouse.column >= area.x
+                        && mouse.column < area.x + area.width
+                        && mouse.row >= area.y
+                        && mouse.row < area.y + area.height
+                    {
+                        step_selection(&mut exp.selected_tree_index, exp.tree_nodes.len(), up);
+                        return Ok(());
+                    }
+                }
+                // Workspace: grid / result rows.
+                let mut focus_workspace = false;
+                if let Some(tab) = exp.active_tab_mut() {
+                    match tab {
+                        WorkspaceTab::Table(t) => {
+                            if let Some(area) = t.grid_hit_area
+                                && mouse.column >= area.x
+                                && mouse.column < area.x + area.width
+                                && mouse.row >= area.y
+                                && mouse.row < area.y + area.height
+                            {
+                                // Bound against the *displayed* (filtered) rows.
+                                let visible = t
+                                    .filter
+                                    .as_ref()
+                                    .map(|f| {
+                                        t.page
+                                            .records
+                                            .iter()
+                                            .filter(|r| {
+                                                crate::ui::screens::explorer::record_matches_filter(
+                                                    r, f,
+                                                )
+                                            })
+                                            .count()
+                                    })
+                                    .unwrap_or(t.page.records.len());
+                                step_selection(&mut t.selected_row, visible, up);
+                                focus_workspace = true;
+                            }
+                        }
+                        WorkspaceTab::Console(c) => {
+                            if let Some(area) = c.result_hit_area
+                                && mouse.column >= area.x
+                                && mouse.column < area.x + area.width
+                                && mouse.row >= area.y
+                                && mouse.row < area.y + area.height
+                            {
+                                if let Some(res) = &c.last_result {
+                                    step_selection(&mut c.result_selected_row, res.records.len(), up);
+                                    c.focused_subpane = ConsoleSubpane::Result;
+                                }
+                                focus_workspace = true;
+                            }
+                        }
+                        WorkspaceTab::Erd(_) => {}
+                    }
+                }
+                if focus_workspace {
+                    exp.focused_pane = FocusedPane::Workspace;
+                }
+            }
+            return Ok(());
+        }
+
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return Ok(());
         }
@@ -756,6 +918,7 @@ impl App {
             || exp.object_search.is_some()
             || exp.import_csv_modal.is_some()
             || exp.schema_edit_modal.is_some()
+            || exp.create_object_modal.is_some()
         {
             return Ok(());
         }
@@ -1465,6 +1628,33 @@ impl App {
                         s.type_changes.push((col, ty));
                     }
                     return;
+                }
+
+                // Create-object modal: pick kind + type name. Enter falls
+                // through to the event loop, which generates the CREATE.
+                if let Some(c) = &mut exp.create_object_modal {
+                    if key.code != KeyCode::Enter {
+                        match key.code {
+                            KeyCode::Esc => exp.create_object_modal = None,
+                            KeyCode::Left | KeyCode::Up => {
+                                c.kind = c.kind.cycle(-1);
+                            }
+                            KeyCode::Right | KeyCode::Down => {
+                                c.kind = c.kind.cycle(1);
+                            }
+                            KeyCode::Backspace => {
+                                c.name.pop();
+                            }
+                            KeyCode::Char(ch)
+                                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                c.name.push(ch);
+                            }
+                            _ => {}
+                        }
+                        return;
+                    }
+                    // Enter → generate CREATE in the event loop.
                 }
 
                 match key.code {
@@ -2545,6 +2735,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 || e.object_search.is_some()
                                 || e.import_csv_modal.is_some()
                                 || e.schema_edit_modal.is_some()
+                                || e.create_object_modal.is_some()
                                 || e.ddl_popup.is_some()
                         })
                         .unwrap_or(false);
@@ -2933,6 +3124,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         && exp.sql_confirm_modal.is_none()
                         && exp.import_csv_modal.is_none()
                         && exp.schema_edit_modal.is_none()
+                        && exp.create_object_modal.is_none()
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('t')
                     {
@@ -3070,6 +3262,48 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         continue;
                     }
 
+                    // Create object: Enter generates a CREATE statement into the
+                    // SQL-confirm modal (name must be non-empty, and the kind
+                    // must be supported by this driver).
+                    if exp.create_object_modal.is_some() && key.code == KeyCode::Enter {
+                        let sql = {
+                            let c = exp.create_object_modal.as_ref().unwrap();
+                            if c.name.trim().is_empty() {
+                                None
+                            } else {
+                                generate_create_sql(
+                                    &c.namespace,
+                                    c.kind,
+                                    &c.name,
+                                    &drv.info().name,
+                                )
+                            }
+                        };
+                        match sql {
+                            Some(sql) => {
+                                let c = exp.create_object_modal.as_ref().unwrap();
+                                exp.sql_confirm_modal = Some(
+                                    crate::ui::screens::explorer::SqlConfirmModalState {
+                                        collection: crate::driver::CollectionRef {
+                                            namespace: c.namespace.clone(),
+                                            name: c.name.clone(),
+                                        },
+                                        sql_query: sql,
+                                        row_idx: 0,
+                                    },
+                                );
+                            }
+                            None => {
+                                app.toasts.push(
+                                    ToastKind::Warning,
+                                    "enter a name (or this kind isn't supported by the driver)".to_string(),
+                                );
+                            }
+                        }
+                        exp.create_object_modal = None;
+                        continue;
+                    }
+
                     // CSV import: Enter on a PARSED file inserts the rows. The
                     // first Enter (read the file) must fall through to
                     // handle_key — gating on `parsed` keeps them distinct.
@@ -3188,9 +3422,41 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
 
                     if exp.ddl_popup.is_none()
                         && exp.schema_edit_modal.is_none()
+                        && exp.create_object_modal.is_none()
+                        && exp.sql_confirm_modal.is_none()
+                        && exp.object_search.is_none()
                         && exp.focused_pane == FocusedPane::Tree
                     {
                         match key.code {
+                            KeyCode::Char('a') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                // Create an object: on a schema node the default
+                                // is a new schema; on a table node, an object in
+                                // that schema.
+                                if let Some(node) = exp.selected_node() {
+                                    match &node.kind {
+                                        TreeNodeKind::Database(ns) => {
+                                            exp.create_object_modal = Some(
+                                                crate::ui::screens::explorer::CreateObjectModalState {
+                                                    namespace: ns.clone(),
+                                                    kind: crate::ui::screens::explorer::CreateKind::Schema,
+                                                    name: String::new(),
+                                                },
+                                            );
+                                        }
+                                        TreeNodeKind::Table(cref, _, _) => {
+                                            exp.create_object_modal = Some(
+                                                crate::ui::screens::explorer::CreateObjectModalState {
+                                                    namespace: cref.namespace.clone(),
+                                                    kind: crate::ui::screens::explorer::CreateKind::Table,
+                                                    name: String::new(),
+                                                },
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                                continue;
+                            }
                             KeyCode::Char(' ') | KeyCode::Enter => {
                                 if let Some(node) = exp.selected_node() {
                                     match &node.kind {
@@ -3562,11 +3828,11 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             }
                         } else {
                             match key.code {
-                                // Backspace on a selected row → confirm + DELETE the row.
+                                // `x` on a selected row → confirm + DELETE the row.
                                 // We need the active driver for the driver-name sniff
                                 // (`quote_ident` + `single_row_suffix`) so this lives
                                 // here in the async event loop, not in `handle_key`.
-                                KeyCode::Backspace => {
+                                KeyCode::Char('x') | KeyCode::Char('X') => {
                                     let can_edit = exp.driver_capabilities.contains(crate::driver::Capabilities::EDIT_DATA);
                                     if !can_edit {
                                         app.toasts.push(ToastKind::Warning, "active driver does not support editing data".to_string());
