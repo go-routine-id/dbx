@@ -306,11 +306,23 @@
       <h2>Bring dbx to your machine</h2>
       <p>Prebuilt binaries ship on every release for Windows, macOS and Linux.</p>
     </div>
-    <pre class="reveal"><span class="c"># from source</span>
-cargo install --git https://github.com/go-routine-id/dbx
+    <div style="text-align:center;margin-bottom:26px">
+      <a class="btn primary" href="https://github.com/go-routine-id/dbx/releases/latest">Download latest release →</a>
+    </div>
+    <pre class="reveal"><span class="c"># macOS — Apple Silicon (M1/M2/M3)</span>
+curl -L -o dbx https://github.com/go-routine-id/dbx/releases/download/v0.1.0/dbx-macos-arm64
+chmod +x dbx && sudo mv dbx /usr/local/bin/
 
-<span class="c"># or grab a binary from Releases</span>
-dbx-linux-x86_64   · dbx-macos-arm64 / x86_64   · dbx-windows-x86_64.exe</pre>
+<span class="c"># macOS — Intel</span>
+curl -L -o dbx https://github.com/go-routine-id/dbx/releases/download/v0.1.0/dbx-macos-x86_64
+chmod +x dbx && sudo mv dbx /usr/local/bin/
+
+<span class="c"># Linux — x86_64</span>
+curl -L -o dbx https://github.com/go-routine-id/dbx/releases/download/v0.1.0/dbx-linux-x86_64
+chmod +x dbx && sudo mv dbx /usr/local/bin/
+
+<span class="c"># Windows — x64: download dbx-windows-x86_64.exe, rename ke dbx.exe, taruh di PATH</span></pre>
+    <p style="text-align:center;color:var(--ink-faint);font-size:13px;margin-top:14px">macOS Gatekeeper? Jalankan <code class="inline" style="color:var(--gold-light)">xattr -d com.apple.quarantine /usr/local/bin/dbx</code></p>
     <div class="pills reveal">
       <span class="pill">Rust</span>
       <span class="pill">ratatui</span>
