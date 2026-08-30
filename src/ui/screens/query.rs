@@ -31,7 +31,13 @@ pub struct QueryConsole {
     pub cursor_row: usize,
     pub cursor_col: usize,
     pub is_executing: bool,
+    /// `last_result` is kept as "the active result" for backward compat with
+    /// render/copy code; it always mirrors `results[active_result]`.
     pub last_result: Option<QueryResult>,
+    /// All result sets from the last multi-statement execution.
+    pub results: Vec<QueryResult>,
+    /// Which result set is currently shown / navigated.
+    pub active_result: usize,
     pub execution_error: Option<String>,
     pub result_selected_row: usize,
     pub result_selected_col: usize,
@@ -81,6 +87,8 @@ impl QueryConsole {
             cursor_col,
             is_executing: false,
             last_result: None,
+            results: Vec::new(),
+            active_result: 0,
             execution_error: None,
             result_selected_row: 0,
             result_selected_col: 0,
@@ -263,6 +271,99 @@ fn flush_sql_token(token: &mut String, out: &mut String, clauses: &[&str]) {
     out.push_str(token);
     out.push(' ');
     token.clear();
+}
+
+/// Split a query into individual `;`-separated statements, ignoring `;`
+/// inside string literals (incl. backslash-escaped quotes), backtick
+/// identifiers, `--` line comments (only when followed by whitespace, per
+/// the SQL standard / MySQL) and `/* */` block comments. Returns trimmed,
+/// non-empty statements.
+pub fn split_statements(sql: &str) -> Vec<String> {
+    let mut stmts = Vec::new();
+    let mut cur = String::new();
+    let mut in_string: Option<char> = None;
+    let mut in_line_comment = false;
+    let mut in_block_comment = false;
+
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_line_comment {
+            cur.push(c);
+            if c == '\n' {
+                in_line_comment = false;
+            }
+            continue;
+        }
+        if in_block_comment {
+            cur.push(c);
+            if c == '*' && chars.peek() == Some(&'/') {
+                cur.push(chars.next().unwrap());
+                in_block_comment = false;
+            }
+            continue;
+        }
+        if let Some(q) = in_string {
+            cur.push(c);
+            // Backslash escape keeps the next char from closing the string
+            // (MySQL `\'`). Consume it so it isn't re-scanned.
+            if c == '\\' {
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+                continue;
+            }
+            if c == q {
+                in_string = None;
+            }
+            continue;
+        }
+        if c == '\'' || c == '"' || c == '`' {
+            in_string = Some(c);
+            cur.push(c);
+            continue;
+        }
+        // `--` starts a comment only when followed by whitespace/control
+        // (SQL standard; MySQL allows `a--b` as a - (-b)).
+        if c == '-' && chars.peek() == Some(&'-') {
+            let after = chars.clone().nth(1);
+            let is_comment = after
+                .map(|n| n.is_whitespace() || n.is_control())
+                .unwrap_or(true);
+            if is_comment {
+                in_line_comment = true;
+                cur.push(c);
+                cur.push(chars.next().unwrap()); // consume second '-'
+                continue;
+            }
+        }
+        if c == '/' && chars.peek() == Some(&'*') {
+            in_block_comment = true;
+            cur.push(c);
+            cur.push(chars.next().unwrap());
+            continue;
+        }
+        if c == ';' {
+            let s = cur.trim();
+            if !s.is_empty() {
+                stmts.push(s.to_string());
+            }
+            cur.clear();
+            continue;
+        }
+        cur.push(c);
+    }
+    let tail = cur.trim();
+    if !tail.is_empty() {
+        stmts.push(tail.to_string());
+    }
+    stmts
+}
+
+/// Is `stmt` a pure comment (nothing but a `--` line comment or a whole
+/// `/* ... */` block)? Such statements are skipped at execution.
+pub fn is_comment_only(stmt: &str) -> bool {
+    let t = stmt.trim();
+    t.starts_with("--") || (t.starts_with("/*") && t.ends_with("*/"))
 }
 
 /// Tokenizes a single SQL line and returns highlighted Spans (owned Strings).
@@ -498,8 +599,13 @@ fn render_result(
     let title = if console.is_executing {
         " Query Result (Executing...) ".to_string()
     } else if let Some(res) = &console.last_result {
+        let multi = if console.results.len() > 1 {
+            format!(" [result {}/{}]", console.active_result + 1, console.results.len())
+        } else {
+            String::new()
+        };
         format!(
-            " Query Result ({} rows affected, {:.2?}) ",
+            " Query Result{multi} ({} rows affected, {:.2?}) ",
             res.rows_affected, res.execution_time
         )
     } else if console.execution_error.is_some() {
@@ -686,6 +792,55 @@ mod tests {
         let f = format_sql("SELECT SELECTED FROM t WHERE GROUP_CONCAT(x) > 1");
         assert!(f.contains("SELECT SELECTED\nFROM t"));
         assert!(!f.contains("\nGROUP_CONCAT"));
+    }
+
+    #[test]
+    fn test_split_statements_basic() {
+        assert_eq!(
+            split_statements("SELECT 1; SELECT 2;"),
+            vec!["SELECT 1".to_string(), "SELECT 2".to_string()]
+        );
+        // Semicolons inside string literals / comments must not split.
+        let stmts = split_statements("SELECT 'a;b'; SELECT 2 -- ; done");
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "SELECT 'a;b'");
+        assert!(stmts[1].contains("SELECT 2"));
+        // Block comments.
+        let stmts = split_statements("SELECT 1 /* ; */; SELECT 3");
+        assert_eq!(stmts, vec!["SELECT 1 /* ; */".to_string(), "SELECT 3".to_string()]);
+        // Trailing semicolon ignored; empty input → no statements.
+        assert!(split_statements(";;;").is_empty());
+        assert!(split_statements("   ").is_empty());
+    }
+
+    #[test]
+    fn test_split_statements_escaped_quotes() {
+        // MySQL `\'` — the escaped quote must not close the string.
+        let stmts = split_statements(r"SELECT 'it\'s'; SELECT 2");
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], r"SELECT 'it\'s'");
+    }
+
+    #[test]
+    fn test_split_statements_backtick_identifier() {
+        // `a;b` is a MySQL identifier — the `;` inside must not split.
+        let stmts = split_statements("SELECT `a;b` FROM t; SELECT 2");
+        assert_eq!(stmts.len(), 2);
+        assert_eq!(stmts[0], "SELECT `a;b` FROM t");
+    }
+
+    #[test]
+    fn test_split_statements_double_dash_needs_whitespace() {
+        // `a--b` is valid MySQL arithmetic (a - (-b)), not a comment.
+        let stmts = split_statements("SELECT a--b FROM t; SELECT 2");
+        assert_eq!(stmts.len(), 2);
+        // But `-- ` IS a comment.
+        let stmts = split_statements("SELECT 1; -- done");
+        assert_eq!(stmts, vec!["SELECT 1".to_string(), "-- done".to_string()]);
+        assert!(is_comment_only("-- done"));
+        assert!(!is_comment_only("SELECT 1"));
+        assert!(is_comment_only("/* just a note */"));
+        assert!(!is_comment_only("/* note */ SELECT 1"));
     }
 }
 

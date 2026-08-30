@@ -382,25 +382,28 @@ fn is_destructive_statement(query: &str) -> bool {
     if trimmed.is_empty() {
         return false;
     }
-    // Split on `;` so each statement in a multi-statement script is checked
-    // independently (a safe SELECT before a DROP still trips the guard).
-    trimmed
-        .split(';')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .any(|s| {
-            let first = s
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_uppercase();
-            match first.as_str() {
-                "DROP" | "TRUNCATE" => true,
-                "DELETE" => !has_where_clause(s),
-                "ALTER" => s.to_uppercase().contains(" DROP "),
-                _ => false,
-            }
-        })
+    // Use the SAME splitter the executor uses (`split_statements`), so a
+    // DROP hidden behind a `-- comment; more` can't slip past the guard
+    // while the executor still runs it.
+    crate::ui::screens::query::split_statements(query)
+        .iter()
+        .any(|s| is_destructive_stmt(strip_leading_comments(s)))
+}
+
+/// Is a single statement destructive (DROP / TRUNCATE / DELETE without WHERE
+/// / ALTER that drops something)?
+fn is_destructive_stmt(stmt: &str) -> bool {
+    let first = stmt
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_uppercase();
+    match first.as_str() {
+        "DROP" | "TRUNCATE" => true,
+        "DELETE" => !has_where_clause(stmt),
+        "ALTER" => stmt.to_uppercase().contains(" DROP "),
+        _ => false,
+    }
 }
 
 /// Does a statement contain a `WHERE` keyword? Used to allow `DELETE … WHERE`
@@ -408,6 +411,26 @@ fn is_destructive_statement(query: &str) -> bool {
 fn has_where_clause(stmt: &str) -> bool {
     stmt.split_whitespace()
         .any(|tok| tok.to_uppercase() == "WHERE")
+}
+
+/// Skip leading whitespace and leading `--` / `/* */` comments so the first
+/// real keyword of a statement can be inspected.
+fn strip_leading_comments(mut s: &str) -> &str {
+    loop {
+        s = s.trim_start();
+        if s.starts_with("--") {
+            s = s.lines().nth(1).unwrap_or("");
+            continue;
+        }
+        if s.starts_with("/*") {
+            if let Some(end) = s.find("*/") {
+                s = &s[end + 2..];
+                continue;
+            }
+        }
+        break;
+    }
+    s
 }
 
 const PICKER_HINTS: [(&str, &str); 7] = [
@@ -445,7 +468,7 @@ const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-const EXPLORER_HELP_BINDINGS: [(&str, &str); 26] = [
+const EXPLORER_HELP_BINDINGS: [(&str, &str); 27] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
@@ -455,6 +478,7 @@ const EXPLORER_HELP_BINDINGS: [(&str, &str); 26] = [
     ("Alt+F", "open saved favorite queries"),
     ("Ctrl+S", "save current query as favorite"),
     ("Ctrl+F", "pretty-print SQL in the editor"),
+    ("[ / ] (in result)", "previous / next result set"),
     ("j / Down", "move cursor / selection down"),
     ("k / Up", "move cursor / selection up"),
     ("h / Left", "move cursor / column selection left"),
@@ -1325,6 +1349,25 @@ impl App {
                                         _ => {}
                                     },
                                     ConsoleSubpane::Result => match key.code {
+                                        // Switch between multiple result sets.
+                                        KeyCode::Char('[') => {
+                                            if c.active_result > 0 {
+                                                c.active_result -= 1;
+                                                c.last_result = c.results.get(c.active_result).cloned();
+                                                c.result_selected_row = 0;
+                                                c.result_selected_col = 0;
+                                                c.result_scroll_x = 0;
+                                            }
+                                        }
+                                        KeyCode::Char(']') => {
+                                            if c.active_result + 1 < c.results.len() {
+                                                c.active_result += 1;
+                                                c.last_result = c.results.get(c.active_result).cloned();
+                                                c.result_selected_row = 0;
+                                                c.result_selected_col = 0;
+                                                c.result_scroll_x = 0;
+                                            }
+                                        }
                                         KeyCode::Up | KeyCode::Char('k') => {
                                             if c.result_selected_row > 0 {
                                                 c.result_selected_row -= 1;
@@ -2081,11 +2124,28 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             let drv_clone = drv.clone();
 
                             app.toasts.push(ToastKind::Info, "executing confirmed statement...".to_string());
-                            match drv_clone.execute(&cref.namespace, &sql).await {
-                                Ok(res) => {
+                            // Execute each split statement (same as the console),
+                            // so a confirmed destructive script runs all of it.
+                            let statements = crate::ui::screens::query::split_statements(&sql);
+                            let mut affected = 0u64;
+                            let mut exec_err: Option<String> = None;
+                            for stmt in &statements {
+                                if crate::ui::screens::query::is_comment_only(stmt) {
+                                    continue;
+                                }
+                                match drv_clone.execute(&cref.namespace, stmt).await {
+                                    Ok(res) => affected += res.rows_affected,
+                                    Err(e) => {
+                                        exec_err = Some(format!("{e:#}"));
+                                        break;
+                                    }
+                                }
+                            }
+                            match exec_err {
+                                None => {
                                     app.toasts.push(
                                         ToastKind::Success,
-                                        format!("executed successfully (rows affected: {})", res.rows_affected),
+                                        format!("executed successfully (rows affected: {affected})"),
                                     );
                                     // Confirmed statements (destructive guard / row
                                     // delete) count as history too.
@@ -2107,8 +2167,8 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                         }
                                     }
                                 }
-                                Err(e) => {
-                                    app.toasts.push(ToastKind::Error, format!("UPDATE failed: {e:#}"));
+                                Some(e) => {
+                                    app.toasts.push(ToastKind::Error, format!("UPDATE failed: {e}"));
                                     exp.sql_confirm_modal = None;
                                 }
                             }
@@ -2520,13 +2580,52 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 console.is_executing = true;
                                 console.execution_error = None;
 
-                                match drv_clone.execute(&active_ns, &query_text).await {
-                                    Ok(res) => {
-                                        console.is_executing = false;
-                                        console.last_result = Some(res);
+                                // Split on `;` and run each statement, collecting
+                                // every result set (multi-statement support).
+                                let statements = crate::ui::screens::query::split_statements(&query_text);
+                                // Empty input is an error, not a silent success.
+                                if statements.is_empty() {
+                                    console.is_executing = false;
+                                    console.execution_error = Some("empty query — nothing to execute".to_string());
+                                    console.results = Vec::new();
+                                    console.last_result = None;
+                                    console.active_result = 0;
+                                    app.toasts.push(ToastKind::Warning, "empty query — nothing to execute".to_string());
+                                    continue;
+                                }
+                                // Stateful scripts (SET @x, transactions) run on
+                                // separate pooled connections, so session state
+                                // doesn't persist — warn up front.
+                                if statements.len() > 1 {
+                                    app.toasts.push(
+                                        ToastKind::Warning,
+                                        "multi-statement: SET @x / BEGIN..COMMIT won't persist between statements".to_string(),
+                                    );
+                                }
+                                let mut results = Vec::new();
+                                let mut failed: Option<String> = None;
+                                for stmt in &statements {
+                                    if crate::ui::screens::query::is_comment_only(stmt) {
+                                        continue;
+                                    }
+                                    match drv_clone.execute(&active_ns, stmt).await {
+                                        Ok(r) => results.push(r),
+                                        Err(e) => {
+                                            failed = Some(format!("{e:#}"));
+                                            break;
+                                        }
+                                    }
+                                }
+                                console.is_executing = false;
+                                match failed {
+                                    None => {
+                                        console.results = results.clone();
+                                        console.active_result = 0;
+                                        console.last_result = results.into_iter().next();
                                         console.execution_error = None;
                                         console.result_selected_row = 0;
                                         console.result_selected_col = 0;
+                                        console.result_scroll_x = 0;
                                         // Record to this connection's query history.
                                         // Not persisted per-query (re-serializing the
                                         // whole config on every run is too costly);
@@ -2536,9 +2635,13 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                         }
                                         app.toasts.push(ToastKind::Success, "query executed".to_string());
                                     }
-                                    Err(e) => {
-                                        console.is_executing = false;
-                                        console.execution_error = Some(format!("{e:#}"));
+                                    Some(e) => {
+                                        // Don't leave stale results from the previous
+                                        // run visible under the error.
+                                        console.execution_error = Some(e);
+                                        console.results = Vec::new();
+                                        console.last_result = None;
+                                        console.active_result = 0;
                                         app.toasts.push(ToastKind::Error, "query failed".to_string());
                                     }
                                 }
@@ -3004,6 +3107,13 @@ mod tests {
         assert!(is_destructive_statement("SELECT * FROM users; DROP TABLE users;"));
         // Case-insensitive.
         assert!(is_destructive_statement("  drop  table  users  "));
+        // Guard bypass: DROP hidden after a comment containing ';' (the old
+        // naive split() let this through; split_statements + strip does not).
+        assert!(is_destructive_statement("SELECT 1; -- note; more\nDROP TABLE users"));
+        assert!(is_destructive_statement("-- note\nDROP TABLE users"));
+        assert!(is_destructive_statement("/* hi */ DELETE FROM users"));
+        // Safe DELETE with WHERE stays safe even behind a comment.
+        assert!(!is_destructive_statement("-- safe\nDELETE FROM users WHERE id = 1"));
         // Empty / whitespace → safe.
         assert!(!is_destructive_statement(""));
         assert!(!is_destructive_statement("   "));
