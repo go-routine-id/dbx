@@ -66,6 +66,9 @@ pub struct SqlConfirmModalState {
 pub struct ErdMenuState {
     pub collection: CollectionRef,
     pub selected: usize,
+    /// Screen cell to anchor the menu near (the mouse click position);
+    /// `None` = centred (keyboard-triggered).
+    pub menu_at: Option<(u16, u16)>,
 }
 
 /// Labels for the ERD node context menu, indexed by `ErdMenuState.selected`.
@@ -403,6 +406,9 @@ pub struct ExplorerState {
     pub schema_edit_modal: Option<SchemaEditModalState>,
     pub create_object_modal: Option<CreateObjectModalState>,
     pub erd_menu: Option<ErdMenuState>,
+    /// Rect of the ERD context menu as last painted — lets a mouse click pick
+    /// the item under the cursor.
+    pub erd_menu_area: Option<Rect>,
     pub driver_capabilities: crate::driver::Capabilities,
     /// X start of each workspace tab (terminal columns), recorded at draw
     /// time so a mouse click maps to the right tab.
@@ -447,6 +453,7 @@ impl ExplorerState {
             schema_edit_modal: None,
             create_object_modal: None,
             erd_menu: None,
+            erd_menu_area: None,
             driver_capabilities,
             tab_starts: Vec::new(),
             tab_bar_area: None,
@@ -584,24 +591,44 @@ pub fn render_explorer(
         render_create_object_modal(f, area, create, theme);
     }
 
-    if let Some(menu) = &state.erd_menu {
-        render_erd_menu(f, area, menu, theme);
+    // Cloned so the popup rect can be recorded back into `state` (the hit
+    // area a mouse click tests against) while rendering.
+    if let Some(menu) = state.erd_menu.clone() {
+        let rect = erd_menu_rect(area, &menu);
+        state.erd_menu_area = Some(rect);
+        render_erd_menu(f, rect, &menu, theme);
+    } else {
+        state.erd_menu_area = None;
+    }
+}
+
+/// Where the ERD context menu is painted: anchored near the click (clamped
+/// on-screen), or centred when it was opened from the keyboard.
+pub fn erd_menu_rect(area: Rect, menu: &ErdMenuState) -> Rect {
+    let width = 30.min(area.width.saturating_sub(4));
+    let height = (ERD_MENU_OPTIONS.len() as u16 + 2).min(area.height.saturating_sub(2));
+    match menu.menu_at {
+        Some((mx, my)) => {
+            let max_x = area.x + area.width.saturating_sub(width);
+            let max_y = area.y + area.height.saturating_sub(height);
+            let x = mx.saturating_sub(2).clamp(area.x, max_x);
+            let y = my.saturating_sub(1).clamp(area.y, max_y);
+            Rect { x, y, width, height }
+        }
+        None => Rect {
+            x: area.x + (area.width.saturating_sub(width)) / 2,
+            y: area.y + (area.height.saturating_sub(height)) / 2,
+            width,
+            height,
+        },
     }
 }
 
 /// Small context menu for an ERD node (View DDL / Open rows / Edit schema /
-/// Delete table). `Enter` runs the highlighted action (handled in the event
-/// loop); `Esc` closes.
-fn render_erd_menu(f: &mut Frame, area: Rect, menu: &ErdMenuState, theme: &Theme) {
+/// Delete table). `Enter` or a mouse click runs the highlighted action
+/// (handled in the event loop / mouse handler); `Esc` closes.
+fn render_erd_menu(f: &mut Frame, popup_area: Rect, menu: &ErdMenuState, theme: &Theme) {
     let options = ERD_MENU_OPTIONS;
-    let width = 30.min(area.width.saturating_sub(4));
-    let height = (options.len() as u16 + 2).min(area.height.saturating_sub(2));
-    let popup_area = Rect {
-        x: area.x + (area.width.saturating_sub(width)) / 2,
-        y: area.y + (area.height.saturating_sub(height)) / 2,
-        width,
-        height,
-    };
     f.render_widget(Clear, popup_area);
 
     let block = Block::default()

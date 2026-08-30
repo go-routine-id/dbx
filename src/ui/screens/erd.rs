@@ -504,7 +504,7 @@ pub fn render_erd(
     draw_edge_text(buf, scene, canvas_area, vx, vy, pcol, prow);
 
     let status = format!(
-        " hjkl/arrows pan · 0 reset · +/- zoom ({:.2}x) · click node = DDL · offset ({:.0}, {:.0})px · scene {}x{} ",
+        " hjkl/arrows pan · 0 reset · +/- zoom ({:.2}x) · click node = menu · offset ({:.0}, {:.0})px · scene {}x{} ",
         erd.view.zoom, erd.view.ox, erd.view.oy, erd.scene_w as i64, erd.scene_h as i64
     );
     f.render_widget(Paragraph::new(status).style(theme.dim()), status_area);

@@ -427,6 +427,96 @@ async fn open_collection_tab(
     Ok(())
 }
 
+/// Index of the ERD context-menu item at screen cell `(col, row)`, or `None`
+/// when the cell is outside the menu or on its border.
+fn erd_menu_item_at(rect: Rect, col: u16, row: u16) -> Option<usize> {
+    if col < rect.x || col >= rect.x + rect.width || row < rect.y || row >= rect.y + rect.height {
+        return None;
+    }
+    // Row 0 is the top border; items start on the next line.
+    let idx = row.checked_sub(rect.y + 1)? as usize;
+    (idx < crate::ui::screens::explorer::ERD_MENU_OPTIONS.len()).then_some(idx)
+}
+
+/// Run one action from the ERD node context menu. Shared by the keyboard
+/// (`Enter`) and mouse (click) paths so both behave identically.
+async fn run_erd_menu_action(
+    exp: &mut crate::ui::screens::explorer::ExplorerState,
+    drv: &Arc<dyn crate::driver::Driver>,
+    toasts: &mut Toasts,
+    page_size: u64,
+    cref: crate::driver::CollectionRef,
+    selected: usize,
+) {
+    match selected {
+        // View DDL
+        0 => match drv.definition(&cref).await {
+            Ok(ddl) => exp.ddl_popup = Some((cref, ddl)),
+            Err(e) => toasts.push(ToastKind::Error, format!("failed to fetch DDL: {e:#}")),
+        },
+        // Open table (list rows)
+        1 => {
+            if let Err(e) = open_collection_tab(exp, drv, cref, page_size, false).await {
+                toasts.push(ToastKind::Error, format!("failed to open table: {e}"));
+            }
+        }
+        // Edit schema
+        2 => {
+            if !exp
+                .driver_capabilities
+                .contains(crate::driver::Capabilities::DDL)
+            {
+                toasts.push(
+                    ToastKind::Warning,
+                    "this driver does not support editing schema".to_string(),
+                );
+                return;
+            }
+            match drv.collection_meta(&cref).await {
+                Ok(meta) => {
+                    exp.schema_edit_modal =
+                        Some(crate::ui::screens::explorer::SchemaEditModalState {
+                            collection: cref,
+                            columns: meta.columns,
+                            selected: 0,
+                            drop_cols: Vec::new(),
+                            add_cols: Vec::new(),
+                            type_changes: Vec::new(),
+                            rename_table: None,
+                            input: None,
+                        });
+                }
+                Err(e) => toasts.push(
+                    ToastKind::Error,
+                    format!("failed to fetch table schema: {e:#}"),
+                ),
+            }
+        }
+        // Delete table (DROP TABLE via the SQL-confirm modal)
+        3 => {
+            if !exp
+                .driver_capabilities
+                .contains(crate::driver::Capabilities::DDL)
+            {
+                toasts.push(
+                    ToastKind::Warning,
+                    "this driver does not support dropping tables".to_string(),
+                );
+                return;
+            }
+            let driver_name = drv.info().name.clone();
+            let q_ns = quote_ident(&cref.namespace.0, &driver_name);
+            let q_tbl = quote_ident(&cref.name, &driver_name);
+            exp.sql_confirm_modal = Some(crate::ui::screens::explorer::SqlConfirmModalState {
+                collection: cref,
+                sql_query: format!("DROP TABLE {q_ns}.{q_tbl};"),
+                row_idx: 0,
+            });
+        }
+        _ => {}
+    }
+}
+
 /// Build an INSERT where every value is a quoted string literal — used by
 /// CSV import so a cell whose text happens to equal the `__DBX_NULL__`
 /// sentinel is inserted as that literal, never as SQL NULL.
@@ -1064,9 +1154,22 @@ impl App {
                     exp.erd_menu = Some(crate::ui::screens::explorer::ErdMenuState {
                         collection: cref,
                         selected: 0,
+                        menu_at: Some((mouse.column, mouse.row)),
                     });
                 }
             }
+            return Ok(());
+        }
+
+        // Moving the cursor over the ERD context menu highlights the item
+        // under it, so the mouse and keyboard share one selection.
+        if matches!(mouse.kind, MouseEventKind::Moved)
+            && let Some(exp) = &mut self.explorer_state
+            && let Some(rect) = exp.erd_menu_area
+            && let Some(menu) = &mut exp.erd_menu
+            && let Some(idx) = erd_menu_item_at(rect, mouse.column, mouse.row)
+        {
+            menu.selected = idx;
             return Ok(());
         }
 
@@ -1087,7 +1190,7 @@ impl App {
             return Ok(());
         }
 
-        let (Some(_drv), Some(exp)) = (&self.active_driver, &mut self.explorer_state) else {
+        let (Some(drv), Some(exp)) = (&self.active_driver, &mut self.explorer_state) else {
             return Ok(());
         };
         // An overlay modal owns the click — don't let it fall through to the
@@ -1110,6 +1213,22 @@ impl App {
             }
             return Ok(());
         }
+        // ERD context menu: clicking an item runs it, clicking anywhere else
+        // dismisses the menu (standard context-menu behaviour).
+        if exp.erd_menu.is_some() {
+            let hit = exp
+                .erd_menu_area
+                .and_then(|rect| erd_menu_item_at(rect, mouse.column, mouse.row));
+            let cref = exp.erd_menu.as_ref().map(|m| m.collection.clone());
+            exp.erd_menu = None;
+            exp.erd_menu_area = None;
+            if let (Some(idx), Some(cref)) = (hit, cref) {
+                let drv = drv.clone();
+                let page_size = self.config.effective_page_size();
+                run_erd_menu_action(exp, &drv, &mut self.toasts, page_size, cref, idx).await;
+            }
+            return Ok(());
+        }
         if exp.export_modal.is_some()
             || exp.cell_edit_modal.is_some()
             || exp.insert_row_modal.is_some()
@@ -1118,7 +1237,6 @@ impl App {
             || exp.import_csv_modal.is_some()
             || exp.schema_edit_modal.is_some()
             || exp.create_object_modal.is_some()
-            || exp.erd_menu.is_some()
         {
             return Ok(());
         }
@@ -3818,88 +3936,16 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             (m.collection.clone(), m.selected)
                         };
                         exp.erd_menu = None;
-                        match selected {
-                            0 => {
-                                // View DDL
-                                let drv_clone = drv.clone();
-                                match drv_clone.definition(&cref).await {
-                                    Ok(ddl) => exp.ddl_popup = Some((cref, ddl)),
-                                    Err(e) => app.toasts.push(
-                                        ToastKind::Error,
-                                        format!("failed to fetch DDL: {e:#}"),
-                                    ),
-                                }
-                            }
-                            1 => {
-                                // Open table (list rows)
-                                if let Err(e) = open_collection_tab(
-                                    exp,
-                                    drv,
-                                    cref,
-                                    app.config.effective_page_size(),
-                                    false,
-                                )
-                                .await
-                                {
-                                    app.toasts.push(
-                                        ToastKind::Error,
-                                        format!("failed to open table: {e}"),
-                                    );
-                                }
-                            }
-                            2 => {
-                                // Edit schema
-                                if !exp
-                                    .driver_capabilities
-                                    .contains(crate::driver::Capabilities::DDL)
-                                {
-                                    app.toasts.push(
-                                        ToastKind::Warning,
-                                        "this driver does not support editing schema".to_string(),
-                                    );
-                                } else {
-                                    let drv_clone = drv.clone();
-                                    if let Ok(meta) = drv_clone.collection_meta(&cref).await {
-                                        exp.schema_edit_modal = Some(
-                                            crate::ui::screens::explorer::SchemaEditModalState {
-                                                collection: cref,
-                                                columns: meta.columns,
-                                                selected: 0,
-                                                drop_cols: Vec::new(),
-                                                add_cols: Vec::new(),
-                                                type_changes: Vec::new(),
-                                                rename_table: None,
-                                                input: None,
-                                            },
-                                        );
-                                    }
-                                }
-                            }
-                            3 => {
-                                // Delete table (DROP TABLE via SQL confirm)
-                                if !exp
-                                    .driver_capabilities
-                                    .contains(crate::driver::Capabilities::DDL)
-                                {
-                                    app.toasts.push(
-                                        ToastKind::Warning,
-                                        "this driver does not support dropping tables".to_string(),
-                                    );
-                                } else {
-                                    let driver_name = drv.info().name.clone();
-                                    let q_ns = quote_ident(&cref.namespace.0, &driver_name);
-                                    let q_tbl = quote_ident(&cref.name, &driver_name);
-                                    exp.sql_confirm_modal = Some(
-                                        crate::ui::screens::explorer::SqlConfirmModalState {
-                                            collection: cref,
-                                            sql_query: format!("DROP TABLE {q_ns}.{q_tbl};"),
-                                            row_idx: 0,
-                                        },
-                                    );
-                                }
-                            }
-                            _ => {}
-                        }
+                        let page_size = app.config.effective_page_size();
+                        run_erd_menu_action(
+                            exp,
+                            drv,
+                            &mut app.toasts,
+                            page_size,
+                            cref,
+                            selected,
+                        )
+                        .await;
                         continue;
                     }
 
@@ -3926,6 +3972,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             exp.erd_menu = Some(crate::ui::screens::explorer::ErdMenuState {
                                 collection: cref,
                                 selected: 0,
+                                menu_at: None,
                             });
                             continue;
                         }
