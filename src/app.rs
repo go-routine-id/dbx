@@ -396,6 +396,7 @@ async fn open_collection_tab(
         filter_buffer: String::new(),
         read_only,
         grid_hit_area: None,
+        grid_col_starts: Vec::new(),
     }));
     exp.active_tab_index = exp.tabs.len().saturating_sub(1);
     exp.focused_pane = FocusedPane::Workspace;
@@ -744,20 +745,17 @@ impl App {
                             t.selected_row = data_row;
                         }
                     }
-                    // Column width: when all columns fit, each is roughly
-                    // area/visible; when they overflow, scroll mode keeps ~16
-                    // cells per column. Clicking the header row selects the
-                    // column only.
-                    let visible_cols = t
-                        .page
-                        .columns
-                        .len()
-                        .saturating_sub(t.scroll_offset_x)
-                        .max(1);
-                    let avg = area.width / visible_cols as u16;
-                    let col_width = if avg >= 16 { avg } else { 16 };
-                    let col_visible = mouse.column.saturating_sub(area.x) / col_width;
-                    t.selected_col = (col_visible as usize + t.scroll_offset_x)
+                    // Column hit-test against the exact x-starts recorded at
+                    // render time. Clicking the header row selects the column.
+                    let mut col_visible = 0usize;
+                    for (i, s) in t.grid_col_starts.iter().enumerate() {
+                        if mouse.column >= *s {
+                            col_visible = i;
+                        } else {
+                            break;
+                        }
+                    }
+                    t.selected_col = (col_visible + t.scroll_offset_x)
                         .min(t.page.columns.len().saturating_sub(1));
                     focus_workspace = true;
                 }
@@ -778,12 +776,15 @@ impl App {
                                 c.result_selected_row = data_row;
                             }
                         }
-                        let visible_cols =
-                            res.columns.len().saturating_sub(c.result_scroll_x).max(1);
-                        let avg = area.width / visible_cols as u16;
-                        let col_width = if avg >= 16 { avg } else { 16 };
-                        let col_visible = mouse.column.saturating_sub(area.x) / col_width;
-                        c.result_selected_col = (col_visible as usize + c.result_scroll_x)
+                        let mut col_visible = 0usize;
+                        for (i, s) in c.result_col_starts.iter().enumerate() {
+                            if mouse.column >= *s {
+                                col_visible = i;
+                            } else {
+                                break;
+                            }
+                        }
+                        c.result_selected_col = (col_visible + c.result_scroll_x)
                             .min(res.columns.len().saturating_sub(1));
                         c.focused_subpane = ConsoleSubpane::Result;
                         focus_workspace = true;

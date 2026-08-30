@@ -158,6 +158,9 @@ pub struct DataTab {
     pub read_only: bool,
     /// Grid inner area from the last draw — maps a mouse click to a cell.
     pub grid_hit_area: Option<Rect>,
+    /// X start (terminal column) of each visible column, computed at draw
+    /// time so mouse hit-testing matches the actual rendered widths exactly.
+    pub grid_col_starts: Vec<u16>,
 }
 
 /// Sort direction for the data grid.
@@ -858,6 +861,16 @@ fn render_grid(f: &mut Frame, area: Rect, tab: &mut DataTab, is_focused: bool, t
 
     let num_cols = tab.page.columns.len();
     let col_offset = tab.scroll_offset_x.min(num_cols.saturating_sub(1));
+
+    // Record the rendered x-start of each visible column so mouse clicks map
+    // to the exact same widths the Table widget computed.
+    if let Some(inner) = tab.grid_hit_area {
+        let num_visible = num_cols.saturating_sub(col_offset).max(1);
+        let col_w = (inner.width / num_visible as u16).max(1);
+        tab.grid_col_starts = (0..num_visible)
+            .map(|i| inner.x + (i as u16 * col_w))
+            .collect();
+    }
 
     // Column highlight: when focused, every cell in the active column gets a
     // dim "ruler" background so the user can track the cursor across rows.

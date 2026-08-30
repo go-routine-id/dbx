@@ -52,6 +52,8 @@ pub struct QueryConsole {
     pub autocomplete_selected: usize,
     /// Result-pane inner area from the last draw — maps a mouse click to a cell.
     pub result_hit_area: Option<Rect>,
+    /// X start of each visible result column, computed at draw time.
+    pub result_col_starts: Vec<u16>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -104,6 +106,7 @@ impl QueryConsole {
             autocomplete: Vec::new(),
             autocomplete_selected: 0,
             result_hit_area: None,
+            result_col_starts: Vec::new(),
         }
     }
 
@@ -806,6 +809,15 @@ fn render_result(
 
             let num_cols = res.columns.len();
             let col_offset = console.result_scroll_x.min(num_cols.saturating_sub(1));
+
+            // Record rendered x-starts so mouse clicks map to actual widths.
+            if let Some(inner) = console.result_hit_area {
+                let num_visible = num_cols.saturating_sub(col_offset).max(1);
+                let col_w = (inner.width / num_visible as u16).max(1);
+                console.result_col_starts = (0..num_visible)
+                    .map(|i| inner.x + (i as u16 * col_w))
+                    .collect();
+            }
 
             let header_cells = res
                 .columns
