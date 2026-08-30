@@ -1,0 +1,198 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>dbx — terminal database explorer</title>
+<meta name="description" content="dbx is a TUI database client: browse schemas, run queries, inspect DDL, visualize ERD, and edit data inline — all from your terminal." />
+<style>
+  :root {
+    --bg: #0d1117;
+    --bg-soft: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent: #58a6ff;
+    --accent-2: #79c0ff;
+    --green: #3fb950;
+    --amber: #d29922;
+    --code: #1f6feb;
+  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { color: var(--accent-2); }
+  .wrap { max-width: 1040px; margin: 0 auto; padding: 0 24px; }
+  header {
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(13, 17, 23, 0.85); backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+  }
+  nav { display: flex; align-items: center; gap: 24px; height: 60px; }
+  nav .brand { font-weight: 700; font-size: 20px; color: var(--text); }
+  nav .brand .dot { color: var(--green); }
+  nav .links { margin-left: auto; display: flex; gap: 20px; }
+  nav .links a { color: var(--muted); font-size: 15px; }
+  nav .links a:hover { color: var(--text); }
+  .hero { padding: 88px 0 64px; text-align: center; }
+  .hero .term {
+    display: inline-block; text-align: left;
+    background: var(--bg-soft); border: 1px solid var(--border); border-radius: 10px;
+    padding: 18px 22px; margin-bottom: 36px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+    font-size: 13px; color: var(--muted);
+    box-shadow: 0 0 0 1px rgba(88, 166, 255, 0.08), 0 20px 60px rgba(0,0,0,0.5);
+  }
+  .hero .term .p { color: var(--green); }
+  .hero .term .kw { color: var(--accent-2); }
+  .hero .term .cm { color: #8b949e; }
+  h1 { font-size: 52px; margin: 0 0 12px; letter-spacing: -0.02em; }
+  .tagline { font-size: 20px; color: var(--muted); max-width: 640px; margin: 0 auto 36px; }
+  .cta { display: flex; gap: 14px; justify-content: center; flex-wrap: wrap; }
+  .btn {
+    display: inline-block; padding: 12px 22px; border-radius: 8px;
+    font-weight: 600; font-size: 15px; border: 1px solid var(--border);
+  }
+  .btn.primary { background: var(--accent); color: #04121f; border-color: var(--accent); }
+  .btn.primary:hover { background: var(--accent-2); }
+  .btn.ghost { color: var(--text); }
+  .btn.ghost:hover { border-color: var(--muted); }
+  section { padding: 56px 0; border-top: 1px solid var(--border); }
+  h2 { font-size: 28px; margin: 0 0 8px; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin: 0 0 32px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; }
+  .card {
+    background: var(--bg-soft); border: 1px solid var(--border); border-radius: 10px;
+    padding: 20px;
+  }
+  .card h3 { margin: 0 0 8px; font-size: 17px; }
+  .card p { margin: 0; color: var(--muted); font-size: 14px; }
+  .shots { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .shots figure { margin: 0; }
+  .shots img {
+    width: 100%; border-radius: 10px; border: 1px solid var(--border);
+    display: block; background: var(--bg-soft);
+  }
+  .shots figcaption { color: var(--muted); font-size: 13px; margin-top: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 15px; }
+  th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  th { color: var(--muted); font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; }
+  .ok { color: var(--green); font-weight: 700; }
+  .wip { color: var(--amber); font-weight: 700; }
+  pre {
+    background: var(--bg-soft); border: 1px solid var(--border); border-radius: 10px;
+    padding: 16px 20px; overflow-x: auto; font-size: 14px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  code.inline { background: var(--bg-soft); border: 1px solid var(--border); border-radius: 5px; padding: 1px 6px; font-size: 0.92em; }
+  .pill { display: inline-block; background: var(--bg-soft); border: 1px solid var(--border); border-radius: 999px; padding: 3px 12px; font-size: 13px; color: var(--muted); margin: 0 6px 6px 0; }
+  footer { padding: 40px 0 64px; color: var(--muted); font-size: 14px; border-top: 1px solid var(--border); }
+  footer .wrap { display: flex; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
+</style>
+</head>
+<body>
+<header>
+  <nav class="wrap">
+    <span class="brand">dbx<span class="dot">.</span></span>
+    <span class="links">
+      <a href="#features">Features</a>
+      <a href="#screenshots">Screenshots</a>
+      <a href="#drivers">Drivers</a>
+      <a href="#install">Install</a>
+      <a href="https://github.com/go-routine-id/dbx">GitHub</a>
+    </span>
+  </nav>
+</header>
+
+<div class="hero wrap">
+  <div class="term">
+    <span class="p">➜</span> <span class="kw">dbx</span> shop<br>
+    <span class="cm"># browse schema · run SQL · draw ERD · edit rows</span><br>
+    <span class="kw">SELECT</span> id, name, created_at <span class="kw">FROM</span> users <span class="kw">WHERE</span> active = <span style="color:#79c0ff">1</span>;
+  </div>
+  <h1>Explore your database from the terminal</h1>
+  <p class="tagline">A DataGrip-like TUI client. Browse schemas, run queries in multi-tab consoles, inspect DDL, visualize ERD, and edit table data inline — over SSH or locally.</p>
+  <div class="cta">
+    <a class="btn primary" href="#install">Install dbx</a>
+    <a class="btn ghost" href="https://github.com/go-routine-id/dbx">View on GitHub</a>
+  </div>
+</div>
+
+<section id="features">
+  <div class="wrap">
+    <h2>Features</h2>
+    <p class="sub">Everything you need to inspect and mutate data without leaving your shell.</p>
+    <div class="grid">
+      <div class="card"><h3>🌳 Explorer tree</h3><p>Schema → tables → columns &amp; indexes, plus views, routines and sequences.</p></div>
+      <div class="card"><h3>🗂 Multi-tab consoles</h3><p>Persistent scratch SQL files, query history, favorites and autocomplete.</p></div>
+      <div class="card"><h3>📊 Result grid</h3><p>Paging, client-side sort &amp; filter, and CSV / JSON / SQL-INSERT export.</p></div>
+      <div class="card"><h3>🔎 DDL popup</h3><p>Table definitions, indexes and foreign keys at a keystroke.</p></div>
+      <div class="card"><h3>🕸 In-terminal ERD</h3><p>Braille canvas with crow's-foot notation, pannable and zoomable with the mouse.</p></div>
+      <div class="card"><h3>✏️ Inline data editing</h3><p>Edit cells, insert rows, delete with a SQL preview, and set NULL on nullable columns.</p></div>
+    </div>
+  </div>
+</section>
+
+<section id="screenshots">
+  <div class="wrap">
+    <h2>Screenshots</h2>
+    <p class="sub">Rendered in-terminal, no GUI required.</p>
+    <div class="shots">
+      <figure><img src="https://github.com/user-attachments/assets/a8b3a8e1-30b6-4998-aecf-864842dac0bd" alt="dbx explorer and query console" loading="lazy" /></figure>
+      <figure><img src="https://github.com/user-attachments/assets/c86ebb64-bd8e-43a3-a204-bd14fdeaacd5" alt="dbx result grid" loading="lazy" /></figure>
+      <figure><img src="https://github.com/user-attachments/assets/30e780b7-43b4-42fe-b577-778f9cd4c9d3" alt="dbx ERD diagram" loading="lazy" /></figure>
+      <figure><img src="https://github.com/user-attachments/assets/a149d6d6-2b2d-4dff-9d6e-ff23470bd452" alt="dbx schema explorer" loading="lazy" /></figure>
+    </div>
+  </div>
+</section>
+
+<section id="drivers">
+  <div class="wrap">
+    <h2>Driver support</h2>
+    <p class="sub">Generic SQL layer — the same code path produces valid SQL for every driver.</p>
+    <table>
+      <thead><tr><th>Driver</th><th>Status</th></tr></thead>
+      <tbody>
+        <tr><td>MySQL</td><td class="ok">✓ implemented</td></tr>
+        <tr><td>PostgreSQL</td><td class="ok">✓ implemented</td></tr>
+        <tr><td>SQL Server</td><td class="wip">planned</td></tr>
+        <tr><td>SQLite</td><td class="wip">planned</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<section id="install">
+  <div class="wrap">
+    <h2>Install</h2>
+    <p class="sub">Prebuilt binaries are published on every release for Windows, macOS and Linux.</p>
+    <pre><code># from source
+cargo install --git https://github.com/go-routine-id/dbx
+
+# or grab a binary from the Releases page
+#   dbx-linux-x86_64   · dbx-macos-arm64 / x86_64   · dbx-windows-x86_64.exe</code></pre>
+    <div style="margin-top:20px">
+      <span class="pill">Rust</span>
+      <span class="pill">ratatui</span>
+      <span class="pill">sqlx</span>
+      <span class="pill">flowmaid</span>
+      <span class="pill">GPL-3.0-or-later</span>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <span>dbx — terminal database explorer.</span>
+    <span><a href="https://github.com/go-routine-id/dbx">github.com/go-routine-id/dbx</a> · GPL-3.0-or-later</span>
+  </div>
+</footer>
+</body>
+</html>
