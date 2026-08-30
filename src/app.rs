@@ -326,6 +326,22 @@ fn build_insert_row_sql(
     format!("INSERT INTO {q_tbl} ({col_list}) VALUES ({value_list});")
 }
 
+/// Recompute the console editor's autocomplete suggestions from the text
+/// before the cursor.
+fn refresh_autocomplete(
+    c: &mut crate::ui::screens::query::QueryConsole,
+    tables: &[String],
+    columns: &std::collections::HashMap<String, Vec<String>>,
+) {
+    let before = c
+        .lines
+        .get(c.cursor_row)
+        .map(|l| l.chars().take(c.cursor_col).collect::<String>())
+        .unwrap_or_default();
+    c.autocomplete = crate::ui::screens::query::suggest(&before, tables, columns);
+    c.autocomplete_selected = 0;
+}
+
 /// Open a collection (table OR view) as a data tab: focus it if already
 /// open, otherwise fetch column metadata + first page and push a `DataTab`.
 /// Shared by the tree Enter handler (Table & View nodes) and the object
@@ -351,6 +367,11 @@ async fn open_collection_tab(
         .await
         .map_err(|e| format!("{e:#}"))?;
     let column_meta = meta_res.map(|m| m.columns).unwrap_or_default();
+    // Feed the console autocomplete with this table's column names.
+    exp.column_cache.insert(
+        format!("{}.{}", cref.namespace, cref.name),
+        column_meta.iter().map(|c| c.name.clone()).collect(),
+    );
     exp.tabs.push(WorkspaceTab::Table(crate::ui::screens::explorer::DataTab {
         collection: cref,
         page: rec_res,
@@ -979,6 +1000,16 @@ impl App {
                         return;
                     }
                     KeyCode::Tab => {
+                        // Autocomplete takes priority over pane-switching:
+                        // Tab inserts the highlighted suggestion.
+                        if exp.focused_pane == FocusedPane::Workspace
+                            && let Some(WorkspaceTab::Console(c)) = exp.active_tab_mut()
+                            && c.focused_subpane == ConsoleSubpane::Editor
+                            && !c.autocomplete.is_empty()
+                        {
+                            c.accept_autocomplete();
+                            return;
+                        }
                         if exp.focused_pane == FocusedPane::Tree {
                             exp.focused_pane = FocusedPane::Workspace;
                         } else {
@@ -1059,6 +1090,16 @@ impl App {
                     },
                     FocusedPane::Workspace => {
                         let can_edit = exp.driver_capabilities.contains(crate::driver::Capabilities::EDIT_DATA);
+                        // Snapshot for console autocomplete (borrowed before
+                        // `active_tab_mut` takes &mut on `exp`).
+                        let (ac_tables, ac_columns) = (
+                            exp.tables
+                                .values()
+                                .flatten()
+                                .map(|c| c.name.clone())
+                                .collect::<Vec<String>>(),
+                            exp.column_cache.clone(),
+                        );
                         if let Some(tab) = exp.active_tab_mut() {
                             match tab {
                                 WorkspaceTab::Table(t) => {
@@ -1265,12 +1306,30 @@ impl App {
                                     }
                                     match c.focused_subpane {
                                     ConsoleSubpane::Editor => match key.code {
-                                        KeyCode::Up => c.move_cursor_up(),
-                                        KeyCode::Down => c.move_cursor_down(),
-                                        KeyCode::Left => c.move_cursor_left(),
-                                        KeyCode::Right => c.move_cursor_right(),
-                                        KeyCode::Backspace => c.backspace(),
-                                        KeyCode::Enter => c.insert_newline(),
+                                        KeyCode::Up => {
+                                            c.move_cursor_up();
+                                            c.autocomplete.clear();
+                                        }
+                                        KeyCode::Down => {
+                                            c.move_cursor_down();
+                                            c.autocomplete.clear();
+                                        }
+                                        KeyCode::Left => {
+                                            c.move_cursor_left();
+                                            c.autocomplete.clear();
+                                        }
+                                        KeyCode::Right => {
+                                            c.move_cursor_right();
+                                            c.autocomplete.clear();
+                                        }
+                                        KeyCode::Backspace => {
+                                            c.backspace();
+                                            refresh_autocomplete(c, &ac_tables, &ac_columns);
+                                        }
+                                        KeyCode::Enter => {
+                                            c.insert_newline();
+                                            c.autocomplete.clear();
+                                        }
                                         // Alt+H: open this connection's query history.
                                         // (Not Ctrl+H — on many terminals Ctrl+H is the
                                         // Backspace erase byte, so it must stay free.)
@@ -1344,6 +1403,7 @@ impl App {
                                         KeyCode::Char(ch) => {
                                             if !key.modifiers.contains(KeyModifiers::CONTROL) {
                                                 c.insert_char(ch);
+                                                refresh_autocomplete(c, &ac_tables, &ac_columns);
                                             }
                                         }
                                         _ => {}

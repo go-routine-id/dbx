@@ -46,6 +46,10 @@ pub struct QueryConsole {
     /// Optional picker overlay (query history / saved favorites). When set,
     /// the console routes Up/Down/Enter/Esc to it.
     pub popup: Option<ConsolePopup>,
+    /// Live autocomplete suggestions for the current editor position.
+    /// Empty = nothing to offer.
+    pub autocomplete: Vec<String>,
+    pub autocomplete_selected: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,11 +99,37 @@ impl QueryConsole {
             result_scroll_x: 0,
             focused_subpane: ConsoleSubpane::Editor,
             popup: None,
+            autocomplete: Vec::new(),
+            autocomplete_selected: 0,
         }
     }
 
     pub fn text(&self) -> String {
         self.lines.join("\n")
+    }
+
+    /// Replace the current completion token (after the last whitespace or
+    /// `.`) with the highlighted suggestion.
+    pub fn accept_autocomplete(&mut self) {
+        let Some(s) = self.autocomplete.get(self.autocomplete_selected).cloned() else {
+            return;
+        };
+        self.autocomplete.clear();
+        self.autocomplete_selected = 0;
+        let line = &mut self.lines[self.cursor_row];
+        let chars: Vec<char> = line.chars().collect();
+        let mut start = self.cursor_col;
+        while start > 0 {
+            let c = chars[start - 1];
+            if c.is_whitespace() || c == '.' {
+                break;
+            }
+            start -= 1;
+        }
+        let head: String = chars[..start].iter().collect();
+        let tail: String = chars[self.cursor_col..].iter().collect();
+        *line = format!("{head}{s}{tail}");
+        self.cursor_col = head.chars().count() + s.chars().count();
     }
 
     /// Replace the whole editor buffer, resetting the cursor to the end.
@@ -366,6 +396,76 @@ pub fn is_comment_only(stmt: &str) -> bool {
     t.starts_with("--") || (t.starts_with("/*") && t.ends_with("*/"))
 }
 
+/// Tier-1 autocomplete for the text before the cursor:
+/// - after FROM/JOIN/INTO/UPDATE → table names
+/// - `table.` prefix → column names (from `column_cache` keyed `ns.table`)
+/// - otherwise → SQL keywords
+pub fn suggest(
+    line_before_cursor: &str,
+    tables: &[String],
+    column_cache: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let trimmed_end = line_before_cursor.trim_end();
+    let words: Vec<&str> = trimmed_end.split_whitespace().collect();
+    // A trailing space means the current token is empty but the previous one
+    // is the context (e.g. "FROM " should suggest all tables).
+    let has_trailing_ws = line_before_cursor.len() > trimmed_end.len();
+    let current = if has_trailing_ws {
+        String::new()
+    } else {
+        words.last().map(|w| w.to_string()).unwrap_or_default()
+    };
+    let prev = if has_trailing_ws {
+        words.last().copied().unwrap_or("").to_uppercase()
+    } else {
+        words.iter().rev().nth(1).copied().unwrap_or("").to_uppercase()
+    };
+
+    // After FROM/JOIN/INTO/UPDATE → table names.
+    if matches!(prev.as_str(), "FROM" | "JOIN" | "INTO" | "UPDATE") {
+        let mut t: Vec<String> = tables
+            .iter()
+            .filter(|t| t.starts_with(&current))
+            .cloned()
+            .collect();
+        t.sort();
+        t.truncate(20);
+        return t;
+    }
+
+    // `table.col` → columns of that table (matched by bare name or ns.table).
+    if current.contains('.') {
+        let (table_part, col_prefix) = match current.rfind('.') {
+            Some(i) => (&current[..i], &current[i + 1..]),
+            None => return Vec::new(),
+        };
+        let mut cols: Vec<String> = column_cache
+            .iter()
+            .filter(|(key, _)| {
+                key.ends_with(&format!(".{table_part}")) || key.as_str() == table_part
+            })
+            .flat_map(|(_, v)| v.iter().cloned())
+            .collect();
+        cols.sort();
+        cols.dedup();
+        cols.retain(|c| c.starts_with(col_prefix));
+        cols.truncate(20);
+        return cols;
+    }
+
+    // Otherwise keywords, but only once something is typed (avoids noise).
+    if current.is_empty() {
+        return Vec::new();
+    }
+    let upper = current.to_uppercase();
+    SQL_KEYWORDS
+        .iter()
+        .filter(|k| k.starts_with(&upper))
+        .map(|k| k.to_string())
+        .take(20)
+        .collect()
+}
+
 /// Tokenizes a single SQL line and returns highlighted Spans (owned Strings).
 pub fn highlight_sql_line(line: &str, theme: &Theme) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
@@ -463,7 +563,58 @@ pub fn render_query_console(
 
     if let Some(popup) = &console.popup {
         render_console_popup(f, area, popup, theme);
+    } else if !console.autocomplete.is_empty() {
+        render_autocomplete(f, chunks[0], console, theme);
     }
+}
+
+/// Small overlay at the bottom of the editor showing live autocomplete
+/// suggestions. Tab inserts the highlighted one.
+fn render_autocomplete(f: &mut Frame, area: Rect, console: &QueryConsole, theme: &Theme) {
+    let height = 6.min(area.height.saturating_sub(1));
+    let popup_area = Rect {
+        x: area.x + 1,
+        y: area.y + area.height.saturating_sub(height),
+        width: area.width.saturating_sub(2),
+        height,
+    };
+    if popup_area.height < 3 {
+        return;
+    }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent())
+        .style(theme.panel())
+        .title(" Complete (Tab) ");
+    let inner = block.inner(popup_area);
+    f.render_widget(Clear, popup_area);
+    f.render_widget(block, popup_area);
+
+    let visible = inner.height as usize;
+    let sel = console
+        .autocomplete_selected
+        .min(console.autocomplete.len().saturating_sub(1));
+    let start = sel.saturating_sub(visible / 2);
+    let mut lines = Vec::new();
+    for (i, s) in console
+        .autocomplete
+        .iter()
+        .skip(start)
+        .take(visible)
+        .enumerate()
+    {
+        let is_sel = start + i == sel;
+        lines.push(Line::from(Span::styled(
+            if is_sel { format!("▶ {s}") } else { format!("  {s}") },
+            if is_sel {
+                theme.selected()
+            } else {
+                theme.base()
+            },
+        )));
+    }
+    f.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Centered picker overlay for history / favorites.
@@ -827,6 +978,37 @@ mod tests {
         let stmts = split_statements("SELECT `a;b` FROM t; SELECT 2");
         assert_eq!(stmts.len(), 2);
         assert_eq!(stmts[0], "SELECT `a;b` FROM t");
+    }
+
+    #[test]
+    fn test_suggest() {
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(
+            "shop.users".to_string(),
+            vec!["id".to_string(), "name".to_string(), "email".to_string()],
+        );
+        let tables = vec!["users".to_string(), "orders".to_string()];
+
+        // After FROM → table names.
+        let s = suggest("SELECT * FROM us", &tables, &cache);
+        assert!(s.contains(&"users".to_string()));
+
+        // `table.col` → column names of that table.
+        let s = suggest("SELECT users.na", &tables, &cache);
+        assert!(s.contains(&"name".to_string()));
+        assert!(!s.contains(&"id".to_string()));
+
+        // Otherwise keywords.
+        let s = suggest("SEL", &tables, &cache);
+        assert!(s.contains(&"SELECT".to_string()));
+
+        // Trailing space after FROM → suggest all tables.
+        let s = suggest("SELECT * FROM ", &tables, &cache);
+        assert!(s.contains(&"users".to_string()));
+        assert!(s.contains(&"orders".to_string()));
+
+        // Keyword context with empty prefix → no keyword noise.
+        assert!(suggest("SELECT ", &tables, &cache).is_empty());
     }
 
     #[test]

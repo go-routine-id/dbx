@@ -253,6 +253,8 @@ pub struct ExplorerState {
     pub views: std::collections::HashMap<String, Vec<Collection>>,
     pub routines: std::collections::HashMap<String, Vec<Collection>>,
     pub sequences: std::collections::HashMap<String, Vec<Collection>>,
+    /// Column names per `ns.table` — feeds the console autocomplete.
+    pub column_cache: std::collections::HashMap<String, Vec<String>>,
     pub tree_nodes: Vec<TreeNode>,
     pub selected_tree_index: usize,
     /// First tree-node row currently visible in the tree pane. Adjusted on
@@ -295,6 +297,7 @@ impl ExplorerState {
             views: std::collections::HashMap::new(),
             routines: std::collections::HashMap::new(),
             sequences: std::collections::HashMap::new(),
+            column_cache: std::collections::HashMap::new(),
             tree_nodes,
             selected_tree_index: 0,
             tree_scroll: 0,
