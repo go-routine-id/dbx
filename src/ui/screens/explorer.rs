@@ -104,7 +104,7 @@ pub struct ObjectSearchState {
 #[derive(Clone, Debug)]
 pub enum TreeNodeKind {
     Database(Namespace),
-    Table(CollectionRef, Option<u64>),
+    Table(CollectionRef, Option<u64>, Option<u64>), // (ref, est. rows, est. size bytes)
     View(CollectionRef),
     Routine(CollectionRef),
     Sequence(CollectionRef),
@@ -173,6 +173,22 @@ pub struct DataTab {
 pub enum SortDir {
     Asc,
     Desc,
+}
+
+/// Human-readable byte size (KB / MB / GB).
+pub fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes >= GB {
+        format!("{:.1} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.1} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.1} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 /// Comparison operator for a client-side row filter.
@@ -367,6 +383,7 @@ impl ExplorerState {
                                     name: tbl.name.clone(),
                                 },
                                 tbl.estimated_row_count,
+                                tbl.estimated_size_bytes,
                             ),
                             is_expanded: false,
                             is_loading: false,
@@ -674,12 +691,16 @@ fn render_tree(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme: &The
                     Span::styled(format!("📁 {}", ns.0), style),
                 ])
             }
-            TreeNodeKind::Table(cref, count) => {
-                // Row count comes from the information schema / planner
-                // estimate, so it's approximate — mark it with `~`.
-                let count_str = count
-                    .map(|c| format!(" (~{})", c))
-                    .unwrap_or_default();
+            TreeNodeKind::Table(cref, count, size) => {
+                // Size is the primary metadata (fits the narrow tree pane);
+                // row count is the fallback when the driver has no size.
+                let meta = if let Some(s) = size {
+                    format!(" (~{})", format_size(*s))
+                } else if let Some(c) = count {
+                    format!(" (~{c} rows)")
+                } else {
+                    String::new()
+                };
                 let style = if is_sel {
                     theme.selected()
                 } else {
@@ -688,7 +709,7 @@ fn render_tree(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme: &The
                 Line::from(vec![
                     Span::styled("   📄 ", theme.dim()),
                     Span::styled(&cref.name, style),
-                    Span::styled(count_str, theme.dim()),
+                    Span::styled(meta, theme.dim()),
                 ])
             }
             TreeNodeKind::View(cref) => {
@@ -1506,6 +1527,15 @@ mod tests {
 
     fn record(values: Vec<Value>) -> Record {
         Record { values }
+    }
+
+    #[test]
+    fn test_format_size() {
+        assert_eq!(format_size(500), "500 B");
+        assert_eq!(format_size(2048), "2.0 KB");
+        assert_eq!(format_size(5 * 1024 * 1024), "5.0 MB");
+        assert_eq!(format_size(2 * 1024 * 1024 * 1024), "2.0 GB");
+        assert_eq!(format_size(0), "0 B");
     }
 
     #[test]

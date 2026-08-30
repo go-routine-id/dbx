@@ -94,6 +94,7 @@ impl PostgresDriver {
             .map(|r| Collection {
                 name: r.get::<String, _>(0),
                 estimated_row_count: None,
+                estimated_size_bytes: None,
             })
             .collect())
     }
@@ -151,9 +152,16 @@ impl Driver for PostgresDriver {
     }
 
     async fn collections(&self, ns: &Namespace) -> Result<Vec<Collection>> {
+        // Partitioned parents (relkind 'p') own no storage, so sum the sizes
+        // of their `pg_inherits` children; plain tables use their own size.
         let sql = "\
             SELECT c.relname AS table_name, \
-                   c.reltuples::bigint AS estimated_rows \
+                   c.reltuples::bigint AS estimated_rows, \
+                   COALESCE( \
+                     (SELECT sum(pg_total_relation_size(inhrelid)) \
+                      FROM pg_inherits WHERE inhparent = c.oid), \
+                     pg_total_relation_size(c.oid) \
+                   ) AS size_bytes \
             FROM pg_class c \
             JOIN pg_namespace n ON n.oid = c.relnamespace \
             WHERE n.nspname = $1 AND c.relkind IN ('r', 'p') \
@@ -169,9 +177,11 @@ impl Driver for PostgresDriver {
         for r in rows {
             let name: String = r.get(0);
             let row_est: Option<i64> = r.try_get(1).ok();
+            let size: Option<i64> = r.try_get(2).ok();
             cols.push(Collection {
                 name,
                 estimated_row_count: row_est.map(|v| v.max(0) as u64),
+                estimated_size_bytes: size.map(|v| v.max(0) as u64),
             });
         }
         Ok(cols)

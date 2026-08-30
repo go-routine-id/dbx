@@ -2920,7 +2920,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                                 format!("SEQUENCE {}.{}", cref.namespace, cref.name),
                                             ));
                                         }
-                                        TreeNodeKind::Table(cref, _) => {
+                                        TreeNodeKind::Table(cref, _, _) => {
                                             if let Err(e) = open_collection_tab(
                                                 exp,
                                                 drv,
@@ -2939,7 +2939,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             KeyCode::F(1) => {
                                 if let Some(node) = exp.selected_node() {
                                     let cref = match &node.kind {
-                                        TreeNodeKind::Table(cref, _)
+                                        TreeNodeKind::Table(cref, _, _)
                                         | TreeNodeKind::View(cref)
                                         | TreeNodeKind::Routine(cref)
                                         | TreeNodeKind::Sequence(cref) => cref.clone(),
@@ -2988,7 +2988,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 if let Some(node) = exp.selected_node() {
                                     let target_ns = match &node.kind {
                                         TreeNodeKind::Database(ns) => ns.clone(),
-                                        TreeNodeKind::Table(cref, _) => cref.namespace.clone(),
+                                        TreeNodeKind::Table(cref, _, _) => cref.namespace.clone(),
                                         TreeNodeKind::View(cref) => cref.namespace.clone(),
                                         TreeNodeKind::Routine(cref) => cref.namespace.clone(),
                                         TreeNodeKind::Sequence(cref) => cref.namespace.clone(),
@@ -3045,7 +3045,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             let active_ns = if let Some(node) = exp.selected_node() {
                                 match &node.kind {
                                     TreeNodeKind::Database(ns) => ns.clone(),
-                                    TreeNodeKind::Table(cref, _) => cref.namespace.clone(),
+                                    TreeNodeKind::Table(cref, _, _) => cref.namespace.clone(),
                                     TreeNodeKind::View(cref) => cref.namespace.clone(),
                                     TreeNodeKind::Routine(cref) => cref.namespace.clone(),
                                     TreeNodeKind::Sequence(cref) => cref.namespace.clone(),

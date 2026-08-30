@@ -62,6 +62,11 @@ impl fmt::Display for CollectionRef {
 pub struct Collection {
     pub name: String,
     pub estimated_row_count: Option<u64>,
+    /// On-disk size in bytes (table + indexes), an estimate from the planner
+    /// / information schema. Driver-specific: PostgreSQL includes TOAST/FSM/VM
+    /// and sums partition children; MySQL is data+index page counts.
+    #[serde(default)]
+    pub estimated_size_bytes: Option<u64>,
 }
 
 /// Column or field definition.

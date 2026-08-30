@@ -93,6 +93,7 @@ impl MySqlDriver {
             .map(|r| Collection {
                 name: r.get::<String, _>(0),
                 estimated_row_count: None,
+                estimated_size_bytes: None,
             })
             .collect())
     }
@@ -140,8 +141,10 @@ impl Driver for MySqlDriver {
     }
 
     async fn collections(&self, ns: &Namespace) -> Result<Vec<Collection>> {
+        // TABLE_ROWS is BIGINT UNSIGNED — cast to signed so sqlx can decode
+        // it as i64 (the unsigned flag otherwise makes try_get::<i64> fail).
         let sql = "\
-            SELECT TABLE_NAME, TABLE_ROWS \
+            SELECT TABLE_NAME, CAST(TABLE_ROWS AS SIGNED), (DATA_LENGTH + INDEX_LENGTH) AS size_bytes \
             FROM information_schema.TABLES \
             WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' \
             ORDER BY TABLE_NAME";
@@ -155,9 +158,11 @@ impl Driver for MySqlDriver {
         for r in rows {
             let name: String = r.get(0);
             let row_est: Option<i64> = r.try_get(1).ok();
+            let size: Option<u64> = r.try_get(2).ok();
             cols.push(Collection {
                 name,
                 estimated_row_count: row_est.map(|v| v.max(0) as u64),
+                estimated_size_bytes: size,
             });
         }
         Ok(cols)
