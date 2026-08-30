@@ -805,6 +805,8 @@ pub struct App {
     form_modal: Option<ConnectionForm>,
     // In-flight test ping for the form modal. None = idle.
     form_test_rx: Option<tokio::sync::mpsc::Receiver<Result<std::time::Duration, String>>>,
+    /// One-shot startup update check. `Some(latest)` means a newer release.
+    update_check_rx: Option<tokio::sync::mpsc::Receiver<Option<String>>>,
     /// Confirmation dialog for destructive delete on a saved connection.
     /// `Some` means a confirmation popup is open; user must press Enter to
     /// actually delete, or Esc to cancel. Stores the original index so the
@@ -850,6 +852,7 @@ impl App {
             selected_connection: 0,
             form_modal: None,
             form_test_rx: None,
+            update_check_rx: None,
             confirm_delete_modal: None,
             mode: ScreenMode::Picker,
             active_driver: None,
@@ -2994,6 +2997,18 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
     let mut spinner = Spinner::new();
     let mut last_tick = Instant::now();
 
+    // Kick off a one-shot update check off the hot path. The result is polled
+    // in the tick below and surfaced as a toast (best-effort, silent on error).
+    let (update_tx, update_rx) = tokio::sync::mpsc::channel::<Option<String>>(1);
+    tokio::spawn(async move {
+        let result = tokio::task::spawn_blocking(crate::update::check_for_update)
+            .await
+            .ok()
+            .flatten();
+        let _ = update_tx.send(result).await;
+    });
+    app.update_check_rx = Some(update_rx);
+
     while !app.should_quit {
         terminal
             .draw(|f| app.draw(f, &spinner))
@@ -4471,6 +4486,30 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             });
                         }
                         app.form_test_rx = None;
+                    }
+                }
+            }
+            // Poll the startup update check. Only surface a toast when a
+            // newer version actually exists — up-to-date / failed checks stay
+            // silent so they don't nag on every launch.
+            if let Some(rx) = &mut app.update_check_rx {
+                match rx.try_recv() {
+                    Ok(Some(latest)) => {
+                        app.toasts.push(
+                            ToastKind::Info,
+                            format!(
+                                "update available: v{latest} (you're on v{}) — github.com/go-routine-id/dbx/releases",
+                                crate::update::CURRENT_VERSION
+                            ),
+                        );
+                        app.update_check_rx = None;
+                    }
+                    Ok(None) => {
+                        app.update_check_rx = None;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        app.update_check_rx = None;
                     }
                 }
             }

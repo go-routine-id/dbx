@@ -7,6 +7,7 @@ mod driver;
 mod export;
 mod theme;
 mod ui;
+mod update;
 
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
