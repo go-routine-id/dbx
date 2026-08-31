@@ -5498,7 +5498,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         app.toasts.push(
                             ToastKind::Info,
                             format!(
-                                "update available: v{latest} (you're on v{}) — github.com/go-routine-id/dbx/releases",
+                                "update available: v{latest} (you're on v{}) — quit and run `dbx --self-update`",
                                 crate::update::CURRENT_VERSION
                             ),
                         );
