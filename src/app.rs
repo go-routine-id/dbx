@@ -421,6 +421,11 @@ async fn open_collection_tab(
         read_only,
         grid_hit_area: None,
         grid_col_starts: Vec::new(),
+        row_detail: false,
+        row_detail_scroll: 0,
+        search_query: String::new(),
+        search_editing: false,
+        search_buffer: String::new(),
     }));
     exp.active_tab_index = exp.tabs.len().saturating_sub(1);
     exp.focused_pane = FocusedPane::Workspace;
@@ -843,7 +848,7 @@ const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-const EXPLORER_HELP_BINDINGS: [(&str, &str); 31] = [
+const EXPLORER_HELP_BINDINGS: [(&str, &str); 34] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
@@ -871,6 +876,9 @@ const EXPLORER_HELP_BINDINGS: [(&str, &str); 31] = [
     ("e (on tree table)", "edit table schema (ALTER: drop/add column, rename)"),
     ("a (in tree)", "create schema / table / view / type / function"),
     ("x", "delete selected row (shows safe SQL confirmation)"),
+    ("v (in table tab)", "expand the selected row vertically (wide tables)"),
+    ("Ctrl+F / Ctrl+G", "search all cells / jump to the next match"),
+    ("E (in ERD tab)", "export the diagram as ~/dbx_erd_<schema>.svg + .mmd"),
     ("i", "open INSERT-row modal — fill fields, server applies DEFAULT for skipped"),
     ("F1", "view table DDL schema popup"),
     ("n / p", "next / previous page in data grid"),
@@ -2174,7 +2182,73 @@ impl App {
                         if let Some(tab) = exp.active_tab_mut() {
                             match tab {
                                 WorkspaceTab::Table(t) => {
-                                    if t.filter_editing {
+                                    // Search input mode owns every key until
+                                    // Enter/Esc, same shape as the filter.
+                                    if t.search_editing {
+                                        match key.code {
+                                            KeyCode::Esc => {
+                                                t.search_editing = false;
+                                                t.search_buffer.clear();
+                                            }
+                                            KeyCode::Enter => {
+                                                t.search_query = t.search_buffer.clone();
+                                                t.search_editing = false;
+                                                // Jump to the first hit so the
+                                                // search does something visible.
+                                                if let Some(&(r, c)) =
+                                                    crate::ui::screens::explorer::search_matches(t)
+                                                        .first()
+                                                {
+                                                    t.selected_row = r;
+                                                    t.selected_col = c;
+                                                }
+                                            }
+                                            KeyCode::Backspace => {
+                                                t.search_buffer.pop();
+                                            }
+                                            KeyCode::Char(c)
+                                                if !key.modifiers
+                                                    .contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                t.search_buffer.push(c);
+                                            }
+                                            _ => {}
+                                        }
+                                    } else if t.row_detail {
+                                        // Row-detail overlay: scroll columns,
+                                        // step rows, close.
+                                        match key.code {
+                                            KeyCode::Esc | KeyCode::Char('v') | KeyCode::Char('V') => {
+                                                t.row_detail = false;
+                                            }
+                                            KeyCode::Down | KeyCode::Char('j') => {
+                                                let last = t.page.columns.len().saturating_sub(1);
+                                                if t.row_detail_scroll < last {
+                                                    t.row_detail_scroll += 1;
+                                                }
+                                            }
+                                            KeyCode::Up | KeyCode::Char('k') => {
+                                                t.row_detail_scroll =
+                                                    t.row_detail_scroll.saturating_sub(1);
+                                            }
+                                            // ←/→ walk rows without leaving the
+                                            // overlay, so scanning is fast.
+                                            KeyCode::Right | KeyCode::Char('l') => {
+                                                let n = crate::ui::screens::explorer::visible_records(t).len();
+                                                if t.selected_row + 1 < n {
+                                                    t.selected_row += 1;
+                                                    t.row_detail_scroll = 0;
+                                                }
+                                            }
+                                            KeyCode::Left | KeyCode::Char('h')
+                                                if t.selected_row > 0 =>
+                                            {
+                                                t.selected_row -= 1;
+                                                t.row_detail_scroll = 0;
+                                            }
+                                            _ => {}
+                                        }
+                                    } else if t.filter_editing {
                                         // Filter input mode: every key feeds the
                                         // filter buffer until Enter/Esc.
                                         match key.code {
@@ -2236,6 +2310,48 @@ impl App {
                                                     "copied row as INSERT to clipboard".to_string(),
                                                 ),
                                                 Err(e) => self.toasts.push(ToastKind::Error, e),
+                                            }
+                                        }
+                                    }
+                                    // `v` expands the selected row vertically —
+                                    // the readable way to inspect a wide table.
+                                    KeyCode::Char('v') | KeyCode::Char('V') => {
+                                        t.row_detail = true;
+                                        t.row_detail_scroll = 0;
+                                    }
+                                    // Ctrl+F: free-text search across all cells
+                                    // (complements `/`, which filters by column).
+                                    KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                        t.search_editing = true;
+                                        t.search_buffer = t.search_query.clone();
+                                    }
+                                    // Ctrl+G: jump to the next match, wrapping.
+                                    KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                        let hits = crate::ui::screens::explorer::search_matches(t);
+                                        if hits.is_empty() {
+                                            self.toasts.push(
+                                                ToastKind::Info,
+                                                "no matches — press Ctrl+F to search".to_string(),
+                                            );
+                                        } else {
+                                            let cur = (t.selected_row, t.selected_col);
+                                            let next = hits
+                                                .iter()
+                                                .find(|&&h| h > cur)
+                                                .copied()
+                                                .unwrap_or(hits[0]);
+                                            t.selected_row = next.0;
+                                            t.selected_col = next.1;
+                                            // Keep the jumped-to column on screen.
+                                            let max_visible = t
+                                                .grid_hit_area
+                                                .map(|r| (r.width / 16).max(1) as usize)
+                                                .unwrap_or(6);
+                                            if t.selected_col < t.scroll_offset_x {
+                                                t.scroll_offset_x = t.selected_col;
+                                            } else if t.selected_col >= t.scroll_offset_x + max_visible {
+                                                t.scroll_offset_x =
+                                                    t.selected_col.saturating_sub(max_visible - 1);
                                             }
                                         }
                                     }
@@ -2769,6 +2885,20 @@ impl App {
                                     }
                                 },
                                 WorkspaceTab::Erd(e) => match key.code {
+                                    // `E` writes the diagram out as SVG (from
+                                    // flowmaid's own renderer) plus the Mermaid
+                                    // source, so it can go straight into docs.
+                                    KeyCode::Char('E') => {
+                                        match e.export_files() {
+                                            Ok(paths) => self.toasts.push(
+                                                ToastKind::Success,
+                                                format!("exported {paths}"),
+                                            ),
+                                            Err(err) => self
+                                                .toasts
+                                                .push(ToastKind::Error, format!("ERD export failed: {err}")),
+                                        }
+                                    }
                                     // [ / ] switch workspace tabs.
                                     KeyCode::Char('[') => switch_tab(exp, -1),
                                     KeyCode::Char(']') => switch_tab(exp, 1),

@@ -9,7 +9,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, Paragraph, Row as TableRow, Table, TableState,
 };
 
-use crate::driver::{Collection, CollectionRef, ColumnMeta, Namespace, Record, RecordPage};
+use crate::driver::{Collection, CollectionRef, ColumnMeta, Namespace, Record, RecordPage, Value};
 use crate::export::ExportFormat;
 use crate::theme::Theme;
 use crate::ui::screens::erd::{self, ErdTab};
@@ -255,6 +255,75 @@ pub struct DataTab {
     /// X start (terminal column) of each visible column, computed at draw
     /// time so mouse hit-testing matches the actual rendered widths exactly.
     pub grid_col_starts: Vec<u16>,
+    /// `true` while the selected row is shown expanded (one column per line),
+    /// which is the only readable way to look at a very wide table.
+    pub row_detail: bool,
+    /// First column shown in the row-detail panel (it scrolls independently
+    /// of the grid).
+    pub row_detail_scroll: usize,
+    /// Free-text search across every cell. Unlike `filter` (which is a
+    /// column expression and hides rows) this only highlights matches and
+    /// jumps between them, so the row set never changes underneath you.
+    pub search_query: String,
+    /// `true` while the user is typing a search term in the footer.
+    pub search_editing: bool,
+    pub search_buffer: String,
+}
+
+/// Rows of `tab` as they are actually displayed: client-side filter applied,
+/// then the client-side sort. Row *references* are returned so
+/// `page.records` keeps its natural order for pagination.
+///
+/// Every place that maps a `selected_row` back to a record must go through
+/// this, or the selection silently points at the wrong row whenever a filter
+/// or sort is active.
+pub fn visible_records(tab: &DataTab) -> Vec<&Record> {
+    let mut rows: Vec<&Record> = tab
+        .page
+        .records
+        .iter()
+        .filter(|r| {
+            tab.filter
+                .as_ref()
+                .map(|f| record_matches_filter(r, f))
+                .unwrap_or(true)
+        })
+        .collect();
+    if let Some(sort_col) = tab.sort_col {
+        rows.sort_by(|a, b| compare_records(a, b, sort_col, tab.sort_dir));
+    }
+    rows
+}
+
+/// Does a cell contain `query`? Case-insensitive, on the displayed text so
+/// what the user searches for is what they can see.
+pub fn cell_matches_search(value: &Value, query: &str) -> bool {
+    if query.is_empty() {
+        return false;
+    }
+    value
+        .display_str()
+        .to_lowercase()
+        .contains(&query.to_lowercase())
+}
+
+/// `(row, col)` of every cell matching the active search, in display order.
+pub fn search_matches(tab: &DataTab) -> Vec<(usize, usize)> {
+    if tab.search_query.is_empty() {
+        return Vec::new();
+    }
+    visible_records(tab)
+        .iter()
+        .enumerate()
+        .flat_map(|(r, rec)| {
+            rec.values
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| cell_matches_search(v, &tab.search_query))
+                .map(move |(c, _)| (r, c))
+                .collect::<Vec<_>>()
+        })
+        .collect()
 }
 
 /// Sort direction for the data grid.
@@ -593,6 +662,14 @@ pub fn render_explorer(
 
     // Cloned so the popup rect can be recorded back into `state` (the hit
     // area a mouse click tests against) while rendering.
+    // Row detail rides on the active tab rather than a modal field: the data
+    // is already in the tab, so there is nothing to keep in sync.
+    if let Some(WorkspaceTab::Table(tab)) = state.active_tab()
+        && tab.row_detail
+    {
+        render_row_detail(f, area, tab, theme);
+    }
+
     if let Some(menu) = state.erd_menu.clone() {
         let rect = erd_menu_rect(area, &menu);
         state.erd_menu_area = Some(rect);
@@ -600,6 +677,114 @@ pub fn render_explorer(
     } else {
         state.erd_menu_area = None;
     }
+}
+
+/// One row shown vertically — `column : value` per line — which is the only
+/// readable way to inspect a table too wide to fit on screen.
+fn render_row_detail(f: &mut Frame, area: Rect, tab: &DataTab, theme: &Theme) {
+    let rows = visible_records(tab);
+    let Some(record) = rows.get(tab.selected_row) else {
+        return;
+    };
+
+    let width = 72.min(area.width.saturating_sub(4));
+    let height = 20.min(area.height.saturating_sub(2));
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent())
+        .style(theme.panel())
+        .title(format!(
+            " {} — row {}/{} ",
+            tab.collection.name,
+            tab.selected_row + 1,
+            rows.len()
+        ));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    // Align the values into a column so long tables stay scannable.
+    let name_w = tab
+        .page
+        .columns
+        .iter()
+        .map(|c| c.chars().count())
+        .max()
+        .unwrap_or(8)
+        .min(24);
+
+    let visible = chunks[0].height as usize;
+    let mut lines = Vec::new();
+    for (i, col) in tab
+        .page
+        .columns
+        .iter()
+        .enumerate()
+        .skip(tab.row_detail_scroll)
+        .take(visible)
+    {
+        let value = record
+            .values
+            .get(i)
+            .map(|v| v.display_str())
+            .unwrap_or_default();
+        // Mark the key columns so the row reads like the table's own shape.
+        let flag = tab
+            .column_meta
+            .iter()
+            .find(|m| &m.name == col)
+            .map(|m| {
+                if m.is_primary_key {
+                    "🔑"
+                } else if m.is_foreign_key {
+                    "🔗"
+                } else {
+                    "  "
+                }
+            })
+            .unwrap_or("  ");
+        let is_sel = i == tab.selected_col;
+        lines.push(Line::from(vec![
+            Span::styled(format!("{flag} "), theme.dim()),
+            Span::styled(
+                format!("{:<name_w$} : ", col.chars().take(name_w).collect::<String>()),
+                if is_sel { theme.accent() } else { theme.dim() },
+            ),
+            Span::styled(
+                value,
+                if is_sel {
+                    theme.selected()
+                } else {
+                    theme.base()
+                },
+            ),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), chunks[0]);
+
+    let more = tab.page.columns.len().saturating_sub(tab.row_detail_scroll + visible);
+    let hint = if more > 0 {
+        format!(" ↑/↓ scroll ({more} more) · ←/→ row · v/Esc close ")
+    } else {
+        " ↑/↓ scroll · ←/→ row · v/Esc close ".to_string()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(hint, theme.dim()))),
+        chunks[1],
+    );
 }
 
 /// Where the ERD context menu is painted: anchored near the click (clamped
@@ -1177,7 +1362,13 @@ fn render_workspace(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme:
 
                 // 3. Pagination Footer. While the user is typing a filter, the
                 // footer becomes the filter input line.
-                let p = if data_tab.filter_editing {
+                let p = if data_tab.search_editing {
+                    let input = format!(
+                        "[search] {}_ [Enter] find  [Esc] cancel",
+                        data_tab.search_buffer
+                    );
+                    Paragraph::new(Span::styled(input, theme.accent()))
+                } else if data_tab.filter_editing {
                     let input = format!("[filter] {}_ [Enter] apply  [Esc] cancel", data_tab.filter_buffer);
                     Paragraph::new(Span::styled(input, theme.accent()))
                 } else {
@@ -1196,13 +1387,23 @@ fn render_workspace(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme:
                         format!(" | filter {} ({}/{} shown)", f.display(), shown, data_tab.page.records.len())
                     });
                     let ro = if data_tab.read_only { " [read-only view]" } else { "" };
+                    let search_badge = if data_tab.search_query.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            " | search '{}' ({} hits, Ctrl+G next)",
+                            data_tab.search_query,
+                            search_matches(data_tab).len()
+                        )
+                    };
                     let footer_text = format!(
-                        " Page {} (showing {} rows{}){}{} | [s] sort  [/] filter  [n]/[p] page  [w] Close",
+                        " Page {} (showing {} rows{}){}{}{} | [v] row  [s] sort  [/] filter  [Ctrl+F] search  [n]/[p] page  [w] Close",
                         data_tab.page.page + 1,
                         data_tab.page.records.len(),
                         total_str,
                         ro,
-                        filter_badge.unwrap_or_default()
+                        filter_badge.unwrap_or_default(),
+                        search_badge
                     );
                     Paragraph::new(Span::styled(footer_text, theme.dim()))
                 };
@@ -1319,17 +1520,7 @@ fn render_grid(f: &mut Frame, area: Rect, tab: &mut DataTab, is_focused: bool, t
         });
     let header = TableRow::new(header_cells).height(1).bottom_margin(1);
 
-    // Client-side filter then sort. We copy row *references* (not the
-    // records) so `page.records` keeps its natural order for pagination.
-    let mut rec_refs: Vec<&Record> = tab
-        .page
-        .records
-        .iter()
-        .filter(|r| tab.filter.as_ref().map(|f| record_matches_filter(r, f)).unwrap_or(true))
-        .collect();
-    if let Some(sort_col) = tab.sort_col {
-        rec_refs.sort_by(|a, b| compare_records(a, b, sort_col, tab.sort_dir));
-    }
+    let rec_refs = visible_records(tab);
 
     let rows: Vec<TableRow> = rec_refs
         .iter()
@@ -1341,8 +1532,13 @@ fn render_grid(f: &mut Frame, area: Rect, tab: &mut DataTab, is_focused: bool, t
                 let cell_str = val.display_str();
                 let is_cell_sel = is_row_sel && abs_col == tab.selected_col;
                 let is_col_sel = is_focused && abs_col == tab.selected_col;
+                // A search hit outranks the column highlight (but not the
+                // cursor) so matches stay findable while navigating.
+                let is_hit = cell_matches_search(val, &tab.search_query);
                 let cell_style = if is_cell_sel {
                     active_cell_style
+                } else if is_hit {
+                    theme.warning().add_modifier(Modifier::BOLD)
                 } else if is_row_sel {
                     row_highlight_style
                 } else if is_col_sel {
@@ -1902,6 +2098,101 @@ mod tests {
 
     fn record(values: Vec<Value>) -> Record {
         Record { values }
+    }
+
+    /// Minimal `DataTab` over `columns`/`records` for the display-order and
+    /// search helpers.
+    fn tab_with(columns: &[&str], records: Vec<Record>) -> DataTab {
+        DataTab {
+            collection: CollectionRef {
+                namespace: Namespace("main".to_string()),
+                name: "t".to_string(),
+            },
+            page: RecordPage {
+                columns: columns.iter().map(|c| c.to_string()).collect(),
+                records,
+                page: 0,
+                page_size: 50,
+                total_records: None,
+            },
+            selected_row: 0,
+            selected_col: 0,
+            scroll_offset_x: 0,
+            column_meta: Vec::new(),
+            sort_col: None,
+            sort_dir: SortDir::Asc,
+            filter: None,
+            filter_editing: false,
+            filter_buffer: String::new(),
+            read_only: false,
+            grid_hit_area: None,
+            grid_col_starts: Vec::new(),
+            row_detail: false,
+            row_detail_scroll: 0,
+            search_query: String::new(),
+            search_editing: false,
+            search_buffer: String::new(),
+        }
+    }
+
+    #[test]
+    fn test_cell_matches_search_is_case_insensitive_on_displayed_text() {
+        assert!(cell_matches_search(&Value::String("Ada".into()), "ada"));
+        assert!(cell_matches_search(&Value::String("ada".into()), "AD"));
+        assert!(cell_matches_search(&Value::Int(1234), "23"));
+        // NULL is searchable by what the grid actually shows.
+        assert!(cell_matches_search(&Value::Null, "null"));
+        assert!(!cell_matches_search(&Value::String("bob".into()), "ada"));
+        // An empty query must never match, or every cell would light up.
+        assert!(!cell_matches_search(&Value::String("bob".into()), ""));
+    }
+
+    #[test]
+    fn test_search_matches_uses_display_order_not_storage_order() {
+        let mut tab = tab_with(
+            &["id", "name"],
+            vec![
+                record(vec![Value::Int(1), Value::String("zoe".into())]),
+                record(vec![Value::Int(2), Value::String("ada".into())]),
+            ],
+        );
+        tab.search_query = "ada".to_string();
+        // Natural order: "ada" is the second row.
+        assert_eq!(search_matches(&tab), vec![(1, 1)]);
+
+        // Sorted by name, "ada" moves to the top — the match must follow the
+        // rows the user can actually see.
+        tab.sort_col = Some(1);
+        assert_eq!(search_matches(&tab), vec![(0, 1)]);
+
+        // No query -> no matches at all.
+        tab.search_query.clear();
+        assert!(search_matches(&tab).is_empty());
+    }
+
+    #[test]
+    fn test_visible_records_applies_filter_then_sort() {
+        let mut tab = tab_with(
+            &["id"],
+            vec![
+                record(vec![Value::Int(3)]),
+                record(vec![Value::Int(1)]),
+                record(vec![Value::Int(2)]),
+            ],
+        );
+        tab.sort_col = Some(0);
+        let ids: Vec<String> = visible_records(&tab)
+            .iter()
+            .map(|r| r.values[0].display_str())
+            .collect();
+        assert_eq!(ids, vec!["1", "2", "3"]);
+
+        tab.sort_dir = SortDir::Desc;
+        let ids: Vec<String> = visible_records(&tab)
+            .iter()
+            .map(|r| r.values[0].display_str())
+            .collect();
+        assert_eq!(ids, vec!["3", "2", "1"]);
     }
 
     #[test]

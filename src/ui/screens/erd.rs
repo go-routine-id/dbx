@@ -111,6 +111,85 @@ pub struct ErdTab {
     /// Index into `scene.scene.nodes` currently selected (click or Tab).
     /// Rendered with a highlighted border.
     pub selected_node: Option<usize>,
+    /// Mermaid `erDiagram` source for the current diagram — the portable
+    /// form used by the export, and what a reader can paste anywhere.
+    pub mermaid: String,
+}
+
+/// Render an `ErDiagram` back to Mermaid `erDiagram` source.
+///
+/// The scene only carries geometry, so this reads the model instead — which
+/// also means the export stays valid no matter how the view is panned.
+fn er_to_mermaid(er: &ErDiagram) -> String {
+    /// Mermaid writes cardinality from the perspective of each side, and the
+    /// left marker is mirrored.
+    fn card(c: Card, left: bool) -> &'static str {
+        match (c, left) {
+            (Card::One, _) => "||",
+            (Card::ZeroOne, true) => "|o",
+            (Card::ZeroOne, false) => "o|",
+            (Card::ZeroMany, true) => "}o",
+            (Card::ZeroMany, false) => "o{",
+            (Card::OneMany, true) => "}|",
+            (Card::OneMany, false) => "|{",
+        }
+    }
+    /// Mermaid identifiers can't contain dots or spaces; quote when needed.
+    fn ident(name: &str) -> String {
+        if name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            name.to_string()
+        } else {
+            format!("\"{}\"", name.replace('"', ""))
+        }
+    }
+
+    let mut out = String::from("erDiagram\n");
+    for e in &er.entities {
+        if e.attrs.is_empty() {
+            // An entity with no attributes still has to be declared.
+            out.push_str(&format!("    {}\n", ident(&e.name)));
+            continue;
+        }
+        out.push_str(&format!("    {} {{\n", ident(&e.name)));
+        for a in &e.attrs {
+            let keys: Vec<&str> = a
+                .keys
+                .iter()
+                .map(|k| match k {
+                    Key::Pk => "PK",
+                    Key::Fk => "FK",
+                    Key::Uk => "UK",
+                })
+                .collect();
+            // Mermaid takes multiple key markers space-separated ("PK UK");
+            // a comma-joined list is rejected by the parser.
+            let suffix = if keys.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", keys.join(" "))
+            };
+            // Mermaid types may not contain spaces (e.g. `character varying`).
+            let ty = a.ty.replace(' ', "_");
+            out.push_str(&format!("        {} {}{}\n", ty, a.name, suffix));
+        }
+        out.push_str("    }\n");
+    }
+    for r in &er.relations {
+        let (Some(from), Some(to)) = (er.entities.get(r.from), er.entities.get(r.to)) else {
+            continue;
+        };
+        let line = if r.identifying { "--" } else { ".." };
+        out.push_str(&format!(
+            "    {} {}{}{} {} : {}\n",
+            ident(&from.name),
+            card(r.card_from, true),
+            line,
+            card(r.card_to, false),
+            ident(&to.name),
+            r.label.clone().unwrap_or_else(|| "has".to_string())
+        ));
+    }
+    out
 }
 
 impl ErdTab {
@@ -125,6 +204,7 @@ impl ErdTab {
             last_error: None,
             last_canvas_area: None,
             selected_node: None,
+            mermaid: String::new(),
         }
     }
 
@@ -133,6 +213,9 @@ impl ErdTab {
     /// feed the model straight into flowmaid's scene.
     pub fn generate_from_meta(&mut self, collections: &[CollectionMeta]) {
         let er = build_er_diagram(collections);
+        // Keep the Mermaid text: it is the portable form of the diagram and
+        // the layout only keeps geometry, not the model.
+        self.mermaid = er_to_mermaid(&er);
         match layout(&er) {
             Ok(scene) => {
                 self.scene_w = scene.scene.width;
@@ -223,6 +306,27 @@ impl ErdTab {
                 .map(|r| r.height.saturating_sub(1).max(1))
                 .unwrap_or(10),
         )
+    }
+
+    /// Write the diagram out as `~/dbx_erd_<schema>.svg` + `.mmd`.
+    ///
+    /// The SVG comes from flowmaid's own renderer (so it matches the shape on
+    /// screen rather than being re-drawn), and the `.mmd` is the portable
+    /// source that pastes into any Mermaid-aware tool.
+    pub fn export_files(&self) -> Result<String, String> {
+        let scene = self
+            .scene
+            .as_ref()
+            .ok_or_else(|| "no diagram to export - press g to generate one first".to_string())?;
+
+        let stem = format!("dbx_erd_{}", self.namespace.0.replace(['/', ' '], "_"));
+        let svg =
+            crate::export::Exporter::save_to_file(&format!("~/{stem}.svg"), &er::to_svg(scene))
+                .map_err(|e| format!("{e:#}"))?;
+        let mmd = crate::export::Exporter::save_to_file(&format!("~/{stem}.mmd"), &self.mermaid)
+            .map_err(|e| format!("{e:#}"))?;
+
+        Ok(format!("{} + {}", svg.display(), mmd.display()))
     }
 
     /// Recentre the viewport (offset = 0,0, zoom = 1.0). Bound to `0` like
@@ -504,7 +608,7 @@ pub fn render_erd(
     draw_edge_text(buf, scene, canvas_area, vx, vy, pcol, prow);
 
     let status = format!(
-        " hjkl/arrows pan · 0 reset · +/- zoom ({:.2}x) · click node = menu · offset ({:.0}, {:.0})px · scene {}x{} ",
+        " hjkl/arrows pan · 0 reset · +/- zoom ({:.2}x) · click node = menu · E export svg/mmd · offset ({:.0}, {:.0})px · scene {}x{} ",
         erd.view.zoom, erd.view.ox, erd.view.oy, erd.scene_w as i64, erd.scene_h as i64
     );
     f.render_widget(Paragraph::new(status).style(theme.dim()), status_area);
@@ -942,6 +1046,45 @@ mod tests {
         let rel = &er.relations[0];
         assert_eq!(er.entities[rel.from].name, "other_ns.users");
         assert_eq!(er.entities[rel.to].name, "other");
+    }
+
+    #[test]
+    fn test_er_to_mermaid_round_trips_through_the_parser() {
+        let users = table(
+            "users",
+            vec![col("id", "int", true, false, true)],
+            vec![],
+        );
+        let orders = table(
+            "orders",
+            vec![col("user_id", "character varying", false, false, false)],
+            vec![ForeignKeyMeta {
+                name: "fk".to_string(),
+                column: "user_id".to_string(),
+                ref_namespace: Namespace("shop".to_string()),
+                ref_table: "users".to_string(),
+                ref_column: "id".to_string(),
+            }],
+        );
+        let er = build_er_diagram(&[users, orders]);
+        let src = er_to_mermaid(&er);
+
+        assert!(src.starts_with("erDiagram"), "got {src}");
+        assert!(src.contains("users {"), "entities missing: {src}");
+        assert!(src.contains("PK"), "key markers missing: {src}");
+        // Mermaid types cannot contain spaces.
+        assert!(!src.contains("character varying"), "unescaped type: {src}");
+        assert!(src.contains("character_varying"), "type not escaped: {src}");
+
+        // The real contract: flowmaid must be able to parse what we emit.
+        let mut tab = ErdTab::new(Namespace("shop".to_string()));
+        tab.generate_from_mermaid(&src);
+        assert!(
+            tab.last_error.is_none(),
+            "emitted source failed to parse: {:?}",
+            tab.last_error
+        );
+        assert!(tab.scene.is_some());
     }
 
     #[test]
