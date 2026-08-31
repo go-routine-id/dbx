@@ -285,7 +285,10 @@ chmod +x dbx && sudo mv dbx /usr/local/bin/
 curl -L -o dbx https://github.com/go-routine-id/dbx/releases/latest/download/dbx-linux-x86_64
 chmod +x dbx && sudo mv dbx /usr/local/bin/
 
-<span class="c"># Windows — x64: download dbx-windows-x86_64.exe, rename ke dbx.exe, taruh di PATH</span></pre>
+<span class="c"># Windows — x64: download dbx-windows-x86_64.exe, rename ke dbx.exe, taruh di PATH</span>
+
+<span class="c"># Upgrade later — no re-download by hand</span>
+dbx --self-update</pre>
     <p style="text-align:center;color:var(--ink-faint);font-size:13px;margin-top:12px">macOS Gatekeeper? Jalankan <code class="inline" style="color:var(--gold-light)">xattr -d com.apple.quarantine /usr/local/bin/dbx</code></p>
     <div class="pills reveal">
       <span class="pill">Rust</span>

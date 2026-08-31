@@ -49,6 +49,16 @@ dbx
 
 Press `a` to add a connection, `t` to test-ping it, then `Enter` to connect.
 
+### Upgrade
+
+```bash
+dbx --self-update
+```
+
+Downloads the latest release for your platform and swaps it in place. If the
+binary lives in a root-owned directory, re-run it with `sudo`. Your config
+(`~/.config/dbx/config.toml`) is untouched.
+
 ## Features
 
 | | Feature |
@@ -64,6 +74,7 @@ Press `a` to add a connection, `t` to test-ping it, then `Enter` to connect.
 | ✅ | Contextual autocomplete (tables, columns, keywords) with `Tab` to accept |
 | ✅ | Saved query collections + per-connection query history |
 | ✅ | SQLite support — point a connection at a `.db` file, no server needed |
+| ✅ | Startup update check + in-place `dbx --self-update` |
 | 🚧 | SQL Server (architecture ready, driver not implemented) |
 
 The ERD renderer uses [flowmaid](https://github.com/go-routine-id/flowmaid)
