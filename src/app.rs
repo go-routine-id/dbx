@@ -1065,6 +1065,12 @@ pub struct App {
     theme: Theme,
     toasts: Toasts,
     help_open: bool,
+    /// First binding shown in the help popup; the list is longer than a normal
+    /// terminal can display.
+    help_scroll: usize,
+    /// Full frame area from the last draw — the help popup needs it to know
+    /// how many bindings actually fit before clamping the scroll.
+    last_frame_area: Option<Rect>,
     should_quit: bool,
 
     // Screen S1 / P5 state
@@ -1115,6 +1121,8 @@ impl App {
             theme: Theme::dark(),
             toasts: Toasts::default(),
             help_open: false,
+            help_scroll: 0,
+            last_frame_area: None,
             should_quit: false,
             selected_connection: 0,
             form_modal: None,
@@ -1577,10 +1585,35 @@ impl App {
             return;
         }
 
-        // If help is open, Esc or ? closes it
+        // Help owns every key while open: Esc/? closes, the rest scrolls the
+        // (longer than one screen) binding list.
         if self.help_open {
-            if key.code == KeyCode::Esc || key.code == KeyCode::Char('?') {
-                self.help_open = false;
+            let bindings: &[(&str, &str)] = if matches!(self.mode, ScreenMode::Connected) {
+                &EXPLORER_HELP_BINDINGS
+            } else {
+                &PICKER_HELP_BINDINGS
+            };
+            let area = self.last_frame_area.unwrap_or_default();
+            let per_screen = crate::ui::widgets::help::visible_rows(area, bindings);
+            let max_scroll = bindings.len().saturating_sub(per_screen);
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('?') => {
+                    self.help_open = false;
+                    self.help_scroll = 0;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.help_scroll = (self.help_scroll + 1).min(max_scroll);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown => {
+                    self.help_scroll = (self.help_scroll + per_screen).min(max_scroll);
+                }
+                KeyCode::PageUp => {
+                    self.help_scroll = self.help_scroll.saturating_sub(per_screen);
+                }
+                _ => {}
             }
             return;
         }
@@ -3336,6 +3369,7 @@ impl App {
 
     fn draw(&mut self, f: &mut ratatui::Frame, spinner: &Spinner) {
         let area = f.area();
+        self.last_frame_area = Some(area);
         let theme = &self.theme;
 
         // Paint background base. When a blocking form-modal test is in flight, dim
@@ -3442,7 +3476,7 @@ impl App {
                 ScreenMode::Picker => ("Connection Picker", &PICKER_HELP_BINDINGS[..]),
                 ScreenMode::Connected => ("Database Explorer", &EXPLORER_HELP_BINDINGS[..]),
             };
-            help::render(f, area, title, bindings, theme);
+            help::render(f, area, title, bindings, self.help_scroll, theme);
         }
     }
 }
