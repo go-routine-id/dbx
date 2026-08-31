@@ -62,6 +62,9 @@ pub struct QueryConsole {
     pub watch_interval: Option<std::time::Duration>,
     /// When the watched query last executed.
     pub last_run: Option<std::time::Instant>,
+    /// First editor line drawn. The editor pane is only a few rows tall, so a
+    /// query of any real length needs the view to follow the cursor.
+    pub editor_scroll: usize,
 }
 
 /// Interval cycled through by `Ctrl+W`, in seconds. `None` (off) is the
@@ -186,6 +189,7 @@ impl QueryConsole {
             result_col_starts: Vec::new(),
             watch_interval: None,
             last_run: None,
+            editor_scroll: 0,
         }
     }
 
@@ -293,6 +297,35 @@ impl QueryConsole {
             self.lines[self.cursor_row].push_str(&current_line);
             self.cursor_col = prev_char_count;
         }
+    }
+
+    /// Forward delete: removes the character the cursor sits before, and
+    /// joins the next line when already at the end of one.
+    pub fn delete_forward(&mut self) {
+        let Some(line) = self.lines.get(self.cursor_row) else {
+            return;
+        };
+        let len = line.chars().count();
+        if self.cursor_col < len {
+            let mut chars: Vec<char> = line.chars().collect();
+            chars.remove(self.cursor_col);
+            self.lines[self.cursor_row] = chars.into_iter().collect();
+        } else if self.cursor_row + 1 < self.lines.len() {
+            let next = self.lines.remove(self.cursor_row + 1);
+            self.lines[self.cursor_row].push_str(&next);
+        }
+    }
+
+    pub fn move_line_start(&mut self) {
+        self.cursor_col = 0;
+    }
+
+    pub fn move_line_end(&mut self) {
+        self.cursor_col = self
+            .lines
+            .get(self.cursor_row)
+            .map(|l| l.chars().count())
+            .unwrap_or(0);
     }
 
     pub fn move_cursor_left(&mut self) {
@@ -979,7 +1012,7 @@ fn render_console_popup(f: &mut Frame, area: Rect, popup: &ConsolePopup, theme: 
 fn render_editor(
     f: &mut Frame,
     area: Rect,
-    console: &QueryConsole,
+    console: &mut QueryConsole,
     is_tab_focused: bool,
     theme: &Theme,
 ) {
@@ -990,7 +1023,7 @@ fn render_editor(
         theme.border()
     };
 
-    let title = format!(" SQL Editor: {} [Ctrl+Enter/F5 to execute] ", console.title);
+    let title = format!(" SQL Editor: {} [F5 / Ctrl+Enter / Alt+Enter to run] ", console.title);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -1001,8 +1034,22 @@ fn render_editor(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
+    // Keep the cursor inside the visible window before drawing it.
+    let visible = inner.height as usize;
+    let mut top = console.editor_scroll.min(console.cursor_row);
+    if console.cursor_row >= top + visible {
+        top = console.cursor_row + 1 - visible;
+    }
+    console.editor_scroll = top;
+
     let mut lines = Vec::new();
-    for (r_idx, line_str) in console.lines.iter().enumerate() {
+    for (r_idx, line_str) in console
+        .lines
+        .iter()
+        .enumerate()
+        .skip(top)
+        .take(visible)
+    {
         let line_num_str = format!("{:>3} │ ", r_idx + 1);
         let mut spans = vec![Span::styled(line_num_str, theme.dim())];
 
@@ -1244,6 +1291,58 @@ mod tests {
         // Backspace
         console.backspace();
         assert_eq!(console.text(), "SELECT 1;\nWHERE ");
+    }
+
+    #[test]
+    fn test_delete_forward_and_line_motions() {
+        let mut c = QueryConsole::new("t.sql".to_string(), Some("SELECT 1\nFROM t"));
+        c.cursor_row = 0;
+        c.cursor_col = 0;
+
+        // End / Home walk the current line, not the buffer.
+        c.move_line_end();
+        assert_eq!(c.cursor_col, "SELECT 1".chars().count());
+        c.move_line_start();
+        assert_eq!(c.cursor_col, 0);
+
+        // Forward delete removes the char under the cursor.
+        c.delete_forward();
+        assert_eq!(c.text(), "ELECT 1\nFROM t");
+
+        // At end of line it joins the next one (and never panics at the very end).
+        c.move_line_end();
+        c.delete_forward();
+        assert_eq!(c.text(), "ELECT 1FROM t");
+        c.cursor_row = 0;
+        c.move_line_end();
+        c.delete_forward();
+        assert_eq!(c.text(), "ELECT 1FROM t", "delete at the very end is a no-op");
+    }
+
+    #[test]
+    fn test_editor_scroll_follows_the_cursor() {
+        // The editor pane is a few rows tall; a long query must not scroll the
+        // cursor out of sight (it used to render only the first lines).
+        let sql = (1..=30).map(|i| format!("-- line {i}")).collect::<Vec<_>>().join("\n");
+        let mut c = QueryConsole::new("t.sql".to_string(), Some(&sql));
+        assert_eq!(c.lines.len(), 30);
+        // `new` puts the cursor on the last line.
+        assert_eq!(c.cursor_row, 29);
+
+        // Mirrors the renderer's window calculation for an 8-row pane.
+        let visible = 8usize;
+        let mut top = c.editor_scroll.min(c.cursor_row);
+        if c.cursor_row >= top + visible {
+            top = c.cursor_row + 1 - visible;
+        }
+        c.editor_scroll = top;
+        assert!(
+            c.cursor_row >= c.editor_scroll && c.cursor_row < c.editor_scroll + visible,
+            "cursor {} outside window {}..{}",
+            c.cursor_row,
+            c.editor_scroll,
+            c.editor_scroll + visible
+        );
     }
 
     #[test]

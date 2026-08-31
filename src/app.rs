@@ -8,7 +8,8 @@ use std::time::{Duration, Instant};
 use anyhow::Context;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
+    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -1011,12 +1012,13 @@ const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-const EXPLORER_HELP_BINDINGS: [(&str, &str); 40] = [
+const EXPLORER_HELP_BINDINGS: [(&str, &str); 41] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
     ("Ctrl+T", "search all objects / jump to a table"),
-    ("Ctrl+Enter / F5", "execute SQL query in active console"),
+    ("Ctrl+Enter / Alt+Enter / F5", "execute SQL query in active console"),
+    ("Home / End (in editor)", "jump to start / end of line (also Ctrl+A / Ctrl+E)"),
     ("Ctrl+R", "reconnect after a dropped connection"),
     ("Ctrl+Shift+I", "import rows from a CSV file into the active table"),
     ("Alt+H", "open query history for this connection"),
@@ -2873,6 +2875,38 @@ impl App {
                                             c.backspace();
                                             refresh_autocomplete(c, &ac_tables, &ac_columns);
                                         }
+                                        KeyCode::Delete => {
+                                            c.delete_forward();
+                                            refresh_autocomplete(c, &ac_tables, &ac_columns);
+                                        }
+                                        // Home/End and their emacs equivalents,
+                                        // which terminals deliver more reliably.
+                                        KeyCode::Home => {
+                                            c.move_line_start();
+                                            c.autocomplete.clear();
+                                        }
+                                        KeyCode::End => {
+                                            c.move_line_end();
+                                            c.autocomplete.clear();
+                                        }
+                                        KeyCode::Char('a')
+                                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                        {
+                                            c.move_line_start();
+                                            c.autocomplete.clear();
+                                        }
+                                        KeyCode::Char('e')
+                                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                        {
+                                            c.move_line_end();
+                                            c.autocomplete.clear();
+                                        }
+                                        // A run chord is handled by the event
+                                        // loop; inserting a newline here too
+                                        // would leave a stray blank line.
+                                        KeyCode::Enter
+                                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                                                || key.modifiers.contains(KeyModifiers::ALT) => {}
                                         KeyCode::Enter => {
                                             c.insert_newline();
                                             c.autocomplete.clear();
@@ -3492,10 +3526,27 @@ impl TerminalGuard {
         // space) to open its DDL. `EnableMouseCapture` + `EnterAlternateScreen`
         // in one execute keeps the two terminal modes atomic.
         execute!(io::stdout(), EnableMouseCapture, EnterAlternateScreen)?;
+
+        // Without the enhanced keyboard protocol a terminal cannot report
+        // Ctrl+Enter at all — it arrives as a plain Enter, so the console's
+        // "run query" chord silently inserts a newline instead. Ask for it
+        // where the terminal supports it (kitty, Ghostty, WezTerm, foot);
+        // elsewhere F5 and Alt+Enter remain the way to run.
+        if matches!(crossterm::terminal::supports_keyboard_enhancement(), Ok(true)) {
+            let _ = execute!(
+                io::stdout(),
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                )
+            );
+        }
         Ok(guard)
     }
 
     fn restore() {
+        // Popping is harmless when nothing was pushed, and leaving the flags
+        // set would confuse the shell we hand the terminal back to.
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
         let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
         let _ = disable_raw_mode();
     }
@@ -4969,7 +5020,14 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             }
                         }
                     } else if exp.ddl_popup.is_none() && exp.focused_pane == FocusedPane::Workspace {
-                        let is_ctrl_enter = key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Enter;
+                        // Ctrl+Enter only reaches us on terminals that speak
+                        // the enhanced keyboard protocol, so Alt+Enter (a plain
+                        // ESC-prefixed CR) and F5 are kept as equals rather than
+                        // as second-class fallbacks.
+                        let is_run_chord = key.code == KeyCode::Enter
+                            && (key.modifiers.contains(KeyModifiers::CONTROL)
+                                || key.modifiers.contains(KeyModifiers::ALT));
+                        let is_ctrl_enter = is_run_chord;
                         let is_f5 = key.code == KeyCode::F(5);
 
                         // Don't run the query under a history/favorites popup —
