@@ -12,6 +12,12 @@ use ratatui::widgets::{
 use crate::driver::QueryResult;
 use crate::theme::Theme;
 
+/// Smallest useful editor: borders plus a few lines of SQL.
+const MIN_EDITOR_H: u16 = 6;
+
+/// Width of the editor's line-number gutter (`"  1 │ "`).
+const GUTTER_W: usize = 6;
+
 /// SQL keywords to highlight in the editor.
 const SQL_KEYWORDS: &[&str] = &[
     "SELECT", "FROM", "WHERE", "INSERT", "INTO", "UPDATE", "SET", "DELETE",
@@ -65,6 +71,8 @@ pub struct QueryConsole {
     /// First editor line drawn. The editor pane is only a few rows tall, so a
     /// query of any real length needs the view to follow the cursor.
     pub editor_scroll: usize,
+    /// First editor column drawn, for lines wider than the pane.
+    pub editor_scroll_x: usize,
 }
 
 /// Interval cycled through by `Ctrl+W`, in seconds. `None` (off) is the
@@ -190,6 +198,7 @@ impl QueryConsole {
             watch_interval: None,
             last_run: None,
             editor_scroll: 0,
+            editor_scroll_x: 0,
         }
     }
 
@@ -877,11 +886,18 @@ pub fn render_query_console(
     is_tab_focused: bool,
     theme: &Theme,
 ) {
+    // The editor grows with the query instead of sitting at a fixed height: a
+    // one-liner should not eat the result pane, and a 30-line query should not
+    // be squeezed into 8 rows. Always leaves room for the results.
+    let wanted = console.lines.len().saturating_add(2) as u16;
+    let max_editor = (area.height * 3 / 5).max(MIN_EDITOR_H);
+    let editor_h = wanted.clamp(MIN_EDITOR_H, max_editor);
+
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(10), // Editor Area (Top)
-            Constraint::Min(8),     // Result Grid / Info Area (Bottom)
+            Constraint::Length(editor_h), // Editor Area (Top)
+            Constraint::Min(5),           // Result Grid / Info Area (Bottom)
         ])
         .split(area);
 
@@ -1034,13 +1050,27 @@ fn render_editor(
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    // Keep the cursor inside the visible window before drawing it.
+    // Keep the cursor inside the visible window, vertically and horizontally,
+    // before drawing it. A long SELECT would otherwise run off the right edge
+    // and take the cursor with it.
     let visible = inner.height as usize;
     let mut top = console.editor_scroll.min(console.cursor_row);
     if console.cursor_row >= top + visible {
         top = console.cursor_row + 1 - visible;
     }
     console.editor_scroll = top;
+
+    let text_w = (inner.width as usize).saturating_sub(GUTTER_W) .max(1);
+    let mut left = console.editor_scroll_x.min(console.cursor_col);
+    if console.cursor_col >= left + text_w {
+        left = console.cursor_col + 1 - text_w;
+    }
+    console.editor_scroll_x = left;
+
+    /// Characters `[left, left + text_w)` of a line, as a String.
+    fn window(line: &str, left: usize, text_w: usize) -> String {
+        line.chars().skip(left).take(text_w).collect()
+    }
 
     let mut lines = Vec::new();
     for (r_idx, line_str) in console
@@ -1052,14 +1082,15 @@ fn render_editor(
     {
         let line_num_str = format!("{:>3} │ ", r_idx + 1);
         let mut spans = vec![Span::styled(line_num_str, theme.dim())];
+        let shown = window(line_str, left, text_w);
 
         if is_editor_focused && r_idx == console.cursor_row {
             // The cursor block sits on the char LEFT of the insertion point —
             // the one backspace removes — so what's highlighted is exactly
             // what the user can delete.
-            let chars: Vec<char> = line_str.chars().collect();
-            let char_count = chars.len();
-            let cur = console.cursor_col.min(char_count);
+            let chars: Vec<char> = shown.chars().collect();
+            // Cursor position translated into the visible window.
+            let cur = console.cursor_col.saturating_sub(left).min(chars.len());
             if cur > 0 {
                 let before: String = chars[..cur - 1].iter().collect();
                 let cursor_char: String = chars[cur - 1].to_string();
@@ -1077,10 +1108,10 @@ fn render_editor(
                     " ",
                     theme.selected().add_modifier(Modifier::REVERSED | Modifier::BOLD),
                 ));
-                spans.extend(highlight_sql_line(line_str, theme));
+                spans.extend(highlight_sql_line(&shown, theme));
             }
         } else {
-            spans.extend(highlight_sql_line(line_str, theme));
+            spans.extend(highlight_sql_line(&shown, theme));
         }
 
         lines.push(Line::from(spans));
@@ -1317,6 +1348,37 @@ mod tests {
         c.move_line_end();
         c.delete_forward();
         assert_eq!(c.text(), "ELECT 1FROM t", "delete at the very end is a no-op");
+    }
+
+    #[test]
+    fn test_editor_horizontal_window_keeps_the_cursor_visible() {
+        // A long single-line SELECT used to run off the right edge, taking the
+        // cursor with it — there was no horizontal scrolling at all.
+        let long = format!("SELECT {} FROM t", (1..=60).map(|i| format!("col{i}")).collect::<Vec<_>>().join(", "));
+        let mut c = QueryConsole::new("t.sql".to_string(), Some(&long));
+        c.move_line_end();
+        let width = 40usize; // text columns available after the gutter
+
+        // Mirrors the renderer's horizontal window calculation.
+        let mut left = c.editor_scroll_x.min(c.cursor_col);
+        if c.cursor_col >= left + width {
+            left = c.cursor_col + 1 - width;
+        }
+        c.editor_scroll_x = left;
+
+        assert!(c.cursor_col > width, "test needs a line wider than the pane");
+        assert!(
+            c.cursor_col >= c.editor_scroll_x && c.cursor_col < c.editor_scroll_x + width,
+            "cursor {} outside window {}..{}",
+            c.cursor_col,
+            c.editor_scroll_x,
+            c.editor_scroll_x + width
+        );
+
+        // Back at the start of the line the window must return to column 0.
+        c.move_line_start();
+        let left = c.editor_scroll_x.min(c.cursor_col);
+        assert_eq!(left, 0);
     }
 
     #[test]
