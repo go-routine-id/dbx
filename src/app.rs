@@ -2843,21 +2843,32 @@ impl App {
                     self.form_modal = None;
                 }
                 KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.focused_field == FormField::Driver => {
-                    form.driver = match form.driver {
-                        crate::config::DriverType::MySql => {
-                            if form.port == "3306" {
-                                form.port = "5432".to_string();
-                            }
-                            crate::config::DriverType::Postgres
-                        }
-                        crate::config::DriverType::Postgres => {
-                            if form.port == "5432" {
-                                form.port = "3306".to_string();
-                            }
-                            crate::config::DriverType::MySql
-                        }
-                        _ => crate::config::DriverType::MySql,
+                    use crate::config::DriverType;
+                    // Only the drivers that are actually implemented are
+                    // offered — SQL Server would just fail at connect time.
+                    const CYCLE: [DriverType; 3] =
+                        [DriverType::MySql, DriverType::Postgres, DriverType::Sqlite];
+                    let cur = CYCLE.iter().position(|d| *d == form.driver).unwrap_or(0);
+                    let delta = if key.code == KeyCode::Left {
+                        CYCLE.len() - 1
+                    } else {
+                        1
                     };
+                    let next = CYCLE[(cur + delta) % CYCLE.len()].clone();
+                    // Keep a port the user typed themselves; only replace one
+                    // that's still a driver default (or blank).
+                    let is_default_port = form.port.is_empty()
+                        || CYCLE.iter().any(|d| {
+                            d.default_port() != 0 && form.port == d.default_port().to_string()
+                        });
+                    if is_default_port {
+                        // SQLite is a file path — it has no port.
+                        form.port = match next.default_port() {
+                            0 => String::new(),
+                            p => p.to_string(),
+                        };
+                    }
+                    form.driver = next;
                 }
                 KeyCode::Backspace => {
                     let target_str = match form.focused_field {

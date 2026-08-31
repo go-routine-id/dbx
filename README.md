@@ -61,8 +61,10 @@ Press `a` to add a connection, `t` to test-ping it, then `Enter` to connect.
 | ✅ | In-place data editing: `Enter` to edit cell, `i` to insert row, `Backspace` to delete (with SQL preview) |
 | ✅ | `NULL` assignment via `Ctrl+N` on nullable columns |
 | ✅ | Confirm-before-delete for saved connections |
-| 🚧 | Contextual autocomplete (planned) |
-| 🚧 | SQL Server / SQLite (architecture ready, drivers not implemented) |
+| ✅ | Contextual autocomplete (tables, columns, keywords) with `Tab` to accept |
+| ✅ | Saved query collections + per-connection query history |
+| ✅ | SQLite support — point a connection at a `.db` file, no server needed |
+| 🚧 | SQL Server (architecture ready, driver not implemented) |
 
 The ERD renderer uses [flowmaid](https://github.com/go-routine-id/flowmaid)
 for automatic layout and crow's-foot geometry, painted into a
@@ -85,7 +87,7 @@ inside a terminal grid.
 | MySQL | ✅ implemented |
 | PostgreSQL | ✅ implemented |
 | SQL Server | 🚧 architecture ready (`DriverType` enum exists, no implementation) |
-| SQLite | 🚧 architecture ready (`DriverType` enum exists, no implementation) |
+| SQLite | ✅ implemented (file-based — set the file path in the `database` field) |
 
 All SQL is built through a generic helper layer (`quote_ident`,
 `single_row_suffix`, `render_*`, `build_where_for_row`, `build_insert_sql`)

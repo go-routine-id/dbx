@@ -3,6 +3,7 @@
 
 pub mod mysql;
 pub mod postgres;
+pub mod sqlite;
 
 use std::fmt;
 use std::sync::Arc;
@@ -238,7 +239,11 @@ pub async fn connect_driver(cfg: &ConnectionConfig) -> Result<Arc<dyn Driver>> {
             let drv = postgres::PostgresDriver::connect(cfg).await?;
             Ok(Arc::new(drv))
         }
-        DriverType::SqlServer | DriverType::Sqlite => {
+        DriverType::Sqlite => {
+            let drv = sqlite::SqliteDriver::connect(cfg).await?;
+            Ok(Arc::new(drv))
+        }
+        DriverType::SqlServer => {
             anyhow::bail!("driver '{:?}' is not yet supported", cfg.driver);
         }
     }

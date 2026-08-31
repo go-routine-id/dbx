@@ -282,7 +282,14 @@ pub fn render_form_modal(
             theme.dim()
         };
 
-        let label_str = format!("{:<10} : ", field.label());
+        // SQLite has no server: `database` carries the file path, so the
+        // label says so rather than the generic "Database".
+        let label_text = if field == FormField::Database && form.driver == DriverType::Sqlite {
+            "File path"
+        } else {
+            field.label()
+        };
+        let label_str = format!("{label_text:<10} : ");
         let mut spans = vec![Span::styled(label_str, label_style)];
 
         if field == FormField::Driver {
