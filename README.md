@@ -138,8 +138,10 @@ and the rest of the app just works.
 
 ### Mouse
 
-Mouse capture is enabled so you can click an ERD node to open its DDL, and
-click outside a popup to dismiss it. Consequence: **selecting/copying text in
+Mouse capture is enabled so you can click an ERD node to open its context
+menu, click a workspace tab to switch to it, and click outside a popup to
+dismiss it. Two-finger scrolling works in both axes: vertically it walks rows,
+horizontally it walks columns (and pans the ERD). Consequence: **selecting/copying text in
 the terminal requires holding `Shift`** (standard for TUI apps with mouse
 support). Mouse capture is released automatically when the app exits.
 

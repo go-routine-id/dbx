@@ -584,6 +584,35 @@ async fn run_console_query(
     }
 }
 
+/// Move a grid's column selection one step and keep it inside the rendered
+/// window. Shared by the h/l keys and horizontal scrolling so the viewport
+/// never desyncs from the selection.
+fn step_column(
+    selected: &mut usize,
+    scroll_x: &mut usize,
+    n_columns: usize,
+    area: Option<Rect>,
+    right: bool,
+) {
+    if n_columns == 0 {
+        return;
+    }
+    if right {
+        if *selected + 1 < n_columns {
+            *selected += 1;
+        }
+    } else {
+        *selected = selected.saturating_sub(1);
+    }
+    // Columns render at a 16-cell minimum, which is what decides how many fit.
+    let max_visible = area.map(|r| (r.width / 16).max(1) as usize).unwrap_or(6);
+    if *selected < *scroll_x {
+        *scroll_x = *selected;
+    } else if *selected >= *scroll_x + max_visible {
+        *scroll_x = selected.saturating_sub(max_visible - 1);
+    }
+}
+
 /// Read every table's structure in `ns`. Errors on individual tables are
 /// skipped rather than failing the whole comparison — a diff over the tables
 /// we could read is more useful than no diff at all.
@@ -1208,6 +1237,24 @@ impl App {
                 if let Some(tab) = exp.active_tab_mut() {
                     match tab {
                         WorkspaceTab::Table(t) => {
+                            // Horizontal scroll (two-finger swipe) walks the
+                            // columns, mirroring how vertical scroll walks rows.
+                            if let Some(area) = t.grid_hit_area
+                                && !is_vertical
+                                && mouse.column >= area.x
+                                && mouse.column < area.x + area.width
+                                && mouse.row >= area.y
+                                && mouse.row < area.y + area.height
+                            {
+                                step_column(
+                                    &mut t.selected_col,
+                                    &mut t.scroll_offset_x,
+                                    t.page.columns.len(),
+                                    t.grid_hit_area,
+                                    matches!(mouse.kind, MouseEventKind::ScrollRight),
+                                );
+                                focus_workspace = true;
+                            }
                             if let Some(area) = t.grid_hit_area
                                 && is_vertical
                                 && mouse.column >= area.x
@@ -1236,6 +1283,24 @@ impl App {
                             }
                         }
                         WorkspaceTab::Console(c) => {
+                            if let Some(area) = c.result_hit_area
+                                && !is_vertical
+                                && mouse.column >= area.x
+                                && mouse.column < area.x + area.width
+                                && mouse.row >= area.y
+                                && mouse.row < area.y + area.height
+                            {
+                                let n = c.last_result.as_ref().map(|r| r.columns.len()).unwrap_or(0);
+                                step_column(
+                                    &mut c.result_selected_col,
+                                    &mut c.result_scroll_x,
+                                    n,
+                                    c.result_hit_area,
+                                    matches!(mouse.kind, MouseEventKind::ScrollRight),
+                                );
+                                c.focused_subpane = ConsoleSubpane::Result;
+                                focus_workspace = true;
+                            }
                             if let Some(area) = c.result_hit_area
                                 && is_vertical
                                 && mouse.column >= area.x
@@ -2646,28 +2711,22 @@ impl App {
                                         t.selected_row = t.selected_row.saturating_sub(page_rows);
                                     }
                                     KeyCode::Left | KeyCode::Char('h') => {
-                                        if t.selected_col > 0 {
-                                            t.selected_col -= 1;
-                                            if t.selected_col < t.scroll_offset_x {
-                                                t.scroll_offset_x = t.selected_col;
-                                            }
-                                        }
+                                        step_column(
+                                            &mut t.selected_col,
+                                            &mut t.scroll_offset_x,
+                                            t.page.columns.len(),
+                                            t.grid_hit_area,
+                                            false,
+                                        );
                                     }
                                     KeyCode::Right | KeyCode::Char('l') => {
-                                        if !t.page.columns.is_empty() && t.selected_col < t.page.columns.len() - 1 {
-                                            t.selected_col += 1;
-                                            // Keep the selected column inside the
-                                            // rendered window (matches the grid's
-                                            // max_visible, not a hardcoded +6).
-                                            let max_visible = t
-                                                .grid_hit_area
-                                                .map(|r| (r.width / 16).max(1) as usize)
-                                                .unwrap_or(6);
-                                            if t.selected_col >= t.scroll_offset_x + max_visible {
-                                                t.scroll_offset_x =
-                                                    t.selected_col.saturating_sub(max_visible - 1);
-                                            }
-                                        }
+                                        step_column(
+                                            &mut t.selected_col,
+                                            &mut t.scroll_offset_x,
+                                            t.page.columns.len(),
+                                            t.grid_hit_area,
+                                            true,
+                                        );
                                     }
                                     KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                         if let Some(row) = t.page.records.get(t.selected_row) {
@@ -3099,22 +3158,32 @@ impl App {
                                                 .saturating_sub(page_rows);
                                         }
                                         KeyCode::Left | KeyCode::Char('h') => {
-                                            if c.result_selected_col > 0 {
-                                                c.result_selected_col -= 1;
-                                                if c.result_selected_col < c.result_scroll_x {
-                                                    c.result_scroll_x = c.result_selected_col;
-                                                }
-                                            }
+                                            let n = c
+                                                .last_result
+                                                .as_ref()
+                                                .map(|r| r.columns.len())
+                                                .unwrap_or(0);
+                                            step_column(
+                                                &mut c.result_selected_col,
+                                                &mut c.result_scroll_x,
+                                                n,
+                                                c.result_hit_area,
+                                                false,
+                                            );
                                         }
                                         KeyCode::Right | KeyCode::Char('l') => {
-                                            if let Some(res) = &c.last_result {
-                                                if !res.columns.is_empty() && c.result_selected_col < res.columns.len() - 1 {
-                                                    c.result_selected_col += 1;
-                                                    if c.result_selected_col >= c.result_scroll_x + 6 {
-                                                        c.result_scroll_x = c.result_selected_col.saturating_sub(5);
-                                                    }
-                                                }
-                                            }
+                                            let n = c
+                                                .last_result
+                                                .as_ref()
+                                                .map(|r| r.columns.len())
+                                                .unwrap_or(0);
+                                            step_column(
+                                                &mut c.result_selected_col,
+                                                &mut c.result_scroll_x,
+                                                n,
+                                                c.result_hit_area,
+                                                true,
+                                            );
                                         }
                                         KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                             if let Some(res) = &c.last_result {
@@ -5631,6 +5700,51 @@ mod tests {
 
     fn row(values: Vec<Value>) -> Record {
         Record { values }
+    }
+
+    #[test]
+    fn test_step_column_keeps_selection_inside_the_window() {
+        // Grid 80 cells wide -> 5 columns of 16 fit at a time.
+        let area = Some(Rect::new(0, 0, 80, 20));
+        let (mut sel, mut scroll) = (0usize, 0usize);
+
+        // Walking right past the window edge drags the viewport along.
+        for _ in 0..6 {
+            step_column(&mut sel, &mut scroll, 12, area, true);
+        }
+        assert_eq!(sel, 6);
+        assert!(
+            sel >= scroll && sel < scroll + 5,
+            "selection {sel} outside window {scroll}..{}",
+            scroll + 5
+        );
+
+        // Walking back left pulls it back.
+        for _ in 0..6 {
+            step_column(&mut sel, &mut scroll, 12, area, false);
+        }
+        assert_eq!((sel, scroll), (0, 0));
+    }
+
+    #[test]
+    fn test_step_column_clamps_at_both_ends() {
+        let area = Some(Rect::new(0, 0, 80, 20));
+        let (mut sel, mut scroll) = (0usize, 0usize);
+
+        // Left at column 0 stays put rather than underflowing.
+        step_column(&mut sel, &mut scroll, 3, area, false);
+        assert_eq!(sel, 0);
+
+        // Right stops on the last column.
+        for _ in 0..10 {
+            step_column(&mut sel, &mut scroll, 3, area, true);
+        }
+        assert_eq!(sel, 2);
+
+        // No columns at all is a no-op, not a panic.
+        let (mut sel, mut scroll) = (0usize, 0usize);
+        step_column(&mut sel, &mut scroll, 0, area, true);
+        assert_eq!((sel, scroll), (0, 0));
     }
 
     #[test]
