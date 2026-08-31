@@ -113,6 +113,35 @@ impl Driver for PostgresDriver {
             | Capabilities::ERD
             | Capabilities::EXPLAIN
             | Capabilities::EDIT_DATA
+            | Capabilities::PROCESS_LIST
+    }
+
+    /// Active backends from `pg_stat_activity`, excluding this connection and
+    /// idle sessions — only work actually in flight is worth showing.
+    async fn process_list(&self) -> Result<QueryResult> {
+        let sql = "\
+            SELECT pid, usename AS user, datname AS database, state, \
+                   EXTRACT(EPOCH FROM (now() - query_start))::bigint AS seconds, \
+                   query \
+            FROM pg_stat_activity \
+            WHERE pid <> pg_backend_pid() AND state <> 'idle' \
+            ORDER BY query_start";
+        self.execute(&Namespace("public".to_string()), sql).await
+    }
+
+    async fn kill_process(&self, id: &str) -> Result<()> {
+        let pid: i32 = id
+            .trim()
+            .parse()
+            .with_context(|| format!("'{id}' is not a PostgreSQL pid"))?;
+        // Cancel (not terminate): stops the query but keeps the session, which
+        // is the conservative choice for someone else's connection.
+        sqlx::query("SELECT pg_cancel_backend($1)")
+            .bind(pid)
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("failed to cancel backend {pid}"))?;
+        Ok(())
     }
 
     async fn ping(&self) -> Result<Duration> {

@@ -24,6 +24,8 @@ bitflags::bitflags! {
         const ERD        = 1 << 3;
         const EDIT_DATA  = 1 << 4;
         const EXPLAIN    = 1 << 5;
+        /// Can list (and cancel) the server's currently running queries.
+        const PROCESS_LIST = 1 << 6;
     }
 }
 
@@ -223,6 +225,24 @@ pub trait Driver: Send + Sync {
         Ok(Vec::new())
     }
     /// Source / DDL of a stored routine.
+    /// Sessions/queries currently running on the server, newest first.
+    ///
+    /// Defaults to empty so a driver without the notion (SQLite is a local
+    /// file — there is no server to inspect) needs no implementation.
+    async fn process_list(&self) -> Result<QueryResult> {
+        Ok(QueryResult {
+            columns: Vec::new(),
+            records: Vec::new(),
+            rows_affected: 0,
+            execution_time: Duration::ZERO,
+        })
+    }
+
+    /// Cancel one running query by its server-side id.
+    async fn kill_process(&self, _id: &str) -> Result<()> {
+        anyhow::bail!("this driver cannot cancel running queries")
+    }
+
     async fn routine_definition(&self, _c: &CollectionRef) -> Result<String> {
         anyhow::bail!("this driver does not expose routine definitions")
     }

@@ -111,7 +111,34 @@ impl Driver for MySqlDriver {
             | Capabilities::DDL
             | Capabilities::ERD
             | Capabilities::EXPLAIN
+            | Capabilities::PROCESS_LIST
             | Capabilities::EDIT_DATA
+    }
+
+    /// Running threads from `information_schema.PROCESSLIST`, excluding this
+    /// connection and sleeping sessions.
+    async fn process_list(&self) -> Result<QueryResult> {
+        let sql = "\
+            SELECT ID AS pid, USER AS user, DB AS `database`, COMMAND AS state, \
+                   TIME AS seconds, INFO AS query \
+            FROM information_schema.PROCESSLIST \
+            WHERE ID <> CONNECTION_ID() AND COMMAND <> 'Sleep' \
+            ORDER BY TIME DESC";
+        self.execute(&Namespace("information_schema".to_string()), sql)
+            .await
+    }
+
+    async fn kill_process(&self, id: &str) -> Result<()> {
+        let pid: u64 = id
+            .trim()
+            .parse()
+            .with_context(|| format!("'{id}' is not a MySQL thread id"))?;
+        // KILL QUERY ends the statement but leaves the connection alive.
+        sqlx::query(AssertSqlSafe(format!("KILL QUERY {pid}")))
+            .execute(&self.pool)
+            .await
+            .with_context(|| format!("failed to kill query on thread {pid}"))?;
+        Ok(())
     }
 
     async fn ping(&self) -> Result<Duration> {

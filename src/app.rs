@@ -982,7 +982,7 @@ const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-const EXPLORER_HELP_BINDINGS: [(&str, &str); 37] = [
+const EXPLORER_HELP_BINDINGS: [(&str, &str); 38] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
@@ -1016,6 +1016,7 @@ const EXPLORER_HELP_BINDINGS: [(&str, &str); 37] = [
     ("Ctrl+W (in console)", "cycle auto re-run: off / 1s / 5s / 15s / 60s"),
     ("Ctrl+P (in console)", "EXPLAIN the query and show the plan tree"),
     ("f (on an FK cell)", "open the row this foreign key references"),
+    ("Ctrl+K", "list running queries (x cancels, r refreshes)"),
     ("i", "open INSERT-row modal — fill fields, server applies DEFAULT for skipped"),
     ("F1", "view table DDL schema popup"),
     ("n / p", "next / previous page in data grid"),
@@ -1140,6 +1141,7 @@ impl App {
                         || e.create_object_modal.is_some()
                         || e.erd_menu.is_some()
                         || e.explain_plan.is_some()
+                        || e.process_list.is_some()
                 })
                 .unwrap_or(false);
             if modal_open {
@@ -4246,6 +4248,105 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             }
                         } else {
                             exp.import_csv_modal = None;
+                        }
+                        continue;
+                    }
+
+                    // Running-query monitor: open with Ctrl+K, then x cancels
+                    // the highlighted query and r refreshes the snapshot.
+                    if exp.process_list.is_some() {
+                        match key.code {
+                            KeyCode::Esc => {
+                                exp.process_list = None;
+                                continue;
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if let Some(p) = exp.process_list.as_mut() {
+                                    p.selected = p.selected.saturating_sub(1);
+                                }
+                                continue;
+                            }
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if let Some(p) = exp.process_list.as_mut() {
+                                    p.selected = (p.selected + 1)
+                                        .min(p.result.records.len().saturating_sub(1));
+                                }
+                                continue;
+                            }
+                            KeyCode::Char('x') | KeyCode::Char('X') => {
+                                let pid = exp.process_list.as_ref().and_then(|p| p.selected_pid());
+                                match pid {
+                                    Some(pid) => match drv.kill_process(&pid).await {
+                                        Ok(_) => {
+                                            app.toasts.push(
+                                                ToastKind::Success,
+                                                format!("cancelled query {pid}"),
+                                            );
+                                            // Re-read so the list reflects it.
+                                            if let Ok(res) = drv.process_list().await {
+                                                exp.process_list = Some(
+                                                    crate::ui::screens::explorer::ProcessListState {
+                                                        selected: 0,
+                                                        result: res,
+                                                    },
+                                                );
+                                            }
+                                        }
+                                        Err(e) => app
+                                            .toasts
+                                            .push(ToastKind::Error, format!("cancel failed: {e:#}")),
+                                    },
+                                    None => app.toasts.push(
+                                        ToastKind::Warning,
+                                        "no query selected".to_string(),
+                                    ),
+                                }
+                                continue;
+                            }
+                            KeyCode::Char('r') | KeyCode::Char('R') => {
+                                match drv.process_list().await {
+                                    Ok(res) => {
+                                        exp.process_list = Some(
+                                            crate::ui::screens::explorer::ProcessListState {
+                                                selected: 0,
+                                                result: res,
+                                            },
+                                        )
+                                    }
+                                    Err(e) => app
+                                        .toasts
+                                        .push(ToastKind::Error, format!("refresh failed: {e:#}")),
+                                }
+                                continue;
+                            }
+                            _ => continue,
+                        }
+                    }
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('k')
+                    {
+                        if !exp
+                            .driver_capabilities
+                            .contains(crate::driver::Capabilities::PROCESS_LIST)
+                        {
+                            app.toasts.push(
+                                ToastKind::Warning,
+                                "this driver has no server-side query list".to_string(),
+                            );
+                            continue;
+                        }
+                        match drv.process_list().await {
+                            Ok(res) => {
+                                exp.process_list =
+                                    Some(crate::ui::screens::explorer::ProcessListState {
+                                        selected: 0,
+                                        result: res,
+                                    })
+                            }
+                            Err(e) => app.toasts.push(
+                                ToastKind::Error,
+                                format!("failed to list running queries: {e:#}"),
+                            ),
                         }
                         continue;
                     }

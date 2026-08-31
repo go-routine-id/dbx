@@ -60,6 +60,25 @@ pub struct SqlConfirmModalState {
     pub row_idx: usize,
 }
 
+/// Snapshot of the server's running queries.
+#[derive(Clone, Debug)]
+pub struct ProcessListState {
+    pub result: crate::driver::QueryResult,
+    pub selected: usize,
+}
+
+impl ProcessListState {
+    /// Server-side id of the highlighted row, used to cancel it.
+    pub fn selected_pid(&self) -> Option<String> {
+        let idx = self
+            .result
+            .columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case("pid"))?;
+        Some(self.result.records.get(self.selected)?.values.get(idx)?.display_str())
+    }
+}
+
 /// A parsed query plan, shown as a tree over the console.
 #[derive(Clone, Debug)]
 pub struct ExplainPlanState {
@@ -489,6 +508,8 @@ pub struct ExplorerState {
     pub erd_menu: Option<ErdMenuState>,
     /// Query-plan overlay (`Ctrl+P` in a console).
     pub explain_plan: Option<ExplainPlanState>,
+    /// Running-query monitor (`Ctrl+K`).
+    pub process_list: Option<ProcessListState>,
     /// Rect of the ERD context menu as last painted — lets a mouse click pick
     /// the item under the cursor.
     pub erd_menu_area: Option<Rect>,
@@ -538,6 +559,7 @@ impl ExplorerState {
             erd_menu: None,
             erd_menu_area: None,
             explain_plan: None,
+            process_list: None,
             driver_capabilities,
             tab_starts: Vec::new(),
             tab_bar_area: None,
@@ -685,6 +707,10 @@ pub fn render_explorer(
         render_row_detail(f, area, tab, theme);
     }
 
+    if let Some(procs) = &state.process_list {
+        render_process_list(f, area, procs, theme);
+    }
+
     if let Some(plan) = &state.explain_plan {
         render_explain_plan(f, area, plan, theme);
     }
@@ -802,6 +828,102 @@ fn render_row_detail(f: &mut Frame, area: Rect, tab: &DataTab, theme: &Theme) {
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(hint, theme.dim()))),
+        chunks[1],
+    );
+}
+
+/// Running queries, one per line, with the longest-running highlighted.
+fn render_process_list(f: &mut Frame, area: Rect, procs: &ProcessListState, theme: &Theme) {
+    let width = 100.min(area.width.saturating_sub(4));
+    let height = 20.min(area.height.saturating_sub(2));
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent())
+        .style(theme.panel())
+        .title(format!(
+            " Running Queries ({}) ",
+            procs.result.records.len()
+        ));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    if procs.result.records.is_empty() {
+        f.render_widget(
+            Paragraph::new(Span::styled(
+                "  nothing running right now",
+                theme.dim(),
+            )),
+            chunks[0],
+        );
+    } else {
+        let col = |name: &str| {
+            procs
+                .result
+                .columns
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(name))
+        };
+        let (pid_i, user_i, secs_i, query_i) =
+            (col("pid"), col("user"), col("seconds"), col("query"));
+
+        let visible = chunks[0].height as usize;
+        let start = procs.selected.saturating_sub(visible / 2);
+        let mut lines = Vec::new();
+        for (i, rec) in procs
+            .result
+            .records
+            .iter()
+            .enumerate()
+            .skip(start)
+            .take(visible)
+        {
+            let get = |idx: Option<usize>| {
+                idx.and_then(|i| rec.values.get(i))
+                    .map(|v| v.display_str())
+                    .unwrap_or_default()
+            };
+            let secs = get(secs_i);
+            // A query running for a while is the one worth looking at.
+            let is_slow = secs.parse::<f64>().map(|s| s >= 5.0).unwrap_or(false);
+            let is_sel = i == procs.selected;
+            let style = if is_sel {
+                theme.selected()
+            } else if is_slow {
+                theme.warning()
+            } else {
+                theme.base()
+            };
+            let query = get(query_i).replace(['\n', '\r'], " ");
+            lines.push(Line::from(vec![
+                Span::styled(if is_sel { "▶ " } else { "  " }, theme.accent()),
+                Span::styled(format!("{:>8} ", get(pid_i)), theme.dim()),
+                Span::styled(format!("{:>5}s ", secs), if is_slow { theme.warning() } else { theme.dim() }),
+                Span::styled(format!("{:<12} ", get(user_i)), theme.dim()),
+                Span::styled(query, style),
+            ]));
+        }
+        f.render_widget(Paragraph::new(lines), chunks[0]);
+    }
+
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ↑/↓ select · x cancel query · r refresh · Esc close ",
+            theme.dim(),
+        ))),
         chunks[1],
     );
 }
