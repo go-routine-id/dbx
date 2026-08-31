@@ -607,6 +607,130 @@ fn step_column(
     }
 }
 
+/// Open (or toggle) whatever the tree has selected: expand a schema, open a
+/// table/view as a data tab, or show a routine/sequence definition.
+///
+/// Shared by Enter/Space and by a mouse click, so clicking a table does the
+/// same thing as selecting it and pressing Enter.
+async fn open_tree_node(
+    exp: &mut crate::ui::screens::explorer::ExplorerState,
+    drv: &Arc<dyn crate::driver::Driver>,
+    toasts: &mut Toasts,
+    page_size: u64,
+) {
+    if let Some(node) = exp.selected_node() {
+        match &node.kind {
+            TreeNodeKind::Database(ns) => {
+                let ns_clone = ns.clone();
+                let is_expanded = node.is_expanded;
+                // Fetch every object type the first time this
+                // schema is expanded — and retry on re-expand
+                // (no permanent gate on `tables`), so a transient
+                // view/routine listing failure is re-attempted.
+                if !is_expanded {
+                    if let Some(n) = exp.tree_nodes.iter_mut().find(|n| match &n.kind {
+                        TreeNodeKind::Database(d) => d == &ns_clone,
+                        _ => false,
+                    }) {
+                        n.is_loading = true;
+                    }
+                    let drv_clone = drv.clone();
+                    // 4 round trips in parallel instead of serial.
+                    let (tables, views, routines, seqs) = tokio::join!(
+                        drv_clone.collections(&ns_clone),
+                        drv_clone.list_views(&ns_clone),
+                        drv_clone.list_routines(&ns_clone),
+                        drv_clone.list_sequences(&ns_clone),
+                    );
+                    if let Ok(t) = tables {
+                        exp.tables.insert(ns_clone.0.clone(), t);
+                    }
+                    if let Ok(v) = views {
+                        exp.views.insert(ns_clone.0.clone(), v);
+                    }
+                    if let Ok(r) = routines {
+                        exp.routines.insert(ns_clone.0.clone(), r);
+                    }
+                    if let Ok(s) = seqs {
+                        exp.sequences.insert(ns_clone.0.clone(), s);
+                    }
+                    if let Some(n) = exp.tree_nodes.iter_mut().find(|n| match &n.kind {
+                        TreeNodeKind::Database(d) => d == &ns_clone,
+                        _ => false,
+                    }) {
+                        n.is_loading = false;
+                    }
+                }
+                if let Some(n) = exp.tree_nodes.iter_mut().find(|n| match &n.kind {
+                    TreeNodeKind::Database(d) => d == &ns_clone,
+                    _ => false,
+                }) {
+                    n.is_expanded = !is_expanded;
+                }
+                exp.rebuild_tree_nodes();
+
+                // Restore selection index to the toggled database item
+                if let Some(new_idx) = exp.tree_nodes.iter().position(|n| match &n.kind {
+                    TreeNodeKind::Database(d) => d == &ns_clone,
+                    _ => false,
+                }) {
+                    exp.selected_tree_index = new_idx;
+                }
+            }
+            TreeNodeKind::View(cref) => {
+                // A view opens like a table (SELECT *).
+                if let Err(e) = open_collection_tab(
+                    exp,
+                    drv,
+                    cref.clone(),
+                    page_size,
+                    true, // views are read-only
+                )
+                .await
+                {
+                    toasts.push(ToastKind::Error, format!("failed to load view: {e}"));
+                }
+            }
+            TreeNodeKind::Routine(cref) => {
+                let cref_clone = cref.clone();
+                let drv_clone = drv.clone();
+                match drv_clone.routine_definition(&cref_clone).await {
+                    Ok(ddl) => {
+                        exp.ddl_popup = Some((cref_clone, ddl));
+                    }
+                    Err(e) => {
+                        toasts.push(ToastKind::Error, format!("failed to fetch routine: {e:#}"));
+                    }
+                }
+            }
+            TreeNodeKind::Sequence(cref) => {
+                // Sequences have no body to render — show a stub so the
+                // user at least sees the object resolved.
+                exp.ddl_popup = Some((
+                    cref.clone(),
+                    format!("SEQUENCE {}.{}", cref.namespace, cref.name),
+                ));
+            }
+            // A section divider is a label; there
+            // is nothing to open.
+            TreeNodeKind::Section(..) => {}
+            TreeNodeKind::Table(cref, _, _) => {
+                if let Err(e) = open_collection_tab(
+                    exp,
+                    drv,
+                    cref.clone(),
+                    page_size,
+                    false,
+                )
+                .await
+                {
+                    toasts.push(ToastKind::Error, format!("failed to load table: {e}"));
+                }
+            }
+        }
+    }
+}
+
 /// Read every table's structure in `ns`. Errors on individual tables are
 /// skipped rather than failing the whole comparison — a diff over the tables
 /// we could read is more useful than no diff at all.
@@ -1520,6 +1644,12 @@ impl App {
                 if idx < exp.tree_nodes.len() {
                     exp.selected_tree_index = exp.snap_to_selectable(idx);
                     exp.focused_pane = FocusedPane::Tree;
+                    // A click opens the node outright — selecting it and then
+                    // asking for a second keypress is a step nobody wants.
+                    if let Some(drv) = self.active_driver.clone() {
+                        let page_size = self.config.effective_page_size();
+                        open_tree_node(exp, &drv, &mut self.toasts, page_size).await;
+                    }
                     return Ok(());
                 }
             }
@@ -4833,117 +4963,8 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 continue;
                             }
                             KeyCode::Char(' ') | KeyCode::Enter => {
-                                if let Some(node) = exp.selected_node() {
-                                    match &node.kind {
-                                        TreeNodeKind::Database(ns) => {
-                                            let ns_clone = ns.clone();
-                                            let is_expanded = node.is_expanded;
-                                            // Fetch every object type the first time this
-                                            // schema is expanded — and retry on re-expand
-                                            // (no permanent gate on `tables`), so a transient
-                                            // view/routine listing failure is re-attempted.
-                                            if !is_expanded {
-                                                if let Some(n) = exp.tree_nodes.iter_mut().find(|n| match &n.kind {
-                                                    TreeNodeKind::Database(d) => d == &ns_clone,
-                                                    _ => false,
-                                                }) {
-                                                    n.is_loading = true;
-                                                }
-                                                let drv_clone = drv.clone();
-                                                // 4 round trips in parallel instead of serial.
-                                                let (tables, views, routines, seqs) = tokio::join!(
-                                                    drv_clone.collections(&ns_clone),
-                                                    drv_clone.list_views(&ns_clone),
-                                                    drv_clone.list_routines(&ns_clone),
-                                                    drv_clone.list_sequences(&ns_clone),
-                                                );
-                                                if let Ok(t) = tables {
-                                                    exp.tables.insert(ns_clone.0.clone(), t);
-                                                }
-                                                if let Ok(v) = views {
-                                                    exp.views.insert(ns_clone.0.clone(), v);
-                                                }
-                                                if let Ok(r) = routines {
-                                                    exp.routines.insert(ns_clone.0.clone(), r);
-                                                }
-                                                if let Ok(s) = seqs {
-                                                    exp.sequences.insert(ns_clone.0.clone(), s);
-                                                }
-                                                if let Some(n) = exp.tree_nodes.iter_mut().find(|n| match &n.kind {
-                                                    TreeNodeKind::Database(d) => d == &ns_clone,
-                                                    _ => false,
-                                                }) {
-                                                    n.is_loading = false;
-                                                }
-                                            }
-                                            if let Some(n) = exp.tree_nodes.iter_mut().find(|n| match &n.kind {
-                                                TreeNodeKind::Database(d) => d == &ns_clone,
-                                                _ => false,
-                                            }) {
-                                                n.is_expanded = !is_expanded;
-                                            }
-                                            exp.rebuild_tree_nodes();
-
-                                            // Restore selection index to the toggled database item
-                                            if let Some(new_idx) = exp.tree_nodes.iter().position(|n| match &n.kind {
-                                                TreeNodeKind::Database(d) => d == &ns_clone,
-                                                _ => false,
-                                            }) {
-                                                exp.selected_tree_index = new_idx;
-                                            }
-                                        }
-                                        TreeNodeKind::View(cref) => {
-                                            // A view opens like a table (SELECT *).
-                                            if let Err(e) = open_collection_tab(
-                                                exp,
-                                                drv,
-                                                cref.clone(),
-                                                app.config.effective_page_size(),
-                                                true, // views are read-only
-                                            )
-                                            .await
-                                            {
-                                                app.toasts.push(ToastKind::Error, format!("failed to load view: {e}"));
-                                            }
-                                        }
-                                        TreeNodeKind::Routine(cref) => {
-                                            let cref_clone = cref.clone();
-                                            let drv_clone = drv.clone();
-                                            match drv_clone.routine_definition(&cref_clone).await {
-                                                Ok(ddl) => {
-                                                    exp.ddl_popup = Some((cref_clone, ddl));
-                                                }
-                                                Err(e) => {
-                                                    app.toasts.push(ToastKind::Error, format!("failed to fetch routine: {e:#}"));
-                                                }
-                                            }
-                                        }
-                                        TreeNodeKind::Sequence(cref) => {
-                                            // Sequences have no body to render — show a stub so the
-                                            // user at least sees the object resolved.
-                                            exp.ddl_popup = Some((
-                                                cref.clone(),
-                                                format!("SEQUENCE {}.{}", cref.namespace, cref.name),
-                                            ));
-                                        }
-                                        // A section divider is a label; there
-                                        // is nothing to open.
-                                        TreeNodeKind::Section(..) => {}
-                                        TreeNodeKind::Table(cref, _, _) => {
-                                            if let Err(e) = open_collection_tab(
-                                                exp,
-                                                drv,
-                                                cref.clone(),
-                                                app.config.effective_page_size(),
-                                                false,
-                                            )
-                                            .await
-                                            {
-                                                app.toasts.push(ToastKind::Error, format!("failed to load table: {e}"));
-                                            }
-                                        }
-                                    }
-                                }
+                                let page_size = app.config.effective_page_size();
+                                open_tree_node(exp, drv, &mut app.toasts, page_size).await;
                             }
                             KeyCode::Char('e') => {
                                 // Edit schema (ALTER). Gated on the DDL
