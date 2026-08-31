@@ -466,14 +466,8 @@ async fn run_console_query(
     conn_name: Option<&String>,
 ) {
     // Find active database from selected tree node or fallback to first namespace
-    let active_ns = if let Some(node) = exp.selected_node() {
-        match &node.kind {
-            TreeNodeKind::Database(ns) => ns.clone(),
-            TreeNodeKind::Table(cref, _, _) => cref.namespace.clone(),
-            TreeNodeKind::View(cref) => cref.namespace.clone(),
-            TreeNodeKind::Routine(cref) => cref.namespace.clone(),
-            TreeNodeKind::Sequence(cref) => cref.namespace.clone(),
-        }
+    let active_ns = if let Some(ns) = exp.selected_node().and_then(|n| n.kind.namespace()) {
+        ns.clone()
     } else {
         exp.namespaces.first().cloned().unwrap_or(crate::driver::Namespace("mysql".to_string()))
     };
@@ -1228,7 +1222,8 @@ impl App {
                         && mouse.row >= area.y
                         && mouse.row < area.y + area.height
                     {
-                        step_selection(&mut exp.selected_tree_index, exp.tree_nodes.len(), up);
+                        exp.selected_tree_index =
+                            exp.next_selectable(exp.selected_tree_index, if up { -1 } else { 1 });
                         return Ok(());
                     }
                 }
@@ -1523,7 +1518,7 @@ impl App {
             {
                 let idx = (mouse.row - area.y) as usize + exp.tree_scroll;
                 if idx < exp.tree_nodes.len() {
-                    exp.selected_tree_index = idx;
+                    exp.selected_tree_index = exp.snap_to_selectable(idx);
                     exp.focused_pane = FocusedPane::Tree;
                     return Ok(());
                 }
@@ -2443,8 +2438,9 @@ impl App {
                                     .map(|r| (r.height as usize).saturating_sub(1))
                                     .unwrap_or(10)
                                     .max(1);
-                                exp.selected_tree_index = (exp.selected_tree_index + page_rows)
+                                let target = (exp.selected_tree_index + page_rows)
                                     .min(exp.tree_nodes.len() - 1);
+                                exp.selected_tree_index = exp.snap_to_selectable(target);
                             }
                         }
                         KeyCode::PageUp => {
@@ -2453,8 +2449,8 @@ impl App {
                                 .map(|r| (r.height as usize).saturating_sub(1))
                                 .unwrap_or(10)
                                 .max(1);
-                            exp.selected_tree_index =
-                                exp.selected_tree_index.saturating_sub(page_rows);
+                            let target = exp.selected_tree_index.saturating_sub(page_rows);
+                            exp.selected_tree_index = exp.snap_to_selectable(target);
                         }
                         _ => {}
                     },
@@ -4518,13 +4514,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 };
                                 let Some(ns) = exp
                                     .selected_node()
-                                    .map(|n| match &n.kind {
-                                        TreeNodeKind::Database(ns) => ns.clone(),
-                                        TreeNodeKind::Table(c, _, _)
-                                        | TreeNodeKind::View(c)
-                                        | TreeNodeKind::Routine(c)
-                                        | TreeNodeKind::Sequence(c) => c.namespace.clone(),
-                                    })
+                                    .and_then(|n| n.kind.namespace().cloned())
                                     .or_else(|| exp.namespaces.first().cloned())
                                 else {
                                     app.toasts.push(
@@ -4723,13 +4713,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         }
                         let ns = exp
                             .selected_node()
-                            .map(|n| match &n.kind {
-                                TreeNodeKind::Database(ns) => ns.clone(),
-                                TreeNodeKind::Table(c, _, _)
-                                | TreeNodeKind::View(c)
-                                | TreeNodeKind::Routine(c)
-                                | TreeNodeKind::Sequence(c) => c.namespace.clone(),
-                            })
+                            .and_then(|n| n.kind.namespace().cloned())
                             .or_else(|| exp.namespaces.first().cloned());
                         let Some(ns) = ns else {
                             app.toasts
@@ -4942,6 +4926,9 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                                 format!("SEQUENCE {}.{}", cref.namespace, cref.name),
                                             ));
                                         }
+                                        // A section divider is a label; there
+                                        // is nothing to open.
+                                        TreeNodeKind::Section(..) => {}
                                         TreeNodeKind::Table(cref, _, _) => {
                                             if let Err(e) = open_collection_tab(
                                                 exp,
@@ -5003,7 +4990,9 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                         | TreeNodeKind::View(cref)
                                         | TreeNodeKind::Routine(cref)
                                         | TreeNodeKind::Sequence(cref) => cref.clone(),
-                                        TreeNodeKind::Database(_) => continue,
+                                        TreeNodeKind::Database(_) | TreeNodeKind::Section(..) => {
+                                            continue;
+                                        }
                                     };
                                     let drv_clone = drv.clone();
                                     let def: Result<String, String> = match &node.kind {
@@ -5046,12 +5035,8 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                     continue;
                                 }
                                 if let Some(node) = exp.selected_node() {
-                                    let target_ns = match &node.kind {
-                                        TreeNodeKind::Database(ns) => ns.clone(),
-                                        TreeNodeKind::Table(cref, _, _) => cref.namespace.clone(),
-                                        TreeNodeKind::View(cref) => cref.namespace.clone(),
-                                        TreeNodeKind::Routine(cref) => cref.namespace.clone(),
-                                        TreeNodeKind::Sequence(cref) => cref.namespace.clone(),
+                                    let Some(target_ns) = node.kind.namespace().cloned() else {
+                                        continue;
                                     };
 
                                     if let Some(existing_idx) = exp.tabs.iter().position(|t| match t {

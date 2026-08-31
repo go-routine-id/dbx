@@ -244,6 +244,30 @@ pub enum TreeNodeKind {
     View(CollectionRef),
     Routine(CollectionRef),
     Sequence(CollectionRef),
+    /// A non-selectable divider that groups the objects under a schema
+    /// ("Tables", "Views", ...). Grouping without another level of expanding
+    /// keeps everything one keypress away while still being scannable.
+    Section(&'static str, usize),
+}
+
+impl TreeNodeKind {
+    /// Section headers are labels, not destinations: navigation skips them so
+    /// arrow keys never land on a row that cannot be opened.
+    pub fn is_selectable(&self) -> bool {
+        !matches!(self, TreeNodeKind::Section(..))
+    }
+
+    /// Schema this node belongs to; `None` for a section divider.
+    pub fn namespace(&self) -> Option<&Namespace> {
+        match self {
+            TreeNodeKind::Database(ns) => Some(ns),
+            TreeNodeKind::Table(c, _, _)
+            | TreeNodeKind::View(c)
+            | TreeNodeKind::Routine(c)
+            | TreeNodeKind::Sequence(c) => Some(&c.namespace),
+            TreeNodeKind::Section(..) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -590,6 +614,44 @@ impl ExplorerState {
         }
     }
 
+    /// Next selectable row from `from` in `dir` (+1 / -1), skipping section
+    /// dividers. Returns `from` when there is nothing selectable that way, so
+    /// the selection never lands on a label or runs off the list.
+    pub fn next_selectable(&self, from: usize, dir: isize) -> usize {
+        let n = self.tree_nodes.len();
+        if n == 0 {
+            return 0;
+        }
+        let mut i = from as isize;
+        loop {
+            i += dir;
+            if i < 0 || i as usize >= n {
+                return from;
+            }
+            if self.tree_nodes[i as usize].kind.is_selectable() {
+                return i as usize;
+            }
+        }
+    }
+
+    /// Nearest selectable row at or after `from`, used after a rebuild or a
+    /// click so the selection is never parked on a divider.
+    pub fn snap_to_selectable(&self, from: usize) -> usize {
+        if self
+            .tree_nodes
+            .get(from)
+            .map(|n| n.kind.is_selectable())
+            .unwrap_or(false)
+        {
+            return from;
+        }
+        let forward = self.next_selectable(from, 1);
+        if forward != from {
+            return forward;
+        }
+        self.next_selectable(from, -1)
+    }
+
     pub fn rebuild_tree_nodes(&mut self) {
         let mut nodes = Vec::new();
         for ns in &self.namespaces {
@@ -610,6 +672,14 @@ impl ExplorerState {
             });
 
             if is_expanded {
+                let tables = self.tables.get(&ns.0).map(|v| v.len()).unwrap_or(0);
+                if tables > 0 {
+                    nodes.push(TreeNode {
+                        kind: TreeNodeKind::Section("Tables", tables),
+                        is_expanded: false,
+                        is_loading: false,
+                    });
+                }
                 if let Some(tbls) = self.tables.get(&ns.0) {
                     for tbl in tbls {
                         nodes.push(TreeNode {
@@ -638,13 +708,27 @@ impl ExplorerState {
                         });
                     }
                 };
+                // Each group is announced by a divider only when it has
+                // members, so an empty section never costs a row.
+                let section = |nodes: &mut Vec<TreeNode>, label: &'static str, n: usize| {
+                    if n > 0 {
+                        nodes.push(TreeNode {
+                            kind: TreeNodeKind::Section(label, n),
+                            is_expanded: false,
+                            is_loading: false,
+                        });
+                    }
+                };
                 if let Some(views) = self.views.get(&ns.0) {
+                    section(&mut nodes, "Views", views.len());
                     push_objects(&mut nodes, views, TreeNodeKind::View);
                 }
                 if let Some(routines) = self.routines.get(&ns.0) {
+                    section(&mut nodes, "Routines", routines.len());
                     push_objects(&mut nodes, routines, TreeNodeKind::Routine);
                 }
                 if let Some(seqs) = self.sequences.get(&ns.0) {
+                    section(&mut nodes, "Sequences", seqs.len());
                     push_objects(&mut nodes, seqs, TreeNodeKind::Sequence);
                 }
             }
@@ -1601,6 +1685,17 @@ fn render_tree(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme: &The
         let node = &state.tree_nodes[i];
         let is_sel = i == sel && is_focused;
         let line = match &node.kind {
+            // A rule that names the group and how many are in it, so the list
+            // stays scannable without another level of expanding.
+            TreeNodeKind::Section(label, count) => {
+                let head = format!("  {label} ({count}) ");
+                let rule_w = (area.width as usize)
+                    .saturating_sub(head.chars().count() + 3);
+                Line::from(vec![
+                    Span::styled(head, theme.accent().add_modifier(Modifier::BOLD)),
+                    Span::styled("─".repeat(rule_w), theme.dim()),
+                ])
+            }
             TreeNodeKind::Database(ns) => {
                 let prefix = if node.is_loading {
                     "⏳ "
@@ -2581,6 +2676,100 @@ mod tests {
             .map(|r| r.values[0].display_str())
             .collect();
         assert_eq!(ids, vec!["3", "2", "1"]);
+    }
+
+    fn coll(name: &str) -> Collection {
+        Collection {
+            name: name.to_string(),
+            estimated_row_count: None,
+            estimated_size_bytes: None,
+        }
+    }
+
+    /// Explorer with one expanded schema holding one of each object type.
+    fn expanded_state() -> ExplorerState {
+        let ns = Namespace("shop".to_string());
+        let mut st = ExplorerState::new(vec![ns.clone()], crate::driver::Capabilities::all());
+        st.tables.insert(ns.0.clone(), vec![coll("users"), coll("orders")]);
+        st.views.insert(ns.0.clone(), vec![coll("active_users")]);
+        st.routines.insert(ns.0.clone(), vec![coll("calc")]);
+        st.tree_nodes[0].is_expanded = true;
+        st.rebuild_tree_nodes();
+        st
+    }
+
+    #[test]
+    fn test_tree_groups_objects_under_section_dividers() {
+        let st = expanded_state();
+        let kinds: Vec<String> = st
+            .tree_nodes
+            .iter()
+            .map(|n| match &n.kind {
+                TreeNodeKind::Database(d) => format!("db:{}", d.0),
+                TreeNodeKind::Section(l, c) => format!("== {l} ({c})"),
+                TreeNodeKind::Table(c, _, _) => format!("table:{}", c.name),
+                TreeNodeKind::View(c) => format!("view:{}", c.name),
+                TreeNodeKind::Routine(c) => format!("routine:{}", c.name),
+                TreeNodeKind::Sequence(c) => format!("seq:{}", c.name),
+            })
+            .collect();
+
+        assert_eq!(
+            kinds,
+            vec![
+                "db:shop",
+                "== Tables (2)",
+                "table:users",
+                "table:orders",
+                "== Views (1)",
+                "view:active_users",
+                "== Routines (1)",
+                "routine:calc",
+            ]
+        );
+        // Sequences are empty here, so no divider is spent on them.
+        assert!(!kinds.iter().any(|k| k.contains("Sequences")));
+    }
+
+    #[test]
+    fn test_navigation_steps_over_section_dividers() {
+        let st = expanded_state();
+        // Walking down from the schema must land on a table, never a label.
+        let mut i = 0;
+        let mut visited = Vec::new();
+        for _ in 0..8 {
+            let next = st.next_selectable(i, 1);
+            if next == i {
+                break;
+            }
+            i = next;
+            visited.push(i);
+            assert!(
+                st.tree_nodes[i].kind.is_selectable(),
+                "navigation landed on a divider at {i}"
+            );
+        }
+        // Every real object is reachable (2 tables + 1 view + 1 routine).
+        assert_eq!(visited.len(), 4);
+
+        // And back up again, still skipping labels.
+        while st.next_selectable(i, -1) != i {
+            i = st.next_selectable(i, -1);
+            assert!(st.tree_nodes[i].kind.is_selectable());
+        }
+        assert_eq!(i, 0, "should walk all the way back to the schema row");
+    }
+
+    #[test]
+    fn test_snap_to_selectable_never_parks_on_a_divider() {
+        let st = expanded_state();
+        // Index 1 is the "Tables" divider; a click or page jump there must
+        // resolve to a real row.
+        assert!(matches!(st.tree_nodes[1].kind, TreeNodeKind::Section(..)));
+        let snapped = st.snap_to_selectable(1);
+        assert!(st.tree_nodes[snapped].kind.is_selectable());
+        // A row that is already fine is left alone.
+        assert_eq!(st.snap_to_selectable(2), 2);
     }
 
     #[test]
