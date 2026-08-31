@@ -400,7 +400,9 @@ async fn open_collection_tab(
         .records(&cref, Page { offset: 0, limit: page_size })
         .await
         .map_err(|e| format!("{e:#}"))?;
-    let column_meta = meta_res.map(|m| m.columns).unwrap_or_default();
+    let (column_meta, foreign_keys) = meta_res
+        .map(|m| (m.columns, m.foreign_keys))
+        .unwrap_or_default();
     // Feed the console autocomplete with this table's column names.
     exp.column_cache.insert(
         format!("{}.{}", cref.namespace, cref.name),
@@ -413,6 +415,7 @@ async fn open_collection_tab(
         selected_col: 0,
         scroll_offset_x: 0,
         column_meta,
+        foreign_keys,
         sort_col: None,
         sort_dir: crate::ui::screens::explorer::SortDir::Asc,
         filter: None,
@@ -979,7 +982,7 @@ const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-const EXPLORER_HELP_BINDINGS: [(&str, &str); 36] = [
+const EXPLORER_HELP_BINDINGS: [(&str, &str); 37] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
@@ -1012,6 +1015,7 @@ const EXPLORER_HELP_BINDINGS: [(&str, &str); 36] = [
     ("E (in ERD tab)", "export the diagram as ~/dbx_erd_<schema>.svg + .mmd"),
     ("Ctrl+W (in console)", "cycle auto re-run: off / 1s / 5s / 15s / 60s"),
     ("Ctrl+P (in console)", "EXPLAIN the query and show the plan tree"),
+    ("f (on an FK cell)", "open the row this foreign key references"),
     ("i", "open INSERT-row modal — fill fields, server applies DEFAULT for skipped"),
     ("F1", "view table DDL schema popup"),
     ("n / p", "next / previous page in data grid"),
@@ -4745,6 +4749,63 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                                 "cannot delete: no row selected or no columns to identify it".to_string(),
                                             );
                                         }
+                                    }
+                                }
+                                // `f` on a foreign-key cell opens the row it
+                                // references. A console tab (rather than a
+                                // filtered table tab) is used so the parent row
+                                // is found even when it sits on a later page.
+                                KeyCode::Char('f') | KeyCode::Char('F')
+                                    if active_is_table
+                                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    let plan: Option<(String, String)> = (|| {
+                                        let WorkspaceTab::Table(t) = exp.active_tab()? else {
+                                            return None;
+                                        };
+                                        let col = t.page.columns.get(t.selected_col)?;
+                                        let fk = t.foreign_keys.iter().find(|f| &f.column == col)?;
+                                        let row = crate::ui::screens::explorer::visible_records(t)
+                                            .get(t.selected_row)
+                                            .copied()?;
+                                        let value = row.values.get(t.selected_col)?;
+                                        // A NULL foreign key references nothing.
+                                        if matches!(value, crate::driver::Value::Null) {
+                                            return None;
+                                        }
+                                        let driver_name = drv.info().name.clone();
+                                        let q_ns = quote_ident(&fk.ref_namespace.0, &driver_name);
+                                        let q_tbl = quote_ident(&fk.ref_table, &driver_name);
+                                        let q_col = quote_ident(&fk.ref_column, &driver_name);
+                                        let literal = render_value_sql(value);
+                                        Some((
+                                            format!("{}.{}", fk.ref_table, fk.ref_column),
+                                            format!(
+                                                "SELECT * FROM {q_ns}.{q_tbl} WHERE {q_col} = {literal};"
+                                            ),
+                                        ))
+                                    })();
+                                    match plan {
+                                        Some((target, sql)) => {
+                                            let title = format!("→ {target}");
+                                            exp.tabs.push(WorkspaceTab::Console(
+                                                QueryConsole::new(title, Some(&sql)),
+                                            ));
+                                            exp.active_tab_index = exp.tabs.len().saturating_sub(1);
+                                            exp.focused_pane = FocusedPane::Workspace;
+                                            run_console_query(
+                                                exp,
+                                                drv,
+                                                &mut app.toasts,
+                                                &mut app.config,
+                                                app.active_connection_name.as_ref(),
+                                            )
+                                            .await;
+                                        }
+                                        None => app.toasts.push(
+                                            ToastKind::Info,
+                                            "not a foreign-key cell (or the value is NULL)".to_string(),
+                                        ),
                                     }
                                 }
                                 // `i` → open the INSERT-row modal. All fields start

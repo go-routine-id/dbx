@@ -245,6 +245,9 @@ pub struct DataTab {
     /// Empty for tabs opened before this field existed or for query-console
     /// tabs that don't bind to a single table.
     pub column_meta: Vec<ColumnMeta>,
+    /// Foreign keys of this table, kept so a cell can jump to the row it
+    /// references (`f`). Same source as `column_meta`.
+    pub foreign_keys: Vec<crate::driver::ForeignKeyMeta>,
     /// Active client-side sort (column index into `page.columns`) + direction.
     /// `None` = natural order.
     pub sort_col: Option<usize>,
@@ -2233,6 +2236,7 @@ mod tests {
             selected_col: 0,
             scroll_offset_x: 0,
             column_meta: Vec::new(),
+            foreign_keys: Vec::new(),
             sort_col: None,
             sort_dir: SortDir::Asc,
             filter: None,
