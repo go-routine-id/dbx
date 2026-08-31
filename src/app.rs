@@ -1011,7 +1011,7 @@ const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-const EXPLORER_HELP_BINDINGS: [(&str, &str); 39] = [
+const EXPLORER_HELP_BINDINGS: [(&str, &str); 40] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
@@ -1045,6 +1045,7 @@ const EXPLORER_HELP_BINDINGS: [(&str, &str); 39] = [
     ("Ctrl+W (in console)", "cycle auto re-run: off / 1s / 5s / 15s / 60s"),
     ("Ctrl+P (in console)", "EXPLAIN the query and show the plan tree"),
     ("f (on an FK cell)", "open the row this foreign key references"),
+    ("F (on any cell)", "find every row in the schema that references it"),
     ("Ctrl+K", "list running queries (x cancels, r refreshes)"),
     ("Alt+D", "compare this schema with another saved connection"),
     ("i", "open INSERT-row modal — fill fields, server applies DEFAULT for skipped"),
@@ -5048,7 +5049,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 // references. A console tab (rather than a
                                 // filtered table tab) is used so the parent row
                                 // is found even when it sits on a later page.
-                                KeyCode::Char('f') | KeyCode::Char('F')
+                                KeyCode::Char('f')
                                     if active_is_table
                                         && !key.modifiers.contains(KeyModifiers::CONTROL) =>
                                 {
@@ -5100,6 +5101,107 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                             "not a foreign-key cell (or the value is NULL)".to_string(),
                                         ),
                                     }
+                                }
+                                // `F` is the reverse of `f`: find every row in
+                                // this schema that points AT the selected one.
+                                // Referencing tables are unknown up front, so
+                                // the whole schema's metadata is scanned once.
+                                KeyCode::Char('F')
+                                    if active_is_table
+                                        && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                {
+                                    let here: Option<(crate::driver::CollectionRef, String, String)> =
+                                        (|| {
+                                            let WorkspaceTab::Table(t) = exp.active_tab()? else {
+                                                return None;
+                                            };
+                                            let col = t.page.columns.get(t.selected_col)?.clone();
+                                            let row =
+                                                crate::ui::screens::explorer::visible_records(t)
+                                                    .get(t.selected_row)
+                                                    .copied()?;
+                                            let value = row.values.get(t.selected_col)?;
+                                            // NULL is referenced by nothing.
+                                            if matches!(value, crate::driver::Value::Null) {
+                                                return None;
+                                            }
+                                            Some((
+                                                t.collection.clone(),
+                                                col,
+                                                render_value_sql(value),
+                                            ))
+                                        })();
+                                    let Some((cref, col, literal)) = here else {
+                                        app.toasts.push(
+                                            ToastKind::Info,
+                                            "select a non-NULL cell to find references to it"
+                                                .to_string(),
+                                        );
+                                        continue;
+                                    };
+
+                                    app.toasts.push(
+                                        ToastKind::Info,
+                                        format!("scanning {} for references...", cref.namespace.0),
+                                    );
+                                    let driver_name = drv.info().name.clone();
+                                    let metas = collect_schema(drv, &cref.namespace).await;
+                                    // Every (child table, child column) whose FK
+                                    // targets the cell we're standing on.
+                                    let refs: Vec<(String, String)> = metas
+                                        .iter()
+                                        .flat_map(|m| {
+                                            m.foreign_keys
+                                                .iter()
+                                                .filter(|fk| {
+                                                    fk.ref_table == cref.name && fk.ref_column == col
+                                                })
+                                                .map(|fk| {
+                                                    (m.reference.name.clone(), fk.column.clone())
+                                                })
+                                                .collect::<Vec<_>>()
+                                        })
+                                        .collect();
+
+                                    if refs.is_empty() {
+                                        app.toasts.push(
+                                            ToastKind::Info,
+                                            format!("nothing references {}.{col}", cref.name),
+                                        );
+                                        continue;
+                                    }
+
+                                    // One statement per referencing table: the
+                                    // console already shows multi-statement runs
+                                    // as separate result sets ([ / ] to switch).
+                                    let q_ns = quote_ident(&cref.namespace.0, &driver_name);
+                                    let sql = refs
+                                        .iter()
+                                        .map(|(table, fk_col)| {
+                                            format!(
+                                                "SELECT * FROM {q_ns}.{} WHERE {} = {literal};",
+                                                quote_ident(table, &driver_name),
+                                                quote_ident(fk_col, &driver_name)
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join("\n");
+
+                                    let title = format!("← refs to {}.{col}", cref.name);
+                                    exp.tabs.push(WorkspaceTab::Console(QueryConsole::new(
+                                        title,
+                                        Some(&sql),
+                                    )));
+                                    exp.active_tab_index = exp.tabs.len().saturating_sub(1);
+                                    exp.focused_pane = FocusedPane::Workspace;
+                                    run_console_query(
+                                        exp,
+                                        drv,
+                                        &mut app.toasts,
+                                        &mut app.config,
+                                        app.active_connection_name.as_ref(),
+                                    )
+                                    .await;
                                 }
                                 // `i` → open the INSERT-row modal. All fields start
                                 // in the "skip" state so the user can opt in to

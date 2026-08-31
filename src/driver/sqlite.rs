@@ -595,6 +595,49 @@ mod tests {
         assert_eq!(res.rows_affected, 1);
     }
 
+    /// Reverse foreign-key lookup: given a table+column, find every table in
+    /// the schema whose FK points at it. This is the metadata the `F` binding
+    /// walks, so prove it over a real database rather than trusting the shape.
+    #[tokio::test]
+    async fn test_foreign_keys_resolve_for_reverse_lookup() {
+        let db = seeded_db().await;
+        let drv = SqliteDriver::connect(&cfg_for(&db.0)).await.unwrap();
+        let main = Namespace("main".to_string());
+
+        // A second child table so the lookup has to find more than one.
+        let extra = SqliteConnectOptions::new().filename(&db.0);
+        let pool = SqlitePool::connect_with(extra).await.unwrap();
+        sqlx::query(
+            "CREATE TABLE sessions (id INTEGER PRIMARY KEY, owner INTEGER REFERENCES users(id))",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+
+        // Collect every table's FKs, the way the reverse navigation does.
+        let mut referencing: Vec<(String, String)> = Vec::new();
+        for t in drv.collections(&main).await.unwrap() {
+            let cref = CollectionRef { namespace: main.clone(), name: t.name.clone() };
+            let meta = drv.collection_meta(&cref).await.unwrap();
+            for fk in meta.foreign_keys {
+                if fk.ref_table == "users" && fk.ref_column == "id" {
+                    referencing.push((t.name.clone(), fk.column));
+                }
+            }
+        }
+        referencing.sort();
+
+        assert_eq!(
+            referencing,
+            vec![
+                ("orders".to_string(), "user_id".to_string()),
+                ("sessions".to_string(), "owner".to_string()),
+            ],
+            "both child tables must be found"
+        );
+    }
+
     #[tokio::test]
     async fn test_connect_rejects_missing_file_and_empty_path() {
         // A typo'd path must fail rather than silently create a new database.
