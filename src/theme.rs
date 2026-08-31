@@ -59,6 +59,13 @@ impl Theme {
         Style::default().fg(self.text_dim)
     }
 
+    /// Selection in a pane that does not have focus. Still clearly marked —
+    /// losing your place when focus moves elsewhere is disorienting — but
+    /// quiet enough that the focused pane still reads as the active one.
+    pub fn selected_inactive(&self) -> Style {
+        Style::default().bg(self.panel).fg(self.text_dim)
+    }
+
     /// Full-area dim style used to fade out the rest of the UI when a blocking
     /// operation (e.g. in-flight connection test) is in progress.
     pub fn dimmed(&self) -> Style {

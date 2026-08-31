@@ -1683,7 +1683,16 @@ fn render_tree(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme: &The
     let mut lines = Vec::new();
     for i in state.tree_scroll..end {
         let node = &state.tree_nodes[i];
-        let is_sel = i == sel && is_focused;
+        // The selection stays marked even when the tree loses focus — opening a
+        // table moves focus to the workspace, and losing your place in the
+        // list at that moment is disorienting. Focus only changes how loud the
+        // marker is.
+        let is_sel = i == sel;
+        let sel_style = if is_focused {
+            theme.selected()
+        } else {
+            theme.selected_inactive()
+        };
         let line = match &node.kind {
             // A rule that names the group and how many are in it, so the list
             // stays scannable without another level of expanding.
@@ -1705,7 +1714,7 @@ fn render_tree(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme: &The
                     "▶ "
                 };
                 let style = if is_sel {
-                    theme.selected().add_modifier(Modifier::BOLD)
+                    sel_style.add_modifier(Modifier::BOLD)
                 } else {
                     theme.base().add_modifier(Modifier::BOLD)
                 };
@@ -1723,11 +1732,7 @@ fn render_tree(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme: &The
                 } else {
                     String::new()
                 };
-                let style = if is_sel {
-                    theme.selected()
-                } else {
-                    theme.base()
-                };
+                let style = if is_sel { sel_style } else { theme.base() };
                 Line::from(vec![
                     Span::styled("   📄 ", theme.dim()),
                     Span::styled(&cref.name, style),
@@ -1735,33 +1740,21 @@ fn render_tree(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme: &The
                 ])
             }
             TreeNodeKind::View(cref) => {
-                let style = if is_sel {
-                    theme.selected()
-                } else {
-                    theme.base()
-                };
+                let style = if is_sel { sel_style } else { theme.base() };
                 Line::from(vec![
                     Span::styled("   👁️ ", theme.dim()),
                     Span::styled(&cref.name, style),
                 ])
             }
             TreeNodeKind::Routine(cref) => {
-                let style = if is_sel {
-                    theme.selected()
-                } else {
-                    theme.base()
-                };
+                let style = if is_sel { sel_style } else { theme.base() };
                 Line::from(vec![
                     Span::styled("   ⚙️ ", theme.dim()),
                     Span::styled(&cref.name, style),
                 ])
             }
             TreeNodeKind::Sequence(cref) => {
-                let style = if is_sel {
-                    theme.selected()
-                } else {
-                    theme.base()
-                };
+                let style = if is_sel { sel_style } else { theme.base() };
                 Line::from(vec![
                     Span::styled("   🔢 ", theme.dim()),
                     Span::styled(&cref.name, style),
@@ -1960,14 +1953,22 @@ fn render_grid(f: &mut Frame, area: Rect, tab: &mut DataTab, is_focused: bool, t
     // dim "ruler" background so the user can track the cursor across rows.
     // The active cell (row ∩ col) gets the full accent highlight.
     let col_highlight_bg = theme.panel;
-    let active_cell_style = Style::default()
-        .bg(theme.accent)
-        .fg(theme.background)
-        .add_modifier(Modifier::BOLD);
+    let active_cell_style = if is_focused {
+        Style::default()
+            .bg(theme.accent)
+            .fg(theme.background)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        theme.selected_inactive().add_modifier(Modifier::BOLD)
+    };
     let col_highlight_style = Style::default()
         .bg(col_highlight_bg)
         .fg(theme.accent);
-    let row_highlight_style = theme.selected();
+    let row_highlight_style = if is_focused {
+        theme.selected()
+    } else {
+        theme.selected_inactive()
+    };
 
     // Sort indicator on the active sort column header.
     let sort_indicator = |abs_col: usize| -> &'static str {
@@ -2008,12 +2009,14 @@ fn render_grid(f: &mut Frame, area: Rect, tab: &mut DataTab, is_focused: bool, t
         .iter()
         .enumerate()
         .map(|(r_idx, record)| {
-            let is_row_sel = r_idx == tab.selected_row && is_focused;
+            // Keep the cursor visible when the grid is not the focused pane
+            // (e.g. after Tab to the tree): only its intensity changes.
+            let is_row_sel = r_idx == tab.selected_row;
             let cells = record.values.iter().skip(col_offset).take(take_n).enumerate().map(|(rel_idx, val)| {
                 let abs_col = col_offset + rel_idx;
                 let cell_str = val.display_str();
                 let is_cell_sel = is_row_sel && abs_col == tab.selected_col;
-                let is_col_sel = is_focused && abs_col == tab.selected_col;
+                let is_col_sel = abs_col == tab.selected_col;
                 // A search hit outranks the column highlight (but not the
                 // cursor) so matches stay findable while navigating.
                 let is_hit = cell_matches_search(val, &tab.search_query);

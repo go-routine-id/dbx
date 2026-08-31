@@ -1239,15 +1239,22 @@ fn render_result(
                 .enumerate()
                 .map(|(rel_idx, record)| {
                     let r_idx = console.result_scroll_y + rel_idx;
-                    let is_row_sel = r_idx == console.result_selected_row && is_result_focused;
+                    // Same rule as the grid: the cursor stays visible when
+                    // the result pane is not focused, just quieter.
+                    let is_row_sel = r_idx == console.result_selected_row;
                     let cells = record.values.iter().skip(col_offset).enumerate().map(|(i, val)| {
                         let abs_col = col_offset + i;
                         let cell_str = val.display_str();
                         let is_cell_sel = is_row_sel && abs_col == console.result_selected_col;
-                        let cell_style = if is_cell_sel {
-                            theme.selected().add_modifier(Modifier::BOLD)
-                        } else if is_row_sel {
+                        let sel = if is_result_focused {
                             theme.selected()
+                        } else {
+                            theme.selected_inactive()
+                        };
+                        let cell_style = if is_cell_sel {
+                            sel.add_modifier(Modifier::BOLD)
+                        } else if is_row_sel {
+                            sel
                         } else {
                             theme.base()
                         };
