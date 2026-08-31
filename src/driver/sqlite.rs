@@ -615,17 +615,15 @@ mod tests {
         .unwrap();
         pool.close().await;
 
-        // Collect every table's FKs, the way the reverse navigation does.
-        let mut referencing: Vec<(String, String)> = Vec::new();
-        for t in drv.collections(&main).await.unwrap() {
-            let cref = CollectionRef { namespace: main.clone(), name: t.name.clone() };
-            let meta = drv.collection_meta(&cref).await.unwrap();
-            for fk in meta.foreign_keys {
-                if fk.ref_table == "users" && fk.ref_column == "id" {
-                    referencing.push((t.name.clone(), fk.column));
-                }
-            }
-        }
+        // Exactly what the reverse navigation runs.
+        let mut referencing: Vec<(String, String)> = drv
+            .schema_foreign_keys(&main)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|(_, fk)| fk.ref_table == "users" && fk.ref_column == "id")
+            .map(|(table, fk)| (table, fk.column))
+            .collect();
         referencing.sort();
 
         assert_eq!(

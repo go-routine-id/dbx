@@ -115,6 +115,40 @@ impl Driver for MySqlDriver {
             | Capabilities::EDIT_DATA
     }
 
+    /// One catalog query for every FK in the schema.
+    async fn schema_foreign_keys(
+        &self,
+        ns: &Namespace,
+    ) -> Result<Vec<(String, ForeignKeyMeta)>> {
+        let sql = "\
+            SELECT TABLE_NAME, CONSTRAINT_NAME, COLUMN_NAME, \
+                   REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME \
+            FROM information_schema.KEY_COLUMN_USAGE \
+            WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL";
+        let rows = sqlx::query(sql)
+            .bind(&ns.0)
+            .fetch_all(&self.pool)
+            .await
+            .with_context(|| format!("failed to list foreign keys in {}", ns.0))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let table: String = r.get(0);
+                (
+                    table,
+                    ForeignKeyMeta {
+                        name: r.get(1),
+                        column: r.get(2),
+                        ref_namespace: Namespace(r.get(3)),
+                        ref_table: r.get(4),
+                        ref_column: r.get(5),
+                    },
+                )
+            })
+            .collect())
+    }
+
     /// Running threads from `information_schema.PROCESSLIST`, excluding this
     /// connection and sleeping sessions.
     async fn process_list(&self) -> Result<QueryResult> {

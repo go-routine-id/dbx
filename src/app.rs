@@ -5163,22 +5163,31 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                         format!("scanning {} for references...", cref.namespace.0),
                                     );
                                     let driver_name = drv.info().name.clone();
-                                    let metas = collect_schema(drv, &cref.namespace).await;
+                                    // One catalog query on the server-backed
+                                    // drivers; the trait default only falls back
+                                    // to per-table walking where there is no
+                                    // catalog (SQLite, a local file).
+                                    let all_fks = match drv
+                                        .schema_foreign_keys(&cref.namespace)
+                                        .await
+                                    {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            app.toasts.push(
+                                                ToastKind::Error,
+                                                format!("could not read foreign keys: {e:#}"),
+                                            );
+                                            continue;
+                                        }
+                                    };
                                     // Every (child table, child column) whose FK
                                     // targets the cell we're standing on.
-                                    let refs: Vec<(String, String)> = metas
-                                        .iter()
-                                        .flat_map(|m| {
-                                            m.foreign_keys
-                                                .iter()
-                                                .filter(|fk| {
-                                                    fk.ref_table == cref.name && fk.ref_column == col
-                                                })
-                                                .map(|fk| {
-                                                    (m.reference.name.clone(), fk.column.clone())
-                                                })
-                                                .collect::<Vec<_>>()
+                                    let refs: Vec<(String, String)> = all_fks
+                                        .into_iter()
+                                        .filter(|(_, fk)| {
+                                            fk.ref_table == cref.name && fk.ref_column == col
                                         })
+                                        .map(|(table, fk)| (table, fk.column))
                                         .collect();
 
                                     if refs.is_empty() {

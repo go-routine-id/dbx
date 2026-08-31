@@ -116,6 +116,47 @@ impl Driver for PostgresDriver {
             | Capabilities::PROCESS_LIST
     }
 
+    /// One catalog query for every FK in the schema, instead of the default's
+    /// round trip per table.
+    async fn schema_foreign_keys(
+        &self,
+        ns: &Namespace,
+    ) -> Result<Vec<(String, ForeignKeyMeta)>> {
+        let sql = "\
+            SELECT tc.table_name, tc.constraint_name, kcu.column_name, \
+                   ccu.table_schema, ccu.table_name, ccu.column_name \
+            FROM information_schema.table_constraints AS tc \
+            JOIN information_schema.key_column_usage AS kcu \
+              ON tc.constraint_name = kcu.constraint_name \
+              AND tc.table_schema = kcu.table_schema \
+            JOIN information_schema.constraint_column_usage AS ccu \
+              ON ccu.constraint_name = tc.constraint_name \
+              AND ccu.table_schema = tc.table_schema \
+            WHERE tc.constraint_type = 'FOREIGN KEY' AND tc.table_schema = $1";
+        let rows = sqlx::query(sql)
+            .bind(&ns.0)
+            .fetch_all(&self.pool)
+            .await
+            .with_context(|| format!("failed to list foreign keys in {}", ns.0))?;
+
+        Ok(rows
+            .iter()
+            .map(|r| {
+                let table: String = r.get(0);
+                (
+                    table,
+                    ForeignKeyMeta {
+                        name: r.get(1),
+                        column: r.get(2),
+                        ref_namespace: Namespace(r.get(3)),
+                        ref_table: r.get(4),
+                        ref_column: r.get(5),
+                    },
+                )
+            })
+            .collect())
+    }
+
     /// Active backends from `pg_stat_activity`, excluding this connection and
     /// idle sessions — only work actually in flight is worth showing.
     async fn process_list(&self) -> Result<QueryResult> {

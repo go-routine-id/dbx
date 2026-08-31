@@ -225,6 +225,29 @@ pub trait Driver: Send + Sync {
         Ok(Vec::new())
     }
     /// Source / DDL of a stored routine.
+    /// Every foreign key in `ns`, as `(child_table, fk)`.
+    ///
+    /// Used by the reverse foreign-key lookup ("what references this row?"),
+    /// which needs the whole schema's relationships at once. The default walks
+    /// each table — correct everywhere, but one round trip per table — so
+    /// catalog-backed drivers override it with a single query.
+    async fn schema_foreign_keys(&self, ns: &Namespace) -> Result<Vec<(String, ForeignKeyMeta)>> {
+        let mut out = Vec::new();
+        for t in self.collections(ns).await? {
+            let cref = CollectionRef {
+                namespace: ns.clone(),
+                name: t.name.clone(),
+            };
+            // A single unreadable table must not sink the whole lookup.
+            if let Ok(meta) = self.collection_meta(&cref).await {
+                for fk in meta.foreign_keys {
+                    out.push((t.name.clone(), fk));
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Sessions/queries currently running on the server, newest first.
     ///
     /// Defaults to empty so a driver without the notion (SQLite is a local
