@@ -319,7 +319,16 @@ impl ErdTab {
             .as_ref()
             .ok_or_else(|| "no diagram to export - press g to generate one first".to_string())?;
 
-        let stem = format!("dbx_erd_{}", self.namespace.0.replace(['/', ' '], "_"));
+        // Timestamped so a second export never silently overwrites the first
+        // (the grid exporter asks before clobbering; this one has no prompt).
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stem = format!(
+            "dbx_erd_{}_{stamp}",
+            self.namespace.0.replace(['/', ' '], "_")
+        );
         let svg =
             crate::export::Exporter::save_to_file(&format!("~/{stem}.svg"), &er::to_svg(scene))
                 .map_err(|e| format!("{e:#}"))?;

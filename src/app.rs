@@ -4970,6 +4970,24 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             let active_is_console = exp
                                 .active_tab()
                                 .is_some_and(|t| matches!(t, WorkspaceTab::Console(_)));
+                            // While a table tab is in one of its own input
+                            // modes, every key belongs to that mode: letters
+                            // must reach the search/filter buffer instead of
+                            // firing insert / delete / paging, and the
+                            // row-detail overlay must not sit over a modal it
+                            // did not open. Searching for "index" would
+                            // otherwise insert a row, page forward and open the
+                            // delete dialog.
+                            let table_input_mode = exp.active_tab().is_some_and(|t| match t {
+                                WorkspaceTab::Table(t) => {
+                                    t.search_editing || t.filter_editing || t.row_detail
+                                }
+                                _ => false,
+                            });
+                            if table_input_mode {
+                                app.handle_key(key);
+                                continue;
+                            }
                             match key.code {
                                 // `x` on a selected row → confirm + DELETE the row.
                                 // We need the active driver for the driver-name sniff
@@ -5370,7 +5388,33 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
             // Watch mode: re-run the active console's query once its interval
             // has elapsed. Uses the same path as Ctrl+Enter so results, errors
             // and history behave identically.
-            let watch_due = app
+            // A watched re-run must not fight a dialog: it could re-open the
+            // destructive-statement confirmation on every interval, leaving it
+            // impossible to dismiss.
+            let overlay_open = app
+                .explorer_state
+                .as_ref()
+                .map(|e| {
+                    e.ddl_popup.is_some()
+                        || e.export_modal.is_some()
+                        || e.cell_edit_modal.is_some()
+                        || e.insert_row_modal.is_some()
+                        || e.sql_confirm_modal.is_some()
+                        || e.object_search.is_some()
+                        || e.import_csv_modal.is_some()
+                        || e.schema_edit_modal.is_some()
+                        || e.create_object_modal.is_some()
+                        || e.erd_menu.is_some()
+                        || e.explain_plan.is_some()
+                        || e.process_list.is_some()
+                        || e.schema_diff.is_some()
+                        || e.diff_picker.is_some()
+                })
+                .unwrap_or(false)
+                || app.help_open
+                || app.form_modal.is_some();
+            let watch_due = !overlay_open
+                && app
                 .explorer_state
                 .as_ref()
                 .and_then(|e| e.active_tab())
