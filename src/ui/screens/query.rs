@@ -57,7 +57,16 @@ pub struct QueryConsole {
     pub result_hit_area: Option<Rect>,
     /// X start of each visible result column, computed at draw time.
     pub result_col_starts: Vec<u16>,
+    /// Auto re-run interval. `None` = off. Set with `Ctrl+W`; the event loop
+    /// re-executes the query whenever `last_run` is older than this.
+    pub watch_interval: Option<std::time::Duration>,
+    /// When the watched query last executed.
+    pub last_run: Option<std::time::Instant>,
 }
+
+/// Interval cycled through by `Ctrl+W`, in seconds. `None` (off) is the
+/// entry and exit of the cycle so watching is never left on by accident.
+pub const WATCH_INTERVALS: [u64; 4] = [1, 5, 15, 60];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConsoleSubpane {
@@ -175,6 +184,8 @@ impl QueryConsole {
             autocomplete_selected: 0,
             result_hit_area: None,
             result_col_starts: Vec::new(),
+            watch_interval: None,
+            last_run: None,
         }
     }
 
@@ -1049,13 +1060,17 @@ fn render_result(
     let title = if console.is_executing {
         " Query Result (Executing...) ".to_string()
     } else if let Some(res) = &console.last_result {
+        let watch = match console.watch_interval {
+            Some(d) => format!(" [watch {}s]", d.as_secs()),
+            None => String::new(),
+        };
         let multi = if console.results.len() > 1 {
             format!(" [result {}/{}]", console.active_result + 1, console.results.len())
         } else {
             String::new()
         };
         format!(
-            " Query Result{multi} ({} rows affected, {:.2?}) ",
+            " Query Result{multi}{watch} ({} rows affected, {:.2?}) ",
             res.rows_affected, res.execution_time
         )
     } else if console.execution_error.is_some() {

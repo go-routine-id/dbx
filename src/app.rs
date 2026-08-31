@@ -443,6 +443,137 @@ fn erd_menu_item_at(rect: Rect, col: u16, row: u16) -> Option<usize> {
     (idx < crate::ui::screens::explorer::ERD_MENU_OPTIONS.len()).then_some(idx)
 }
 
+/// Execute the active console's SQL: split into statements, run each, collect
+/// every result set, and record the run in history.
+///
+/// Extracted from the key handler so the watch timer can trigger exactly the
+/// same path — a watched re-run must behave identically to pressing Ctrl+Enter.
+async fn run_console_query(
+    exp: &mut crate::ui::screens::explorer::ExplorerState,
+    drv: &Arc<dyn crate::driver::Driver>,
+    toasts: &mut Toasts,
+    config: &mut AppConfig,
+    conn_name: Option<&String>,
+) {
+    // Find active database from selected tree node or fallback to first namespace
+    let active_ns = if let Some(node) = exp.selected_node() {
+        match &node.kind {
+            TreeNodeKind::Database(ns) => ns.clone(),
+            TreeNodeKind::Table(cref, _, _) => cref.namespace.clone(),
+            TreeNodeKind::View(cref) => cref.namespace.clone(),
+            TreeNodeKind::Routine(cref) => cref.namespace.clone(),
+            TreeNodeKind::Sequence(cref) => cref.namespace.clone(),
+        }
+    } else {
+        exp.namespaces.first().cloned().unwrap_or(crate::driver::Namespace("mysql".to_string()))
+    };
+
+    // Snapshot the console text before mutating state so
+    // we can decide whether the statement is destructive
+    // (M2.10 guard) without holding a borrow on the tab.
+    let query_text = if let Some(WorkspaceTab::Console(c)) = exp.active_tab() {
+        c.text()
+    } else {
+        return;
+    };
+
+    // Destructive statement guard: DROP / TRUNCATE /
+    // DELETE-without-WHERE must be confirmed before they
+    // run. Reuses the SQL-confirm modal (Enter = execute,
+    // Esc = cancel) with a placeholder collection — the
+    // confirm path only needs the namespace.
+    if is_destructive_statement(&query_text) {
+        toasts.push(
+            ToastKind::Warning,
+            "destructive statement detected — confirm to execute".to_string(),
+        );
+        exp.sql_confirm_modal = Some(
+            crate::ui::screens::explorer::SqlConfirmModalState {
+                collection: crate::driver::CollectionRef {
+                    namespace: active_ns,
+                    name: "(console)".to_string(),
+                },
+                sql_query: query_text,
+                row_idx: 0,
+            },
+        );
+        return;
+    }
+
+    if let Some(WorkspaceTab::Console(console)) = exp.active_tab_mut() {
+        let drv_clone = drv.clone();
+        console.is_executing = true;
+        console.execution_error = None;
+
+        // Split on `;` and run each statement, collecting
+        // every result set (multi-statement support).
+        let statements = crate::ui::screens::query::split_statements(&query_text);
+        // Empty input is an error, not a silent success.
+        if statements.is_empty() {
+            console.is_executing = false;
+            console.execution_error = Some("empty query — nothing to execute".to_string());
+            console.results = Vec::new();
+            console.last_result = None;
+            console.active_result = 0;
+            toasts.push(ToastKind::Warning, "empty query — nothing to execute".to_string());
+            return;
+        }
+        // Stateful scripts (SET @x, transactions) run on
+        // separate pooled connections, so session state
+        // doesn't persist — warn up front.
+        if statements.len() > 1 {
+            toasts.push(
+                ToastKind::Warning,
+                "multi-statement: SET @x / BEGIN..COMMIT won't persist between statements".to_string(),
+            );
+        }
+        let mut results = Vec::new();
+        let mut failed: Option<String> = None;
+        for stmt in &statements {
+            if crate::ui::screens::query::is_comment_only(stmt) {
+                return;
+            }
+            match drv_clone.execute(&active_ns, stmt).await {
+                Ok(r) => results.push(r),
+                Err(e) => {
+                    failed = Some(format!("{e:#}"));
+                    break;
+                }
+            }
+        }
+        console.is_executing = false;
+        match failed {
+            None => {
+                console.last_result = results.first().cloned();
+                console.active_result = 0;
+                console.results = results;
+                console.execution_error = None;
+                console.result_selected_row = 0;
+                console.result_selected_col = 0;
+                console.result_scroll_x = 0;
+                console.result_scroll_y = 0;
+                // Record to this connection's query history.
+                // Not persisted per-query (re-serializing the
+                // whole config on every run is too costly);
+                // saved once when the app exits.
+                if let Some(conn) = conn_name {
+                    config.push_history(conn, &query_text);
+                }
+                toasts.push(ToastKind::Success, "query executed".to_string());
+            }
+            Some(e) => {
+                // Don't leave stale results from the previous
+                // run visible under the error.
+                console.execution_error = Some(e);
+                console.results = Vec::new();
+                console.last_result = None;
+                console.active_result = 0;
+                toasts.push(ToastKind::Error, "query failed".to_string());
+            }
+        }
+    }
+}
+
 /// Run one action from the ERD node context menu. Shared by the keyboard
 /// (`Enter`) and mouse (click) paths so both behave identically.
 async fn run_erd_menu_action(
@@ -848,7 +979,7 @@ const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-const EXPLORER_HELP_BINDINGS: [(&str, &str); 34] = [
+const EXPLORER_HELP_BINDINGS: [(&str, &str); 35] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
@@ -879,6 +1010,7 @@ const EXPLORER_HELP_BINDINGS: [(&str, &str); 34] = [
     ("v (in table tab)", "expand the selected row vertically (wide tables)"),
     ("Ctrl+F / Ctrl+G", "search all cells / jump to the next match"),
     ("E (in ERD tab)", "export the diagram as ~/dbx_erd_<schema>.svg + .mmd"),
+    ("Ctrl+W (in console)", "cycle auto re-run: off / 1s / 5s / 15s / 60s"),
     ("i", "open INSERT-row modal — fill fields, server applies DEFAULT for skipped"),
     ("F1", "view table DDL schema popup"),
     ("n / p", "next / previous page in data grid"),
@@ -2740,6 +2872,30 @@ impl App {
                                                 ),
                                             }
                                         }
+                                        // Ctrl+W: cycle the auto re-run interval
+                                        // (off -> 1s -> 5s -> 15s -> 60s -> off).
+                                        KeyCode::Char('w') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                            use crate::ui::screens::query::WATCH_INTERVALS;
+                                            let secs = c.watch_interval.map(|d| d.as_secs());
+                                            let next = match secs {
+                                                None => Some(WATCH_INTERVALS[0]),
+                                                Some(cur) => WATCH_INTERVALS
+                                                    .iter()
+                                                    .position(|&s| s == cur)
+                                                    .and_then(|i| WATCH_INTERVALS.get(i + 1).copied()),
+                                            };
+                                            c.watch_interval = next.map(Duration::from_secs);
+                                            c.last_run = Some(Instant::now());
+                                            match next {
+                                                Some(s) => self.toasts.push(
+                                                    ToastKind::Info,
+                                                    format!("watch: re-running every {s}s"),
+                                                ),
+                                                None => self
+                                                    .toasts
+                                                    .push(ToastKind::Info, "watch off".to_string()),
+                                            }
+                                        }
                                         // Ctrl+F: pretty-print the SQL.
                                         KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                             let formatted = crate::ui::screens::query::format_sql(&c.text());
@@ -4409,122 +4565,16 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 _ => true,
                             })
                         {
-                            // Find active database from selected tree node or fallback to first namespace
-                            let active_ns = if let Some(node) = exp.selected_node() {
-                                match &node.kind {
-                                    TreeNodeKind::Database(ns) => ns.clone(),
-                                    TreeNodeKind::Table(cref, _, _) => cref.namespace.clone(),
-                                    TreeNodeKind::View(cref) => cref.namespace.clone(),
-                                    TreeNodeKind::Routine(cref) => cref.namespace.clone(),
-                                    TreeNodeKind::Sequence(cref) => cref.namespace.clone(),
-                                }
-                            } else {
-                                exp.namespaces.first().cloned().unwrap_or(crate::driver::Namespace("mysql".to_string()))
-                            };
-
-                            // Snapshot the console text before mutating state so
-                            // we can decide whether the statement is destructive
-                            // (M2.10 guard) without holding a borrow on the tab.
-                            let query_text = if let Some(WorkspaceTab::Console(c)) = exp.active_tab() {
-                                c.text()
-                            } else {
-                                continue;
-                            };
-
-                            // Destructive statement guard: DROP / TRUNCATE /
-                            // DELETE-without-WHERE must be confirmed before they
-                            // run. Reuses the SQL-confirm modal (Enter = execute,
-                            // Esc = cancel) with a placeholder collection — the
-                            // confirm path only needs the namespace.
-                            if is_destructive_statement(&query_text) {
-                                app.toasts.push(
-                                    ToastKind::Warning,
-                                    "destructive statement detected — confirm to execute".to_string(),
-                                );
-                                exp.sql_confirm_modal = Some(
-                                    crate::ui::screens::explorer::SqlConfirmModalState {
-                                        collection: crate::driver::CollectionRef {
-                                            namespace: active_ns,
-                                            name: "(console)".to_string(),
-                                        },
-                                        sql_query: query_text,
-                                        row_idx: 0,
-                                    },
-                                );
-                                continue;
-                            }
-
-                            if let Some(WorkspaceTab::Console(console)) = exp.active_tab_mut() {
-                                let drv_clone = drv.clone();
-                                console.is_executing = true;
-                                console.execution_error = None;
-
-                                // Split on `;` and run each statement, collecting
-                                // every result set (multi-statement support).
-                                let statements = crate::ui::screens::query::split_statements(&query_text);
-                                // Empty input is an error, not a silent success.
-                                if statements.is_empty() {
-                                    console.is_executing = false;
-                                    console.execution_error = Some("empty query — nothing to execute".to_string());
-                                    console.results = Vec::new();
-                                    console.last_result = None;
-                                    console.active_result = 0;
-                                    app.toasts.push(ToastKind::Warning, "empty query — nothing to execute".to_string());
-                                    continue;
-                                }
-                                // Stateful scripts (SET @x, transactions) run on
-                                // separate pooled connections, so session state
-                                // doesn't persist — warn up front.
-                                if statements.len() > 1 {
-                                    app.toasts.push(
-                                        ToastKind::Warning,
-                                        "multi-statement: SET @x / BEGIN..COMMIT won't persist between statements".to_string(),
-                                    );
-                                }
-                                let mut results = Vec::new();
-                                let mut failed: Option<String> = None;
-                                for stmt in &statements {
-                                    if crate::ui::screens::query::is_comment_only(stmt) {
-                                        continue;
-                                    }
-                                    match drv_clone.execute(&active_ns, stmt).await {
-                                        Ok(r) => results.push(r),
-                                        Err(e) => {
-                                            failed = Some(format!("{e:#}"));
-                                            break;
-                                        }
-                                    }
-                                }
-                                console.is_executing = false;
-                                match failed {
-                                    None => {
-                                        console.last_result = results.first().cloned();
-                                        console.active_result = 0;
-                                        console.results = results;
-                                        console.execution_error = None;
-                                        console.result_selected_row = 0;
-                                        console.result_selected_col = 0;
-                                        console.result_scroll_x = 0;
-                                        console.result_scroll_y = 0;
-                                        // Record to this connection's query history.
-                                        // Not persisted per-query (re-serializing the
-                                        // whole config on every run is too costly);
-                                        // saved once when the app exits.
-                                        if let Some(conn) = &app.active_connection_name {
-                                            app.config.push_history(conn, &query_text);
-                                        }
-                                        app.toasts.push(ToastKind::Success, "query executed".to_string());
-                                    }
-                                    Some(e) => {
-                                        // Don't leave stale results from the previous
-                                        // run visible under the error.
-                                        console.execution_error = Some(e);
-                                        console.results = Vec::new();
-                                        console.last_result = None;
-                                        console.active_result = 0;
-                                        app.toasts.push(ToastKind::Error, "query failed".to_string());
-                                    }
-                                }
+                            run_console_query(
+                                exp,
+                                drv,
+                                &mut app.toasts,
+                                &mut app.config,
+                                app.active_connection_name.as_ref(),
+                            )
+                            .await;
+                            if let Some(WorkspaceTab::Console(c)) = exp.active_tab_mut() {
+                                c.last_run = Some(Instant::now());
                             }
                         } else {
                             // Workspace-level edit/navigation keys. They only
@@ -4776,6 +4826,37 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
         if last_tick.elapsed() >= TICK_CAP {
             spinner.tick();
             app.toasts.tick();
+
+            // Watch mode: re-run the active console's query once its interval
+            // has elapsed. Uses the same path as Ctrl+Enter so results, errors
+            // and history behave identically.
+            let watch_due = app
+                .explorer_state
+                .as_ref()
+                .and_then(|e| e.active_tab())
+                .and_then(|t| match t {
+                    WorkspaceTab::Console(c) => c.watch_interval.map(|iv| {
+                        c.last_run.map(|t| t.elapsed() >= iv).unwrap_or(true)
+                            && !c.is_executing
+                    }),
+                    _ => None,
+                })
+                .unwrap_or(false);
+            if watch_due
+                && let (Some(drv), Some(exp)) = (&app.active_driver.clone(), &mut app.explorer_state)
+            {
+                run_console_query(
+                    exp,
+                    drv,
+                    &mut app.toasts,
+                    &mut app.config,
+                    app.active_connection_name.as_ref(),
+                )
+                .await;
+                if let Some(WorkspaceTab::Console(c)) = exp.active_tab_mut() {
+                    c.last_run = Some(Instant::now());
+                }
+            }
             // Poll form-modal test result non-blockingly. Push toast AND set the
             // form's last_test_result so the outcome shows inside the modal
             // (right where the user is editing) — most reliable place to be seen.
