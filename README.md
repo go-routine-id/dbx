@@ -75,6 +75,13 @@ binary lives in a root-owned directory, re-run it with `sudo`. Your config
 | ✅ | Saved query collections + per-connection query history |
 | ✅ | SQLite support — point a connection at a `.db` file, no server needed |
 | ✅ | Startup update check + in-place `dbx --self-update` |
+| ✅ | Row detail view (`v`) + free-text cell search (`Ctrl+F` / `Ctrl+G`) |
+| ✅ | **EXPLAIN plan tree** with the costliest node highlighted (`Ctrl+P`) |
+| ✅ | Foreign-key navigation — jump from a cell to the row it references (`f`) |
+| ✅ | Schema diff against another saved connection, with migration SQL (`Alt+D`) |
+| ✅ | Running-query monitor with cancel (`Ctrl+K`) |
+| ✅ | Console watch mode — auto re-run every 1/5/15/60s (`Ctrl+W`) |
+| ✅ | ERD export to SVG + Mermaid (`E`) |
 | 🚧 | SQL Server (architecture ready, driver not implemented) |
 
 The ERD renderer uses [flowmaid](https://github.com/go-routine-id/flowmaid)

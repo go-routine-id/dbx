@@ -60,6 +60,25 @@ pub struct SqlConfirmModalState {
     pub row_idx: usize,
 }
 
+/// Pick which saved connection to compare the current schema against.
+#[derive(Clone, Debug)]
+pub struct DiffPickerState {
+    /// Names of the other saved connections, in config order.
+    pub connections: Vec<String>,
+    pub selected: usize,
+}
+
+/// Result of comparing this schema against another connection's.
+#[derive(Clone, Debug)]
+pub struct SchemaDiffState {
+    pub against: String,
+    pub namespace: String,
+    pub diffs: Vec<crate::schema_diff::Difference>,
+    /// DDL that would bring the other side in line with this one.
+    pub migration: String,
+    pub scroll: usize,
+}
+
 /// Snapshot of the server's running queries.
 #[derive(Clone, Debug)]
 pub struct ProcessListState {
@@ -510,6 +529,9 @@ pub struct ExplorerState {
     pub explain_plan: Option<ExplainPlanState>,
     /// Running-query monitor (`Ctrl+K`).
     pub process_list: Option<ProcessListState>,
+    /// Schema-diff flow (`Alt+D`): first a connection picker, then the result.
+    pub diff_picker: Option<DiffPickerState>,
+    pub schema_diff: Option<SchemaDiffState>,
     /// Rect of the ERD context menu as last painted — lets a mouse click pick
     /// the item under the cursor.
     pub erd_menu_area: Option<Rect>,
@@ -560,6 +582,8 @@ impl ExplorerState {
             erd_menu_area: None,
             explain_plan: None,
             process_list: None,
+            diff_picker: None,
+            schema_diff: None,
             driver_capabilities,
             tab_starts: Vec::new(),
             tab_bar_area: None,
@@ -707,6 +731,14 @@ pub fn render_explorer(
         render_row_detail(f, area, tab, theme);
     }
 
+    if let Some(picker) = &state.diff_picker {
+        render_diff_picker(f, area, picker, theme);
+    }
+
+    if let Some(diff) = &state.schema_diff {
+        render_schema_diff(f, area, diff, theme);
+    }
+
     if let Some(procs) = &state.process_list {
         render_process_list(f, area, procs, theme);
     }
@@ -825,6 +857,122 @@ fn render_row_detail(f: &mut Frame, area: Rect, tab: &DataTab, theme: &Theme) {
         format!(" ↑/↓ scroll ({more} more) · ←/→ row · v/Esc close ")
     } else {
         " ↑/↓ scroll · ←/→ row · v/Esc close ".to_string()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(hint, theme.dim()))),
+        chunks[1],
+    );
+}
+
+/// Choose the connection to diff against.
+fn render_diff_picker(f: &mut Frame, area: Rect, picker: &DiffPickerState, theme: &Theme) {
+    let width = 56.min(area.width.saturating_sub(4));
+    let height = (picker.connections.len() as u16 + 4).min(area.height.saturating_sub(2));
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent())
+        .style(theme.panel())
+        .title(" Compare schema against ");
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let mut lines = Vec::new();
+    if picker.connections.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  no other saved connection to compare with",
+            theme.dim(),
+        )));
+    }
+    for (i, name) in picker.connections.iter().enumerate() {
+        let is_sel = i == picker.selected;
+        lines.push(Line::from(vec![
+            Span::styled(if is_sel { "▶ " } else { "  " }, theme.accent()),
+            Span::styled(
+                name.clone(),
+                if is_sel { theme.selected() } else { theme.base() },
+            ),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), chunks[0]);
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ↑/↓ select · Enter compare · Esc cancel ",
+            theme.dim(),
+        ))),
+        chunks[1],
+    );
+}
+
+/// The differences, plus the migration DDL they imply.
+fn render_schema_diff(f: &mut Frame, area: Rect, diff: &SchemaDiffState, theme: &Theme) {
+    let width = 96.min(area.width.saturating_sub(4));
+    let height = 22.min(area.height.saturating_sub(2));
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent())
+        .style(theme.panel())
+        .title(format!(
+            " Schema diff: {} vs {} ({} differences) ",
+            diff.namespace,
+            diff.against,
+            diff.diffs.len()
+        ));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let visible = chunks[0].height as usize;
+    let mut lines = Vec::new();
+    if diff.diffs.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  schemas are identical",
+            theme.success(),
+        )));
+    }
+    for d in diff.diffs.iter().skip(diff.scroll).take(visible) {
+        let text = d.describe();
+        // Colour by direction so drift reads at a glance.
+        let style = match text.chars().next() {
+            Some('-') => theme.error(),
+            Some('+') => theme.warning(),
+            _ => theme.base(),
+        };
+        lines.push(Line::from(Span::styled(format!("  {text}"), style)));
+    }
+    f.render_widget(Paragraph::new(lines), chunks[0]);
+
+    let more = diff.diffs.len().saturating_sub(diff.scroll + visible);
+    let hint = if more > 0 {
+        format!(" ↑/↓ scroll ({more} more) · y copy migration SQL · Esc close ")
+    } else {
+        " ↑/↓ scroll · y copy migration SQL · Esc close ".to_string()
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(hint, theme.dim()))),

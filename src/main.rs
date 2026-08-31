@@ -6,6 +6,7 @@ mod config;
 mod driver;
 mod explain;
 mod export;
+mod schema_diff;
 mod theme;
 mod ui;
 mod update;

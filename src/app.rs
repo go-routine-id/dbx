@@ -153,6 +153,12 @@ fn quote_ident_with(ident: &str, style: QuoteStyle) -> String {
     }
 }
 
+/// `quote_ident` for use from other modules (the schema diff generates DDL
+/// and must quote exactly the way the rest of the app does).
+pub fn quote_ident_pub(ident: &str, driver_name: &str) -> String {
+    quote_ident(ident, driver_name)
+}
+
 /// Convenience wrapper that pulls the style from a `DriverInfo`-style name.
 /// Kept as a single entry point so call sites never have to think about the
 /// underlying style enum.
@@ -577,6 +583,29 @@ async fn run_console_query(
     }
 }
 
+/// Read every table's structure in `ns`. Errors on individual tables are
+/// skipped rather than failing the whole comparison — a diff over the tables
+/// we could read is more useful than no diff at all.
+async fn collect_schema(
+    drv: &Arc<dyn crate::driver::Driver>,
+    ns: &crate::driver::Namespace,
+) -> Vec<crate::driver::CollectionMeta> {
+    let Ok(tables) = drv.collections(ns).await else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for t in tables {
+        let cref = crate::driver::CollectionRef {
+            namespace: ns.clone(),
+            name: t.name,
+        };
+        if let Ok(meta) = drv.collection_meta(&cref).await {
+            out.push(meta);
+        }
+    }
+    out
+}
+
 /// Run one action from the ERD node context menu. Shared by the keyboard
 /// (`Enter`) and mouse (click) paths so both behave identically.
 async fn run_erd_menu_action(
@@ -982,7 +1011,7 @@ const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-const EXPLORER_HELP_BINDINGS: [(&str, &str); 38] = [
+const EXPLORER_HELP_BINDINGS: [(&str, &str); 39] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
@@ -1017,6 +1046,7 @@ const EXPLORER_HELP_BINDINGS: [(&str, &str); 38] = [
     ("Ctrl+P (in console)", "EXPLAIN the query and show the plan tree"),
     ("f (on an FK cell)", "open the row this foreign key references"),
     ("Ctrl+K", "list running queries (x cancels, r refreshes)"),
+    ("Alt+D", "compare this schema with another saved connection"),
     ("i", "open INSERT-row modal — fill fields, server applies DEFAULT for skipped"),
     ("F1", "view table DDL schema popup"),
     ("n / p", "next / previous page in data grid"),
@@ -1142,6 +1172,8 @@ impl App {
                         || e.erd_menu.is_some()
                         || e.explain_plan.is_some()
                         || e.process_list.is_some()
+                        || e.schema_diff.is_some()
+                        || e.diff_picker.is_some()
                 })
                 .unwrap_or(false);
             if modal_open {
@@ -4248,6 +4280,166 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             }
                         } else {
                             exp.import_csv_modal = None;
+                        }
+                        continue;
+                    }
+
+                    // Schema diff overlay: scroll / copy / close.
+                    if exp.schema_diff.is_some() {
+                        match key.code {
+                            KeyCode::Esc => exp.schema_diff = None,
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if let Some(d) = exp.schema_diff.as_mut() {
+                                    let last = d.diffs.len().saturating_sub(1);
+                                    if d.scroll < last {
+                                        d.scroll += 1;
+                                    }
+                                }
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if let Some(d) = exp.schema_diff.as_mut() {
+                                    d.scroll = d.scroll.saturating_sub(1);
+                                }
+                            }
+                            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                                let sql = exp
+                                    .schema_diff
+                                    .as_ref()
+                                    .map(|d| d.migration.clone())
+                                    .unwrap_or_default();
+                                if sql.trim().is_empty() {
+                                    app.toasts.push(
+                                        ToastKind::Info,
+                                        "no migration needed".to_string(),
+                                    );
+                                } else {
+                                    match ClipboardManager::set_text(&sql) {
+                                        Ok(_) => app.toasts.push(
+                                            ToastKind::Success,
+                                            "migration SQL copied to clipboard".to_string(),
+                                        ),
+                                        Err(e) => app.toasts.push(ToastKind::Error, e),
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Schema-diff connection picker: Enter connects to the
+                    // chosen connection just long enough to read its schema.
+                    if exp.diff_picker.is_some() {
+                        match key.code {
+                            KeyCode::Esc => exp.diff_picker = None,
+                            KeyCode::Down | KeyCode::Char('j') => {
+                                if let Some(p) = exp.diff_picker.as_mut() {
+                                    p.selected = (p.selected + 1)
+                                        .min(p.connections.len().saturating_sub(1));
+                                }
+                            }
+                            KeyCode::Up | KeyCode::Char('k') => {
+                                if let Some(p) = exp.diff_picker.as_mut() {
+                                    p.selected = p.selected.saturating_sub(1);
+                                }
+                            }
+                            KeyCode::Enter => {
+                                let target_name = exp
+                                    .diff_picker
+                                    .as_ref()
+                                    .and_then(|p| p.connections.get(p.selected).cloned());
+                                exp.diff_picker = None;
+                                let Some(target_name) = target_name else {
+                                    continue;
+                                };
+                                let Some(cfg) = app
+                                    .config
+                                    .connections
+                                    .iter()
+                                    .find(|c| c.name == target_name)
+                                    .cloned()
+                                else {
+                                    continue;
+                                };
+                                let Some(ns) = exp
+                                    .selected_node()
+                                    .map(|n| match &n.kind {
+                                        TreeNodeKind::Database(ns) => ns.clone(),
+                                        TreeNodeKind::Table(c, _, _)
+                                        | TreeNodeKind::View(c)
+                                        | TreeNodeKind::Routine(c)
+                                        | TreeNodeKind::Sequence(c) => c.namespace.clone(),
+                                    })
+                                    .or_else(|| exp.namespaces.first().cloned())
+                                else {
+                                    app.toasts.push(
+                                        ToastKind::Warning,
+                                        "no schema selected to compare".to_string(),
+                                    );
+                                    continue;
+                                };
+
+                                app.toasts.push(
+                                    ToastKind::Info,
+                                    format!("comparing {} with '{target_name}'...", ns.0),
+                                );
+                                // The second connection is transient: it lives
+                                // only for this comparison, so the app keeps
+                                // its single-active-driver model.
+                                let other = match crate::driver::connect_driver(&cfg).await {
+                                    Ok(d) => d,
+                                    Err(e) => {
+                                        app.toasts.push(
+                                            ToastKind::Error,
+                                            format!("could not connect to '{target_name}': {e:#}"),
+                                        );
+                                        continue;
+                                    }
+                                };
+                                let source = collect_schema(drv, &ns).await;
+                                let target = collect_schema(&other, &ns).await;
+                                let diffs = crate::schema_diff::diff_schemas(&source, &target);
+                                let migration = crate::schema_diff::migration_sql(
+                                    &diffs,
+                                    &ns.0,
+                                    &drv.info().name,
+                                );
+                                exp.schema_diff =
+                                    Some(crate::ui::screens::explorer::SchemaDiffState {
+                                        against: target_name,
+                                        namespace: ns.0.clone(),
+                                        scroll: 0,
+                                        diffs,
+                                        migration,
+                                    });
+                            }
+                            _ => {}
+                        }
+                        continue;
+                    }
+
+                    // Alt+D opens the schema-diff connection picker.
+                    if key.modifiers.contains(KeyModifiers::ALT)
+                        && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'))
+                    {
+                        let others: Vec<String> = app
+                            .config
+                            .connections
+                            .iter()
+                            .map(|c| c.name.clone())
+                            .filter(|n| Some(n) != app.active_connection_name.as_ref())
+                            .collect();
+                        if others.is_empty() {
+                            app.toasts.push(
+                                ToastKind::Warning,
+                                "add another saved connection to compare against".to_string(),
+                            );
+                        } else {
+                            exp.diff_picker =
+                                Some(crate::ui::screens::explorer::DiffPickerState {
+                                    connections: others,
+                                    selected: 0,
+                                });
                         }
                         continue;
                     }
