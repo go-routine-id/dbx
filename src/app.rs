@@ -979,7 +979,7 @@ const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-const EXPLORER_HELP_BINDINGS: [(&str, &str); 35] = [
+const EXPLORER_HELP_BINDINGS: [(&str, &str); 36] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
@@ -1011,6 +1011,7 @@ const EXPLORER_HELP_BINDINGS: [(&str, &str); 35] = [
     ("Ctrl+F / Ctrl+G", "search all cells / jump to the next match"),
     ("E (in ERD tab)", "export the diagram as ~/dbx_erd_<schema>.svg + .mmd"),
     ("Ctrl+W (in console)", "cycle auto re-run: off / 1s / 5s / 15s / 60s"),
+    ("Ctrl+P (in console)", "EXPLAIN the query and show the plan tree"),
     ("i", "open INSERT-row modal — fill fields, server applies DEFAULT for skipped"),
     ("F1", "view table DDL schema popup"),
     ("n / p", "next / previous page in data grid"),
@@ -1134,6 +1135,7 @@ impl App {
                         || e.schema_edit_modal.is_some()
                         || e.create_object_modal.is_some()
                         || e.erd_menu.is_some()
+                        || e.explain_plan.is_some()
                 })
                 .unwrap_or(false);
             if modal_open {
@@ -1891,6 +1893,24 @@ impl App {
                 if exp.sql_confirm_modal.is_some() {
                     if key.code == KeyCode::Esc {
                         exp.sql_confirm_modal = None;
+                    }
+                    return;
+                }
+
+                // Query-plan overlay owns Esc + scrolling while it is open.
+                if let Some(plan) = &mut exp.explain_plan {
+                    match key.code {
+                        KeyCode::Esc => exp.explain_plan = None,
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            let last = plan.nodes.len().saturating_sub(1);
+                            if plan.scroll < last {
+                                plan.scroll += 1;
+                            }
+                        }
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            plan.scroll = plan.scroll.saturating_sub(1);
+                        }
+                        _ => {}
                     }
                     return;
                 }
@@ -4222,6 +4242,70 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             }
                         } else {
                             exp.import_csv_modal = None;
+                        }
+                        continue;
+                    }
+
+                    // Ctrl+P: EXPLAIN the console's query and show the plan.
+                    if exp.explain_plan.is_none()
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.code == KeyCode::Char('p')
+                        && let Some(WorkspaceTab::Console(c)) = exp.active_tab()
+                        && c.popup.is_none()
+                    {
+                        let query = c.text();
+                        if query.trim().is_empty() {
+                            app.toasts
+                                .push(ToastKind::Warning, "nothing to explain".to_string());
+                            continue;
+                        }
+                        if !exp
+                            .driver_capabilities
+                            .contains(crate::driver::Capabilities::EXPLAIN)
+                        {
+                            app.toasts.push(
+                                ToastKind::Warning,
+                                "this driver does not support EXPLAIN".to_string(),
+                            );
+                            continue;
+                        }
+                        let ns = exp
+                            .selected_node()
+                            .map(|n| match &n.kind {
+                                TreeNodeKind::Database(ns) => ns.clone(),
+                                TreeNodeKind::Table(c, _, _)
+                                | TreeNodeKind::View(c)
+                                | TreeNodeKind::Routine(c)
+                                | TreeNodeKind::Sequence(c) => c.namespace.clone(),
+                            })
+                            .or_else(|| exp.namespaces.first().cloned());
+                        let Some(ns) = ns else {
+                            app.toasts
+                                .push(ToastKind::Warning, "no database selected".to_string());
+                            continue;
+                        };
+                        let sql = crate::explain::explain_sql(&drv.info().name, &query);
+                        match drv.execute(&ns, &sql).await {
+                            Ok(res) => {
+                                let nodes = crate::explain::parse_plan(&drv.info().name, &res);
+                                if nodes.is_empty() {
+                                    app.toasts.push(
+                                        ToastKind::Info,
+                                        "EXPLAIN returned no plan rows".to_string(),
+                                    );
+                                } else {
+                                    exp.explain_plan = Some(
+                                        crate::ui::screens::explorer::ExplainPlanState {
+                                            hotspot: crate::explain::hotspot(&nodes),
+                                            nodes,
+                                            scroll: 0,
+                                        },
+                                    );
+                                }
+                            }
+                            Err(e) => app
+                                .toasts
+                                .push(ToastKind::Error, format!("EXPLAIN failed: {e:#}")),
                         }
                         continue;
                     }

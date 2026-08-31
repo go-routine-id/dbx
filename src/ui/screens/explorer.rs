@@ -60,6 +60,15 @@ pub struct SqlConfirmModalState {
     pub row_idx: usize,
 }
 
+/// A parsed query plan, shown as a tree over the console.
+#[derive(Clone, Debug)]
+pub struct ExplainPlanState {
+    pub nodes: Vec<crate::explain::PlanNode>,
+    /// Index of the costliest node, highlighted as the bottleneck.
+    pub hotspot: Option<usize>,
+    pub scroll: usize,
+}
+
 /// Context menu shown when clicking/selecting an ERD node — a short list of
 /// actions to run against that table.
 #[derive(Clone, Debug)]
@@ -475,6 +484,8 @@ pub struct ExplorerState {
     pub schema_edit_modal: Option<SchemaEditModalState>,
     pub create_object_modal: Option<CreateObjectModalState>,
     pub erd_menu: Option<ErdMenuState>,
+    /// Query-plan overlay (`Ctrl+P` in a console).
+    pub explain_plan: Option<ExplainPlanState>,
     /// Rect of the ERD context menu as last painted — lets a mouse click pick
     /// the item under the cursor.
     pub erd_menu_area: Option<Rect>,
@@ -523,6 +534,7 @@ impl ExplorerState {
             create_object_modal: None,
             erd_menu: None,
             erd_menu_area: None,
+            explain_plan: None,
             driver_capabilities,
             tab_starts: Vec::new(),
             tab_bar_area: None,
@@ -670,6 +682,10 @@ pub fn render_explorer(
         render_row_detail(f, area, tab, theme);
     }
 
+    if let Some(plan) = &state.explain_plan {
+        render_explain_plan(f, area, plan, theme);
+    }
+
     if let Some(menu) = state.erd_menu.clone() {
         let rect = erd_menu_rect(area, &menu);
         state.erd_menu_area = Some(rect);
@@ -780,6 +796,104 @@ fn render_row_detail(f: &mut Frame, area: Rect, tab: &DataTab, theme: &Theme) {
         format!(" ↑/↓ scroll ({more} more) · ←/→ row · v/Esc close ")
     } else {
         " ↑/↓ scroll · ←/→ row · v/Esc close ".to_string()
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(hint, theme.dim()))),
+        chunks[1],
+    );
+}
+
+/// The query plan as an indented tree.
+///
+/// Plans are deep and narrow, so an indented tree with box-drawing connectors
+/// reads far better in a terminal than a box-and-arrow graph would — and the
+/// costliest node is coloured so the bottleneck is the first thing seen.
+fn render_explain_plan(f: &mut Frame, area: Rect, plan: &ExplainPlanState, theme: &Theme) {
+    let width = 96.min(area.width.saturating_sub(4));
+    let height = 22.min(area.height.saturating_sub(2));
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent())
+        .style(theme.panel())
+        .title(format!(" Query Plan ({} steps) ", plan.nodes.len()));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    let visible = chunks[0].height as usize;
+    let mut lines = Vec::new();
+    for (i, node) in plan
+        .nodes
+        .iter()
+        .enumerate()
+        .skip(plan.scroll)
+        .take(visible)
+    {
+        // Last child of its depth gets the closing connector.
+        let is_last = plan
+            .nodes
+            .iter()
+            .skip(i + 1)
+            .take_while(|n| n.depth >= node.depth)
+            .all(|n| n.depth > node.depth);
+        let connector = if node.depth == 0 {
+            String::new()
+        } else {
+            format!("{}{}", "  ".repeat(node.depth - 1), if is_last { "└─ " } else { "├─ " })
+        };
+
+        let is_hot = plan.hotspot == Some(i);
+        let label_style = if is_hot {
+            theme.error().add_modifier(Modifier::BOLD)
+        } else if node.cost.is_some() || node.rows.is_some() {
+            theme.base()
+        } else {
+            // Detail lines ("Filter: ...") are context, not plan steps.
+            theme.dim()
+        };
+
+        let mut spans = vec![
+            Span::styled(connector, theme.dim()),
+            Span::styled(node.label.clone(), label_style),
+        ];
+        let mut meta = String::new();
+        if let Some(c) = node.cost {
+            meta.push_str(&format!("  cost {c:.2}"));
+        }
+        if let Some(r) = node.rows {
+            meta.push_str(&format!("  rows {r:.0}"));
+        }
+        if is_hot {
+            meta.push_str("  ← hotspot");
+        }
+        if !meta.is_empty() {
+            spans.push(Span::styled(
+                meta,
+                if is_hot { theme.error() } else { theme.dim() },
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    f.render_widget(Paragraph::new(lines), chunks[0]);
+
+    let more = plan.nodes.len().saturating_sub(plan.scroll + visible);
+    let hint = if more > 0 {
+        format!(" ↑/↓ scroll ({more} more) · Esc close ")
+    } else {
+        " ↑/↓ scroll · Esc close ".to_string()
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(hint, theme.dim()))),

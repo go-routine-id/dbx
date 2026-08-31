@@ -4,6 +4,7 @@ mod app;
 mod clipboard;
 mod config;
 mod driver;
+mod explain;
 mod export;
 mod theme;
 mod ui;
