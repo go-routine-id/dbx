@@ -73,6 +73,9 @@ pub struct QueryConsole {
     pub editor_scroll: usize,
     /// First editor column drawn, for lines wider than the pane.
     pub editor_scroll_x: usize,
+    /// How long the in-flight query has been running, refreshed each tick so
+    /// the result pane can show a live counter.
+    pub exec_elapsed: std::time::Duration,
 }
 
 /// Interval cycled through by `Ctrl+W`, in seconds. `None` (off) is the
@@ -199,6 +202,7 @@ impl QueryConsole {
             last_run: None,
             editor_scroll: 0,
             editor_scroll_x: 0,
+            exec_elapsed: std::time::Duration::ZERO,
         }
     }
 
@@ -1136,7 +1140,12 @@ fn render_result(
     };
 
     let title = if console.is_executing {
-        " Query Result (Executing...) ".to_string()
+        // A live counter (and the spinner below) is the difference between
+        // "working" and "hung" for a query that takes a while.
+        format!(
+            " Query Result — running {:.1}s (Esc to cancel) ",
+            console.exec_elapsed.as_secs_f64()
+        )
     } else if let Some(res) = &console.last_result {
         let watch = match console.watch_interval {
             Some(d) => format!(" [watch {}s]", d.as_secs()),
@@ -1164,6 +1173,27 @@ fn render_result(
         .style(theme.base())
         .title(title);
     console.result_hit_area = Some(block.inner(area));
+
+    // While running, the pane itself says so — an animated frame plus the
+    // elapsed time, so a slow query never reads as a hang.
+    if console.is_executing {
+        let inner = block.inner(area);
+        f.render_widget(block, area);
+        const FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+        let frame = FRAMES[(console.exec_elapsed.as_millis() / 80) as usize % FRAMES.len()];
+        let body = vec![
+            Line::from(Span::styled(
+                format!("{frame} Running query... {:.1}s", console.exec_elapsed.as_secs_f64()),
+                theme.accent(),
+            )),
+            Line::from(Span::styled("Esc to cancel", theme.dim())),
+        ];
+        f.render_widget(
+            Paragraph::new(body).alignment(Alignment::Center),
+            inner,
+        );
+        return;
+    }
 
     if let Some(err) = &console.execution_error {
         let inner = block.inner(area);

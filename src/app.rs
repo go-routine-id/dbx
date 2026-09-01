@@ -452,127 +452,171 @@ fn erd_menu_item_at(rect: Rect, col: u16, row: u16) -> Option<usize> {
     (idx < crate::ui::screens::explorer::ERD_MENU_OPTIONS.len()).then_some(idx)
 }
 
-/// Execute the active console's SQL: split into statements, run each, collect
-/// every result set, and record the run in history.
+/// An in-flight console query. Execution runs on its own task so the event
+/// loop keeps drawing (spinner, elapsed time) and stays able to accept the
+/// keystroke that cancels it.
+struct QueryRun {
+    rx: tokio::sync::mpsc::Receiver<Result<Vec<crate::driver::QueryResult>, String>>,
+    handle: tokio::task::JoinHandle<()>,
+    /// Tab the results belong to — the user may switch tabs while it runs.
+    tab: usize,
+    started: Instant,
+    query_text: String,
+}
+
+/// Validate the active console's SQL and start executing it in the background.
 ///
-/// Extracted from the key handler so the watch timer can trigger exactly the
-/// same path — a watched re-run must behave identically to pressing Ctrl+Enter.
-async fn run_console_query(
+/// Everything that needs the UI (the destructive-statement guard, empty input,
+/// the multi-statement warning) happens here, synchronously; only the actual
+/// round trips move to a task. `run` receives the handle to poll.
+fn start_console_query(
     exp: &mut crate::ui::screens::explorer::ExplorerState,
     drv: &Arc<dyn crate::driver::Driver>,
     toasts: &mut Toasts,
-    config: &mut AppConfig,
-    conn_name: Option<&String>,
+    run: &mut Option<QueryRun>,
 ) {
-    // Find active database from selected tree node or fallback to first namespace
+    // Find the active database from the selected tree node, else the first.
     let active_ns = if let Some(ns) = exp.selected_node().and_then(|n| n.kind.namespace()) {
         ns.clone()
     } else {
-        exp.namespaces.first().cloned().unwrap_or(crate::driver::Namespace("mysql".to_string()))
+        exp.namespaces
+            .first()
+            .cloned()
+            .unwrap_or(crate::driver::Namespace("mysql".to_string()))
     };
 
-    // Snapshot the console text before mutating state so
-    // we can decide whether the statement is destructive
-    // (M2.10 guard) without holding a borrow on the tab.
     let query_text = if let Some(WorkspaceTab::Console(c)) = exp.active_tab() {
         c.text()
     } else {
         return;
     };
 
-    // Destructive statement guard: DROP / TRUNCATE /
-    // DELETE-without-WHERE must be confirmed before they
-    // run. Reuses the SQL-confirm modal (Enter = execute,
-    // Esc = cancel) with a placeholder collection — the
-    // confirm path only needs the namespace.
+    // Destructive statement guard: DROP / TRUNCATE / DELETE-without-WHERE must
+    // be confirmed first. Reuses the SQL-confirm modal with a placeholder
+    // collection — that path only needs the namespace.
     if is_destructive_statement(&query_text) {
         toasts.push(
             ToastKind::Warning,
             "destructive statement detected — confirm to execute".to_string(),
         );
-        exp.sql_confirm_modal = Some(
-            crate::ui::screens::explorer::SqlConfirmModalState {
-                collection: crate::driver::CollectionRef {
-                    namespace: active_ns,
-                    name: "(console)".to_string(),
-                },
-                sql_query: query_text,
-                row_idx: 0,
+        exp.sql_confirm_modal = Some(crate::ui::screens::explorer::SqlConfirmModalState {
+            collection: crate::driver::CollectionRef {
+                namespace: active_ns,
+                name: "(console)".to_string(),
             },
-        );
+            sql_query: query_text,
+            row_idx: 0,
+        });
         return;
     }
 
-    if let Some(WorkspaceTab::Console(console)) = exp.active_tab_mut() {
-        let drv_clone = drv.clone();
-        console.is_executing = true;
-        console.execution_error = None;
+    // Split on `;` and drop pure comments, so a script of only comments is
+    // reported as empty rather than "succeeding" with nothing.
+    let statements: Vec<String> = crate::ui::screens::query::split_statements(&query_text)
+        .into_iter()
+        .filter(|s| !crate::ui::screens::query::is_comment_only(s))
+        .collect();
 
-        // Split on `;` and run each statement, collecting
-        // every result set (multi-statement support).
-        let statements = crate::ui::screens::query::split_statements(&query_text);
-        // Empty input is an error, not a silent success.
-        if statements.is_empty() {
-            console.is_executing = false;
-            console.execution_error = Some("empty query — nothing to execute".to_string());
-            console.results = Vec::new();
-            console.last_result = None;
-            console.active_result = 0;
-            toasts.push(ToastKind::Warning, "empty query — nothing to execute".to_string());
-            return;
-        }
-        // Stateful scripts (SET @x, transactions) run on
-        // separate pooled connections, so session state
-        // doesn't persist — warn up front.
-        if statements.len() > 1 {
-            toasts.push(
-                ToastKind::Warning,
-                "multi-statement: SET @x / BEGIN..COMMIT won't persist between statements".to_string(),
-            );
-        }
+    let tab = exp.active_tab_index;
+    let Some(WorkspaceTab::Console(console)) = exp.active_tab_mut() else {
+        return;
+    };
+    if statements.is_empty() {
+        console.is_executing = false;
+        console.execution_error = Some("empty query — nothing to execute".to_string());
+        console.results = Vec::new();
+        console.last_result = None;
+        console.active_result = 0;
+        toasts.push(
+            ToastKind::Warning,
+            "empty query — nothing to execute".to_string(),
+        );
+        return;
+    }
+    // Stateful scripts (SET @x, transactions) run on separate pooled
+    // connections, so session state doesn't persist — warn up front.
+    if statements.len() > 1 {
+        toasts.push(
+            ToastKind::Warning,
+            "multi-statement: SET @x / BEGIN..COMMIT won't persist between statements".to_string(),
+        );
+    }
+    console.is_executing = true;
+    console.execution_error = None;
+
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let drv = drv.clone();
+    let handle = tokio::spawn(async move {
         let mut results = Vec::new();
-        let mut failed: Option<String> = None;
+        let mut outcome = Ok(Vec::new());
         for stmt in &statements {
-            if crate::ui::screens::query::is_comment_only(stmt) {
-                return;
-            }
-            match drv_clone.execute(&active_ns, stmt).await {
+            match drv.execute(&active_ns, stmt).await {
                 Ok(r) => results.push(r),
                 Err(e) => {
-                    failed = Some(format!("{e:#}"));
+                    outcome = Err(format!("{e:#}"));
                     break;
                 }
             }
         }
-        console.is_executing = false;
-        match failed {
-            None => {
-                console.last_result = results.first().cloned();
-                console.active_result = 0;
-                console.results = results;
-                console.execution_error = None;
-                console.result_selected_row = 0;
-                console.result_selected_col = 0;
-                console.result_scroll_x = 0;
-                console.result_scroll_y = 0;
-                // Record to this connection's query history.
-                // Not persisted per-query (re-serializing the
-                // whole config on every run is too costly);
-                // saved once when the app exits.
-                if let Some(conn) = conn_name {
-                    config.push_history(conn, &query_text);
-                }
-                toasts.push(ToastKind::Success, "query executed".to_string());
+        if outcome.is_ok() {
+            outcome = Ok(results);
+        }
+        let _ = tx.send(outcome).await;
+    });
+
+    *run = Some(QueryRun {
+        rx,
+        handle,
+        tab,
+        started: Instant::now(),
+        query_text,
+    });
+}
+
+/// Apply a finished query to the console it was started from.
+fn finish_console_query(
+    exp: &mut crate::ui::screens::explorer::ExplorerState,
+    toasts: &mut Toasts,
+    config: &mut AppConfig,
+    conn_name: Option<&String>,
+    tab: usize,
+    query_text: &str,
+    outcome: Result<Vec<crate::driver::QueryResult>, String>,
+) {
+    // The user may have switched or closed tabs while it ran.
+    let Some(WorkspaceTab::Console(console)) = exp.tabs.get_mut(tab) else {
+        toasts.push(
+            ToastKind::Info,
+            "query finished, but its console tab is gone".to_string(),
+        );
+        return;
+    };
+    console.is_executing = false;
+    match outcome {
+        Ok(results) => {
+            console.last_result = results.first().cloned();
+            console.active_result = 0;
+            console.results = results;
+            console.execution_error = None;
+            console.result_selected_row = 0;
+            console.result_selected_col = 0;
+            console.result_scroll_x = 0;
+            console.result_scroll_y = 0;
+            // Recorded to history here rather than on disk per query —
+            // re-serializing the whole config every run is too costly; it is
+            // saved once on exit.
+            if let Some(conn) = conn_name {
+                config.push_history(conn, query_text);
             }
-            Some(e) => {
-                // Don't leave stale results from the previous
-                // run visible under the error.
-                console.execution_error = Some(e);
-                console.results = Vec::new();
-                console.last_result = None;
-                console.active_result = 0;
-                toasts.push(ToastKind::Error, "query failed".to_string());
-            }
+            toasts.push(ToastKind::Success, "query executed".to_string());
+        }
+        Err(e) => {
+            // Don't leave stale results visible under the error.
+            console.execution_error = Some(e);
+            console.results = Vec::new();
+            console.last_result = None;
+            console.active_result = 0;
+            toasts.push(ToastKind::Error, "query failed".to_string());
         }
     }
 }
@@ -1158,7 +1202,7 @@ const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-const EXPLORER_HELP_BINDINGS: [(&str, &str); 42] = [
+const EXPLORER_HELP_BINDINGS: [(&str, &str); 45] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
@@ -1166,6 +1210,9 @@ const EXPLORER_HELP_BINDINGS: [(&str, &str); 42] = [
     ("Ctrl+Enter / Alt+Enter / F5", "execute SQL query in active console"),
     ("Home / End (in editor)", "jump to start / end of line (also Ctrl+A / Ctrl+E)"),
     ("s / S (in table tab)", "add a sort column (asc/desc/off) / clear all sorting"),
+    ("Ctrl+B", "collapse / restore the explorer tree"),
+    ("Ctrl+Space (in editor)", "ask for autocomplete suggestions"),
+    ("Esc (while running)", "cancel the query in flight"),
     ("Ctrl+R", "reconnect after a dropped connection"),
     ("Ctrl+Shift+I", "import rows from a CSV file into the active table"),
     ("Alt+H", "open query history for this connection"),
@@ -1229,6 +1276,8 @@ pub struct App {
     form_test_rx: Option<tokio::sync::mpsc::Receiver<Result<std::time::Duration, String>>>,
     /// One-shot startup update check. `Some(latest)` means a newer release.
     update_check_rx: Option<tokio::sync::mpsc::Receiver<Option<String>>>,
+    /// Console query running in the background, if any.
+    query_run: Option<QueryRun>,
     /// Confirmation dialog for destructive delete on a saved connection.
     /// `Some` means a confirmation popup is open; user must press Enter to
     /// actually delete, or Esc to cancel. Stores the original index so the
@@ -1277,6 +1326,7 @@ impl App {
             form_modal: None,
             form_test_rx: None,
             update_check_rx: None,
+            query_run: None,
             confirm_delete_modal: None,
             mode: ScreenMode::Picker,
             active_driver: None,
@@ -2480,6 +2530,17 @@ impl App {
                         self.active_connection_name = None;
                         return;
                     }
+                    // Ctrl+B folds the explorer away so the console gets the
+                    // full width, and back again.
+                    KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        exp.tree_collapsed = !exp.tree_collapsed;
+                        // A hidden tree must not keep focus, or keys would go
+                        // to a pane that is not on screen.
+                        if exp.tree_collapsed {
+                            exp.focused_pane = FocusedPane::Workspace;
+                        }
+                        return;
+                    }
                     KeyCode::Tab => {
                         // Autocomplete takes priority over pane-switching:
                         // Tab inserts the highlighted suggestion.
@@ -3089,6 +3150,19 @@ impl App {
                                             c.move_cursor_right();
                                             c.autocomplete.clear();
                                         }
+                                        // Ctrl+Space asks for suggestions without
+                                        // having to type another character.
+                                        KeyCode::Char(' ')
+                                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                        {
+                                            refresh_autocomplete(c, &ac_tables, &ac_columns);
+                                            if c.autocomplete.is_empty() {
+                                                self.toasts.push(
+                                                    ToastKind::Info,
+                                                    "no suggestions here".to_string(),
+                                                );
+                                            }
+                                        }
                                         KeyCode::Backspace => {
                                             c.backspace();
                                             refresh_autocomplete(c, &ac_tables, &ac_columns);
@@ -3664,13 +3738,35 @@ impl App {
 
         let layout = layout::compute(area);
 
-        // Header
-        let config_str = format!("  [{}]", self.config_path.display());
-        let header = Line::from(vec![
+        // Header: identity, then where you are. The config path used to sit
+        // here, but "which connection and database am I in" is what actually
+        // needs answering while switching tabs.
+        let mut header_spans = vec![
             Span::styled("◆ dbx", theme.accent()),
             Span::styled(format!("  v{}", env!("CARGO_PKG_VERSION")), theme.dim()),
-            Span::styled(config_str, theme.dim()),
-        ]);
+        ];
+        if let Some(conn) = &self.active_connection_name {
+            let ns = self
+                .explorer_state
+                .as_ref()
+                .and_then(|e| e.selected_node().and_then(|n| n.kind.namespace()).cloned())
+                .or_else(|| {
+                    self.explorer_state
+                        .as_ref()
+                        .and_then(|e| e.namespaces.first().cloned())
+                });
+            header_spans.push(Span::styled("   ", theme.dim()));
+            header_spans.push(Span::styled(conn.clone(), theme.base()));
+            if let Some(ns) = ns {
+                header_spans.push(Span::styled(format!(" · {}", ns.0), theme.dim()));
+            }
+        } else {
+            header_spans.push(Span::styled(
+                format!("  [{}]", self.config_path.display()),
+                theme.dim(),
+            ));
+        }
+        let header = Line::from(header_spans);
         f.render_widget(Paragraph::new(header).style(theme.base()), layout.header);
 
         // Body
@@ -3687,7 +3783,7 @@ impl App {
                 let context_text = if self.connecting {
                     "Connecting..."
                 } else {
-                    "S1: Connection Picker"
+                    "Select a connection"
                 };
                 statusbar::render(f, layout.status, context_text, &PICKER_HINTS, theme);
             }
@@ -3695,7 +3791,16 @@ impl App {
                 if let Some(exp) = &mut self.explorer_state {
                     explorer::render_explorer(f, layout.body, exp, theme);
                 }
-                statusbar::render(f, layout.status, "S2: Explorer", &EXPLORER_HINTS, theme);
+                // "S2: Explorer" was an internal screen id from the spec; the
+                // status bar should report the connection instead.
+                let status = match (&self.active_connection_name, &self.active_driver) {
+                    (Some(name), Some(drv)) => {
+                        let info = drv.info();
+                        format!("● {name} · {} {}", info.name, info.server_version)
+                    }
+                    _ => "● not connected".to_string(),
+                };
+                statusbar::render(f, layout.status, &status, &EXPLORER_HINTS, theme);
             }
         }
 
@@ -4580,6 +4685,24 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         continue;
                     }
 
+                    // Esc while a query runs cancels it. Checked before every
+                    // other Esc handler so the running query wins.
+                    if key.code == KeyCode::Esc
+                        && let Some(run) = app.query_run.take()
+                    {
+                        run.handle.abort();
+                        if let Some(WorkspaceTab::Console(c)) = exp.tabs.get_mut(run.tab) {
+                            c.is_executing = false;
+                            c.execution_error = Some(
+                                "cancelled — the server may still be finishing this statement"
+                                    .to_string(),
+                            );
+                        }
+                        app.toasts
+                            .push(ToastKind::Info, "query cancelled".to_string());
+                        continue;
+                    }
+
                     // Schema diff overlay: scroll / copy / close.
                     if exp.schema_diff.is_some() {
                         match key.code {
@@ -5129,14 +5252,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 _ => true,
                             })
                         {
-                            run_console_query(
-                                exp,
-                                drv,
-                                &mut app.toasts,
-                                &mut app.config,
-                                app.active_connection_name.as_ref(),
-                            )
-                            .await;
+                            start_console_query(exp, drv, &mut app.toasts, &mut app.query_run);
                             if let Some(WorkspaceTab::Console(c)) = exp.active_tab_mut() {
                                 c.last_run = Some(Instant::now());
                             }
@@ -5294,14 +5410,12 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                             ));
                                             exp.active_tab_index = exp.tabs.len().saturating_sub(1);
                                             exp.focused_pane = FocusedPane::Workspace;
-                                            run_console_query(
+                                            start_console_query(
                                                 exp,
                                                 drv,
                                                 &mut app.toasts,
-                                                &mut app.config,
-                                                app.active_connection_name.as_ref(),
-                                            )
-                                            .await;
+                                                &mut app.query_run,
+                                            );
                                         }
                                         None => app.toasts.push(
                                             ToastKind::Info,
@@ -5410,14 +5524,12 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                     )));
                                     exp.active_tab_index = exp.tabs.len().saturating_sub(1);
                                     exp.focused_pane = FocusedPane::Workspace;
-                                    run_console_query(
+                                    start_console_query(
                                         exp,
                                         drv,
                                         &mut app.toasts,
-                                        &mut app.config,
-                                        app.active_connection_name.as_ref(),
-                                    )
-                                    .await;
+                                        &mut app.query_run,
+                                    );
                                 }
                                 // `i` → open the INSERT-row modal. All fields start
                                 // in the "skip" state so the user can opt in to
@@ -5583,6 +5695,42 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
             spinner.tick();
             app.toasts.tick();
 
+            // A finished background query lands here rather than blocking the
+            // loop, so the UI kept drawing (and accepting Esc) while it ran.
+            if let Some(run) = &mut app.query_run {
+                match run.rx.try_recv() {
+                    Ok(outcome) => {
+                        let (tab, text) = (run.tab, run.query_text.clone());
+                        app.query_run = None;
+                        if let Some(exp) = &mut app.explorer_state {
+                            finish_console_query(
+                                exp,
+                                &mut app.toasts,
+                                &mut app.config,
+                                app.active_connection_name.as_ref(),
+                                tab,
+                                &text,
+                                outcome,
+                            );
+                        }
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        // The task died without reporting — don't leave the
+                        // console stuck showing "executing".
+                        let tab = run.tab;
+                        app.query_run = None;
+                        if let Some(exp) = &mut app.explorer_state
+                            && let Some(WorkspaceTab::Console(c)) = exp.tabs.get_mut(tab)
+                        {
+                            c.is_executing = false;
+                            c.execution_error =
+                                Some("query task ended unexpectedly".to_string());
+                        }
+                    }
+                }
+            }
+
             // Watch mode: re-run the active console's query once its interval
             // has elapsed. Uses the same path as Ctrl+Enter so results, errors
             // and history behave identically.
@@ -5611,6 +5759,18 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                 .unwrap_or(false)
                 || app.help_open
                 || app.form_modal.is_some();
+            // Feed the running query's elapsed time to the console so its
+            // pane can show a live counter rather than a frozen label.
+            if let Some(run) = &app.query_run {
+                let elapsed = run.started.elapsed();
+                let tab = run.tab;
+                if let Some(exp) = &mut app.explorer_state
+                    && let Some(WorkspaceTab::Console(c)) = exp.tabs.get_mut(tab)
+                {
+                    c.exec_elapsed = elapsed;
+                }
+            }
+
             let watch_due = !overlay_open
                 && app
                 .explorer_state
@@ -5627,14 +5787,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
             if watch_due
                 && let (Some(drv), Some(exp)) = (&app.active_driver.clone(), &mut app.explorer_state)
             {
-                run_console_query(
-                    exp,
-                    drv,
-                    &mut app.toasts,
-                    &mut app.config,
-                    app.active_connection_name.as_ref(),
-                )
-                .await;
+                start_console_query(exp, drv, &mut app.toasts, &mut app.query_run);
                 if let Some(WorkspaceTab::Console(c)) = exp.active_tab_mut() {
                     c.last_run = Some(Instant::now());
                 }

@@ -33,7 +33,10 @@ A light theme reuses the same tokens with different values (M4).
 - **No heavy/double borders** — thin muted borders, sometimes only a separator
   line. Rounded corners (`╭─╮`).
 - **Accent discipline** — only the focused element carries the accent color;
-  everything else stays gray.
+  everything else stays gray. *Exception:* a pane that loses focus keeps its
+  selection in the accent colour, dropping only the bold weight — recolouring
+  it grey read as a different kind of selection and made you lose your place
+  when opening a table moved focus to the workspace.
 - **Living loading states** — animated spinner + elapsed time while a query
   runs (`⠋ Running query... 1.2s`), never a frozen UI.
 - **Toasts** — transient messages bottom-right (`✓ Connected to local-mysql`),
@@ -103,6 +106,11 @@ Pressing `enter` on a table in the explorer opens its **data tab**
 │ 1    │ ryan   │ ryan@x.com       │ 2026-01-02                        │
 ```
 
+Objects under a schema are grouped by kind with a labelled rule
+(`Tables (12) ─────`) rather than another level of expanding, so everything
+stays one keypress away while remaining scannable. The dividers are not
+selectable — navigation steps over them.
+
 ### 3. ERD view
 
 Generated from `information_schema` foreign keys, laid out by flowmaid,
@@ -129,21 +137,33 @@ painted with unicode box/line drawing.
 
 ## Keybindings
 
+> The bindings below are the ones actually shipped. `?` in the app is the
+> authoritative list; this table is kept in step with it.
+
 Global:
 
-| Key           | Action                                   |
-|---------------|------------------------------------------|
-| `tab`         | Toggle focus explorer ↔ main panel       |
-| `ctrl+b`      | Collapse/expand explorer                 |
-| `ctrl+enter`  | Run statement at cursor                  |
-| `esc`         | Cancel running query / close popup       |
-| `F1`          | DDL / quick documentation popup          |
-| `ctrl+n`      | New console tab                          |
-| `ctrl+w`      | Close current tab                        |
-| `ctrl+e`      | Query history popup                      |
-| `ctrl+d`      | Disconnect / switch connection           |
-| `?`           | Help popup                               |
-| `q`           | Quit / back                              |
+| Key                            | Action                                   |
+|--------------------------------|------------------------------------------|
+| `tab`                          | Toggle focus explorer ↔ main panel       |
+| `ctrl+b`                       | Collapse/restore explorer                |
+| `ctrl+enter` / `alt+enter` / `F5` | Run the console's SQL                 |
+| `esc`                          | Cancel running query / close popup / back |
+| `F1`                           | DDL popup for the selected object        |
+| `c`                            | New console tab                          |
+| `w`                            | Close current tab                        |
+| `[` / `]`                      | Previous / next tab (also click a tab)   |
+| `alt+h`                        | Query history popup                      |
+| `alt+f` / `ctrl+s`             | Saved query collections / save current   |
+| `ctrl+t`                       | Search all objects                       |
+| `ctrl+r`                       | Reconnect after a dropped connection     |
+| `ctrl+e`                       | Export the active result                 |
+| `?`                            | Help popup (scrolls; two columns if wide) |
+| `q`                            | Quit / back                              |
+
+`ctrl+n` / `ctrl+w` / `ctrl+d` from the original concept were reassigned:
+`ctrl+n` sets a cell to NULL, `ctrl+w` cycles the console watch interval, and
+`ctrl+d` deletes a saved query. Tab management uses the unmodified `c` / `w`
+because the console editor never needs those letters.
 
 Editor:
 
@@ -151,24 +171,36 @@ Editor:
 |---------------|------------------------------------------|
 | `ctrl+space`  | Trigger autocomplete manually            |
 | `↑↓` `tab`    | Navigate/accept autocomplete popup       |
+| `home`/`end`, `ctrl+a`/`ctrl+e` | Start / end of line    |
+| `ctrl+f`      | Pretty-print the SQL                     |
+| `ctrl+p`      | EXPLAIN the query, shown as a plan tree  |
+| `ctrl+w`      | Cycle auto re-run: off / 1s / 5s / 15s / 60s |
 
-Result grid:
+Result grid / data tab:
 
 | Key           | Action                                   |
 |---------------|------------------------------------------|
 | `/`           | Client-side filter                       |
-| `s`           | Sort by focused column                   |
-| `←` `→`       | Previous/next page                       |
-| `ctrl+s`      | Export CSV                               |
+| `s` / `S`     | Add a sort column (asc/desc/off) / clear all |
+| `ctrl+f` / `ctrl+g` | Search every cell / jump to next match |
+| `v`           | Expand the selected row vertically       |
+| `n` / `p`     | Next / previous page                     |
+| `←` `→`       | Move the column selection (scroll horizontally) |
+| `f` / `F`     | Follow a foreign key / find what references this row |
+| `e` / `i` / `x` | Edit cell / insert row / delete row     |
+| `ctrl+e`      | Export (CSV / JSON / SQL INSERT)         |
 
 Explorer:
 
 | Key           | Action                                   |
 |---------------|------------------------------------------|
-| `j/k` `↑↓`    | Navigate tree                            |
-| `enter`       | Open table data tab                      |
-| `/`           | Filter tables                            |
-| `ctrl+o`      | Context menu (Open data / Copy name / Show DDL / Generate SELECT) |
+| `j/k` `↑↓`    | Navigate tree (skips section dividers)   |
+| `enter` / click | Open table data tab                    |
+| `a` / `e`     | Create object / edit schema              |
+| `g`           | Generate the ERD                         |
+| `ctrl+t`      | Search all objects (stands in for a tree filter) |
+| `ctrl+k`      | List running queries (cancel with `x`)   |
+| `alt+d`       | Compare this schema with another connection |
 
 ---
 

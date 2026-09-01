@@ -550,6 +550,8 @@ pub struct ExplorerState {
     pub import_csv_modal: Option<ImportCsvModalState>,
     pub schema_edit_modal: Option<SchemaEditModalState>,
     pub create_object_modal: Option<CreateObjectModalState>,
+    /// Explorer tree folded away to give the workspace the full width.
+    pub tree_collapsed: bool,
     pub erd_menu: Option<ErdMenuState>,
     /// Query-plan overlay (`Ctrl+P` in a console).
     pub explain_plan: Option<ExplainPlanState>,
@@ -604,6 +606,7 @@ impl ExplorerState {
             import_csv_modal: None,
             schema_edit_modal: None,
             create_object_modal: None,
+            tree_collapsed: false,
             erd_menu: None,
             erd_menu_area: None,
             explain_plan: None,
@@ -760,15 +763,22 @@ pub fn render_explorer(
     state: &mut ExplorerState,
     theme: &Theme,
 ) {
+    // The console is the centre of gravity, so the tree can be folded away to
+    // give it the full width (Ctrl+B).
+    let tree_w = if state.tree_collapsed { 0 } else { 32 };
     let main_chunks = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
-            Constraint::Length(32), // Explorer tree width
-            Constraint::Min(48),   // Workspace / Table grid
+            Constraint::Length(tree_w), // Explorer tree width
+            Constraint::Min(48),        // Workspace / Table grid
         ])
         .split(area);
 
-    render_tree(f, main_chunks[0], state, theme);
+    if !state.tree_collapsed {
+        render_tree(f, main_chunks[0], state, theme);
+    } else {
+        state.tree_hit_area = None;
+    }
     render_workspace(f, main_chunks[1], state, theme);
 
     if let Some((cref, ddl)) = state.ddl_popup.clone() {
