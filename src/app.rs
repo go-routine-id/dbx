@@ -475,6 +475,15 @@ fn start_console_query(
     toasts: &mut Toasts,
     run: &mut Option<QueryRun>,
 ) {
+    // Only one query at a time: starting a second would orphan the first,
+    // leaving its console spinning forever with no way to cancel it.
+    if run.is_some() {
+        toasts.push(
+            ToastKind::Warning,
+            "a query is already running — press Esc to cancel it".to_string(),
+        );
+        return;
+    }
     // Find the active database from the selected tree node, else the first.
     let active_ns = if let Some(ns) = exp.selected_node().and_then(|n| n.kind.namespace()) {
         ns.clone()
@@ -583,12 +592,21 @@ fn finish_console_query(
     query_text: &str,
     outcome: Result<Vec<crate::driver::QueryResult>, String>,
 ) {
-    // The user may have switched or closed tabs while it ran.
-    let Some(WorkspaceTab::Console(console)) = exp.tabs.get_mut(tab) else {
+    // Tabs can be closed while a query runs, which shifts every later index —
+    // so the slot alone is not proof it is the same console. Requiring it to
+    // still be marked executing stops results landing in an unrelated tab.
+    let stale = !matches!(
+        exp.tabs.get(tab),
+        Some(WorkspaceTab::Console(c)) if c.is_executing
+    );
+    if stale {
         toasts.push(
             ToastKind::Info,
             "query finished, but its console tab is gone".to_string(),
         );
+        return;
+    }
+    let Some(WorkspaceTab::Console(console)) = exp.tabs.get_mut(tab) else {
         return;
     };
     console.is_executing = false;
@@ -2518,7 +2536,7 @@ impl App {
                         // the tree) disconnects back to the picker. Modals are
                         // already dismissed by their own handlers above.
                         if exp.focused_pane == FocusedPane::Workspace {
-                            exp.focused_pane = FocusedPane::Tree;
+                            exp.focus_tree();
                             return;
                         }
                         self.mode = ScreenMode::Picker;
@@ -2567,7 +2585,9 @@ impl App {
                                 switch_to_tree = true;
                             }
 
-                            if switch_to_tree {
+                            // A collapsed tree is not on screen; focusing it
+                            // would send keys to a pane the user cannot see.
+                            if switch_to_tree && !exp.tree_collapsed {
                                 exp.focused_pane = FocusedPane::Tree;
                             }
                         }
@@ -3517,7 +3537,9 @@ impl App {
                             // tab list is fully empty — if other tabs remain, the user
                             // probably wants to keep working in the workspace.
                             if exp.tabs.is_empty() {
-                                exp.focused_pane = FocusedPane::Tree;
+                                // Nothing left in the workspace, so the tree
+                                // has to come back even if it was folded.
+                                exp.focus_tree();
                             }
                         }
                     }

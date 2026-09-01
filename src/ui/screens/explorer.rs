@@ -619,6 +619,15 @@ impl ExplorerState {
         }
     }
 
+    /// Give the tree focus, revealing it first if it was folded away.
+    ///
+    /// Focus must never land on a pane that is not drawn — the keys would go
+    /// somewhere the user cannot see.
+    pub fn focus_tree(&mut self) {
+        self.tree_collapsed = false;
+        self.focused_pane = FocusedPane::Tree;
+    }
+
     /// Next selectable row from `from` in `dir` (+1 / -1), skipping section
     /// dividers. Returns `from` when there is nothing selectable that way, so
     /// the selection never lands on a label or runs off the list.
@@ -2836,6 +2845,19 @@ mod tests {
         st.tree_nodes[0].is_expanded = true;
         st.rebuild_tree_nodes();
         st
+    }
+
+    #[test]
+    fn test_focusing_the_tree_reveals_it_when_collapsed() {
+        // Ctrl+B hides the tree; anything that later hands focus back must
+        // bring it on screen, or keys would go to a pane nobody can see.
+        let mut st = expanded_state();
+        st.tree_collapsed = true;
+        st.focused_pane = FocusedPane::Workspace;
+
+        st.focus_tree();
+        assert!(!st.tree_collapsed, "tree must be revealed when focused");
+        assert_eq!(st.focused_pane, FocusedPane::Tree);
     }
 
     #[test]
