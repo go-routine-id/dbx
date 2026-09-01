@@ -1,6 +1,6 @@
 [package]
 name = "dbx"
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
 description = "Terminal database explorer — DataGrip-like UX, opencode-like UI"
 license = "GPL-3.0-or-later"
