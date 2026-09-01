@@ -1642,11 +1642,21 @@ impl App {
             {
                 let idx = (mouse.row - area.y) as usize + exp.tree_scroll;
                 if idx < exp.tree_nodes.len() {
+                    // Clicking a section divider only moves the selection to a
+                    // real row; it must not open whatever happens to sit next
+                    // to the label.
+                    let clicked_openable = exp
+                        .tree_nodes
+                        .get(idx)
+                        .map(|n| n.kind.is_selectable())
+                        .unwrap_or(false);
                     exp.selected_tree_index = exp.snap_to_selectable(idx);
                     exp.focused_pane = FocusedPane::Tree;
                     // A click opens the node outright — selecting it and then
                     // asking for a second keypress is a step nobody wants.
-                    if let Some(drv) = self.active_driver.clone() {
+                    if clicked_openable
+                        && let Some(drv) = self.active_driver.clone()
+                    {
                         let page_size = self.config.effective_page_size();
                         open_tree_node(exp, &drv, &mut self.toasts, page_size).await;
                     }
@@ -2709,7 +2719,7 @@ impl App {
                                     }
                                     KeyCode::Char('i') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                                         // Copy the selected row as an INSERT statement.
-                                        if let Some(row) = t.page.records.get(t.selected_row) {
+                                        if let Some(row) = crate::ui::screens::explorer::visible_records(t).get(t.selected_row).copied() {
                                             let driver_name = self
                                                 .active_driver
                                                 .as_ref()
@@ -2813,7 +2823,13 @@ impl App {
                                         }
                                     }
                                     KeyCode::Down | KeyCode::Char('j') => {
-                                        if !t.page.records.is_empty() && t.selected_row < t.page.records.len() - 1 {
+                                        // Bound by the DISPLAYED rows: with a
+                                        // filter active the natural count is
+                                        // larger, which would let the cursor
+                                        // walk past the last visible row.
+                                        let visible =
+                                            crate::ui::screens::explorer::visible_records(t).len();
+                                        if t.selected_row + 1 < visible {
                                             t.selected_row += 1;
                                         }
                                     }
@@ -2872,7 +2888,7 @@ impl App {
                                         );
                                     }
                                     KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                        if let Some(row) = t.page.records.get(t.selected_row) {
+                                        if let Some(row) = crate::ui::screens::explorer::visible_records(t).get(t.selected_row).copied() {
                                             match ClipboardManager::copy_row_tsv(row) {
                                                 Ok(_) => self.toasts.push(ToastKind::Success, "copied row as TSV (spreadsheet) to clipboard".to_string()),
                                                 Err(e) => self.toasts.push(ToastKind::Error, e),
@@ -2880,7 +2896,7 @@ impl App {
                                         }
                                     }
                                     KeyCode::Char('y') => {
-                                        if let Some(row) = t.page.records.get(t.selected_row) {
+                                        if let Some(row) = crate::ui::screens::explorer::visible_records(t).get(t.selected_row).copied() {
                                             if let Some(val) = row.values.get(t.selected_col) {
                                                 match ClipboardManager::copy_cell(val) {
                                                     Ok(_) => self.toasts.push(ToastKind::Success, "copied cell to clipboard".to_string()),
@@ -2891,7 +2907,7 @@ impl App {
                                     }
                                     KeyCode::Char('c') => {
                                         if !key.modifiers.contains(KeyModifiers::CONTROL) {
-                                            if let Some(row) = t.page.records.get(t.selected_row) {
+                                            if let Some(row) = crate::ui::screens::explorer::visible_records(t).get(t.selected_row).copied() {
                                                 if let Some(val) = row.values.get(t.selected_col) {
                                                     match ClipboardManager::copy_cell(val) {
                                                         Ok(_) => self.toasts.push(ToastKind::Success, "copied cell to clipboard".to_string()),
@@ -2902,7 +2918,7 @@ impl App {
                                         }
                                     }
                                     KeyCode::Char('Y') => {
-                                        if let Some(row) = t.page.records.get(t.selected_row) {
+                                        if let Some(row) = crate::ui::screens::explorer::visible_records(t).get(t.selected_row).copied() {
                                             match ClipboardManager::copy_row_json(&t.page.columns, row) {
                                                 Ok(_) => self.toasts.push(ToastKind::Success, "copied row as JSON to clipboard".to_string()),
                                                 Err(e) => self.toasts.push(ToastKind::Error, e),
@@ -2914,7 +2930,7 @@ impl App {
                                             self.toasts.push(ToastKind::Warning, "this view is read-only".to_string());
                                         } else if !can_edit {
                                             self.toasts.push(ToastKind::Warning, "active driver does not support editing data");
-                                        } else if let Some(row) = t.page.records.get(t.selected_row)
+                                        } else if let Some(row) = crate::ui::screens::explorer::visible_records(t).get(t.selected_row).copied()
                                             && let Some(col_name) = t.page.columns.get(t.selected_col)
                                             && let Some(val) = row.values.get(t.selected_col)
                                         {
@@ -5189,7 +5205,14 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                             .filter(|c| c.is_primary_key)
                                             .map(|c| c.name.clone())
                                             .collect();
-                                        let row = t.page.records.get(t.selected_row)?;
+                                        // `selected_row` indexes the DISPLAYED
+                                        // rows; reading page.records directly
+                                        // would target a different row whenever
+                                        // a filter or sort is active — and this
+                                        // one builds a DELETE.
+                                        let row = crate::ui::screens::explorer::visible_records(t)
+                                            .get(t.selected_row)
+                                            .copied()?;
                                         let driver_name = drv.info().name.clone();
                                         let where_sql = build_where_for_row(
                                             &t.page.columns,

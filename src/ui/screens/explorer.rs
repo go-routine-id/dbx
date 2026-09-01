@@ -2683,6 +2683,47 @@ mod tests {
         assert!(search_matches(&tab).is_empty());
     }
 
+    /// `selected_row` indexes the DISPLAYED rows. Row actions (copy, edit and
+    /// especially DELETE) used to read `page.records` in natural order, so with
+    /// a sort or filter active they targeted a different row than the one the
+    /// user had highlighted.
+    #[test]
+    fn test_selected_row_resolves_through_the_displayed_order() {
+        let mut tab = tab_with(
+            &["id"],
+            vec![
+                record(vec![Value::Int(30)]),
+                record(vec![Value::Int(10)]),
+                record(vec![Value::Int(20)]),
+            ],
+        );
+        // Sorted ascending the display order is 10, 20, 30.
+        tab.sort_keys = vec![(0, SortDir::Asc)];
+        tab.selected_row = 0;
+
+        let displayed = visible_records(&tab);
+        assert_eq!(displayed[tab.selected_row].values[0].display_str(), "10");
+        // The natural-order read that used to back DELETE points elsewhere.
+        assert_eq!(tab.page.records[tab.selected_row].values[0].display_str(), "30");
+    }
+
+    #[test]
+    fn test_filter_shrinks_the_selectable_row_range() {
+        let mut tab = tab_with(
+            &["id"],
+            vec![
+                record(vec![Value::Int(1)]),
+                record(vec![Value::Int(2)]),
+                record(vec![Value::Int(3)]),
+            ],
+        );
+        tab.filter = parse_filter("id = 2", &tab.page.columns);
+        // Only one row is displayed, so only index 0 is a valid selection even
+        // though `page.records` still holds three.
+        assert_eq!(visible_records(&tab).len(), 1);
+        assert_eq!(tab.page.records.len(), 3);
+    }
+
     #[test]
     fn test_multi_column_sort_uses_later_keys_only_to_break_ties() {
         // (status, priority): sorting by status first must group the statuses,
