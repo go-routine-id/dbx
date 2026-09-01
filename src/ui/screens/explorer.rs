@@ -312,8 +312,9 @@ pub struct DataTab {
     pub foreign_keys: Vec<crate::driver::ForeignKeyMeta>,
     /// Active client-side sort (column index into `page.columns`) + direction.
     /// `None` = natural order.
-    pub sort_col: Option<usize>,
-    pub sort_dir: SortDir,
+    /// Active sort keys in priority order: the first decides, later ones only
+    /// break ties. Empty = natural order.
+    pub sort_keys: Vec<(usize, SortDir)>,
     /// Active client-side filter, applied on top of the sort.
     pub filter: Option<FilterExpr>,
     /// `true` while the user is typing a filter expression in the footer.
@@ -363,8 +364,9 @@ pub fn visible_records(tab: &DataTab) -> Vec<&Record> {
                 .unwrap_or(true)
         })
         .collect();
-    if let Some(sort_col) = tab.sort_col {
-        rows.sort_by(|a, b| compare_records(a, b, sort_col, tab.sort_dir));
+    if !tab.sort_keys.is_empty() {
+        // Stable so equal rows keep the order the server sent them in.
+        rows.sort_by(|a, b| compare_by_keys(a, b, &tab.sort_keys));
     }
     rows
 }
@@ -1862,6 +1864,11 @@ fn render_workspace(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme:
                         format!(" | filter {} ({}/{} shown)", f.display(), shown, data_tab.page.records.len())
                     });
                     let ro = if data_tab.read_only { " [read-only view]" } else { "" };
+                    let sort_badge = if data_tab.sort_keys.len() > 1 {
+                        format!(" | sorted by {} columns", data_tab.sort_keys.len())
+                    } else {
+                        String::new()
+                    };
                     let search_badge = if data_tab.search_query.is_empty() {
                         String::new()
                     } else {
@@ -1872,14 +1879,14 @@ fn render_workspace(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme:
                         )
                     };
                     let footer_text = format!(
-                        " Page {} (showing {} rows{}){}{}{} | [v] row  [s] sort  [/] filter  [Ctrl+F] search  [n]/[p] page  [w] Close",
+                        " Page {} (showing {} rows{}){}{}{} | [v] row  [s/S] sort/clear  [/] filter  [Ctrl+F] search  [n]/[p] page  [w] Close",
                         data_tab.page.page + 1,
                         data_tab.page.records.len(),
                         total_str,
                         ro,
                         filter_badge.unwrap_or_default(),
                         search_badge
-                    );
+                    ) + &sort_badge;
                     Paragraph::new(Span::styled(footer_text, theme.dim()))
                 };
                 f.render_widget(p, chunks[2]);
@@ -1970,14 +1977,23 @@ fn render_grid(f: &mut Frame, area: Rect, tab: &mut DataTab, is_focused: bool, t
         theme.selected_inactive()
     };
 
-    // Sort indicator on the active sort column header.
-    let sort_indicator = |abs_col: usize| -> &'static str {
-        match tab.sort_col {
-            Some(c) if c == abs_col => match tab.sort_dir {
-                SortDir::Asc => " ↑",
-                SortDir::Desc => " ↓",
-            },
-            _ => "",
+    // Sort indicator: direction plus the key's position, so a multi-column
+    // sort shows which column decides and which only breaks ties.
+    let sort_indicator = |abs_col: usize| -> String {
+        match tab.sort_keys.iter().position(|(c, _)| *c == abs_col) {
+            Some(i) => {
+                let arrow = match tab.sort_keys[i].1 {
+                    SortDir::Asc => "↑",
+                    SortDir::Desc => "↓",
+                };
+                // Rank is only worth showing once more than one key is active.
+                if tab.sort_keys.len() > 1 {
+                    format!(" {arrow}{}", i + 1)
+                } else {
+                    format!(" {arrow}")
+                }
+            }
+            None => String::new(),
         }
     };
 
@@ -2064,6 +2080,18 @@ fn render_grid(f: &mut Frame, area: Rect, tab: &mut DataTab, is_focused: bool, t
 }
 
 /// Compare two records on the given column, applying the sort direction.
+/// Compare two rows across every sort key, in priority order: the first key
+/// that separates them decides, the rest only break ties.
+pub fn compare_by_keys(a: &Record, b: &Record, keys: &[(usize, SortDir)]) -> std::cmp::Ordering {
+    for &(col, dir) in keys {
+        let ord = compare_records(a, b, col, dir);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
 pub fn compare_records(a: &Record, b: &Record, col: usize, dir: SortDir) -> std::cmp::Ordering {
     let va = a.values.get(col).unwrap_or(&crate::driver::Value::Null);
     let vb = b.values.get(col).unwrap_or(&crate::driver::Value::Null);
@@ -2605,8 +2633,7 @@ mod tests {
             scroll_offset_x: 0,
             column_meta: Vec::new(),
             foreign_keys: Vec::new(),
-            sort_col: None,
-            sort_dir: SortDir::Asc,
+            sort_keys: Vec::new(),
             filter: None,
             filter_editing: false,
             filter_buffer: String::new(),
@@ -2648,12 +2675,71 @@ mod tests {
 
         // Sorted by name, "ada" moves to the top — the match must follow the
         // rows the user can actually see.
-        tab.sort_col = Some(1);
+        tab.sort_keys = vec![(1, SortDir::Asc)];
         assert_eq!(search_matches(&tab), vec![(0, 1)]);
 
         // No query -> no matches at all.
         tab.search_query.clear();
         assert!(search_matches(&tab).is_empty());
+    }
+
+    #[test]
+    fn test_multi_column_sort_uses_later_keys_only_to_break_ties() {
+        // (status, priority): sorting by status first must group the statuses,
+        // with priority deciding only inside each group.
+        let mut tab = tab_with(
+            &["status", "priority"],
+            vec![
+                record(vec![Value::String("open".into()), Value::Int(2)]),
+                record(vec![Value::String("done".into()), Value::Int(9)]),
+                record(vec![Value::String("open".into()), Value::Int(1)]),
+                record(vec![Value::String("done".into()), Value::Int(3)]),
+            ],
+        );
+        tab.sort_keys = vec![(0, SortDir::Asc), (1, SortDir::Asc)];
+
+        let got: Vec<String> = visible_records(&tab)
+            .iter()
+            .map(|r| format!("{}/{}", r.values[0].display_str(), r.values[1].display_str()))
+            .collect();
+        assert_eq!(got, vec!["done/3", "done/9", "open/1", "open/2"]);
+
+        // Flipping only the secondary key reorders within each group, not across.
+        tab.sort_keys = vec![(0, SortDir::Asc), (1, SortDir::Desc)];
+        let got: Vec<String> = visible_records(&tab)
+            .iter()
+            .map(|r| format!("{}/{}", r.values[0].display_str(), r.values[1].display_str()))
+            .collect();
+        assert_eq!(got, vec!["done/9", "done/3", "open/2", "open/1"]);
+    }
+
+    #[test]
+    fn test_sort_key_order_decides_priority() {
+        let rows = vec![
+            record(vec![Value::String("b".into()), Value::Int(1)]),
+            record(vec![Value::String("a".into()), Value::Int(2)]),
+        ];
+        let mut tab = tab_with(&["name", "n"], rows);
+
+        // Primary = name -> "a" first.
+        tab.sort_keys = vec![(0, SortDir::Asc), (1, SortDir::Asc)];
+        assert_eq!(visible_records(&tab)[0].values[0].display_str(), "a");
+
+        // Swap the priority -> the numeric column decides instead.
+        tab.sort_keys = vec![(1, SortDir::Asc), (0, SortDir::Asc)];
+        assert_eq!(visible_records(&tab)[0].values[0].display_str(), "b");
+    }
+
+    #[test]
+    fn test_compare_by_keys_is_equal_when_no_key_separates() {
+        let a = record(vec![Value::Int(1), Value::String("x".into())]);
+        let b = record(vec![Value::Int(1), Value::String("x".into())]);
+        assert_eq!(
+            compare_by_keys(&a, &b, &[(0, SortDir::Asc), (1, SortDir::Asc)]),
+            std::cmp::Ordering::Equal
+        );
+        // No keys at all leaves everything equal, i.e. natural order.
+        assert_eq!(compare_by_keys(&a, &b, &[]), std::cmp::Ordering::Equal);
     }
 
     #[test]
@@ -2666,14 +2752,14 @@ mod tests {
                 record(vec![Value::Int(2)]),
             ],
         );
-        tab.sort_col = Some(0);
+        tab.sort_keys = vec![(0, SortDir::Asc)];
         let ids: Vec<String> = visible_records(&tab)
             .iter()
             .map(|r| r.values[0].display_str())
             .collect();
         assert_eq!(ids, vec!["1", "2", "3"]);
 
-        tab.sort_dir = SortDir::Desc;
+        tab.sort_keys = vec![(0, SortDir::Desc)];
         let ids: Vec<String> = visible_records(&tab)
             .iter()
             .map(|r| r.values[0].display_str())

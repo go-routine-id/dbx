@@ -423,8 +423,7 @@ async fn open_collection_tab(
         scroll_offset_x: 0,
         column_meta,
         foreign_keys,
-        sort_col: None,
-        sort_dir: crate::ui::screens::explorer::SortDir::Asc,
+        sort_keys: Vec::new(),
         filter: None,
         filter_editing: false,
         filter_buffer: String::new(),
@@ -1159,13 +1158,14 @@ const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-const EXPLORER_HELP_BINDINGS: [(&str, &str); 41] = [
+const EXPLORER_HELP_BINDINGS: [(&str, &str); 42] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
     ("Ctrl+T", "search all objects / jump to a table"),
     ("Ctrl+Enter / Alt+Enter / F5", "execute SQL query in active console"),
     ("Home / End (in editor)", "jump to start / end of line (also Ctrl+A / Ctrl+E)"),
+    ("s / S (in table tab)", "add a sort column (asc/desc/off) / clear all sorting"),
     ("Ctrl+R", "reconnect after a dropped connection"),
     ("Ctrl+Shift+I", "import rows from a CSV file into the active table"),
     ("Alt+H", "open query history for this connection"),
@@ -2773,22 +2773,39 @@ impl App {
                                         }
                                     }
                                     KeyCode::Char('s') => {
-                                        // Client-side sort on the selected column:
-                                        // off → asc → desc → off.
+                                        // Each column cycles asc → desc → off,
+                                        // and columns accumulate: sorting by a
+                                        // second column keeps the first as the
+                                        // primary key and uses the new one to
+                                        // break ties.
+                                        use crate::ui::screens::explorer::SortDir;
                                         let col = t.selected_col;
-                                        t.sort_col = match t.sort_col {
-                                            Some(c) if c == col => match t.sort_dir {
-                                                crate::ui::screens::explorer::SortDir::Asc => {
-                                                    t.sort_dir = crate::ui::screens::explorer::SortDir::Desc;
-                                                    Some(col)
+                                        match t.sort_keys.iter().position(|(c, _)| *c == col) {
+                                            None => t.sort_keys.push((col, SortDir::Asc)),
+                                            Some(i) => match t.sort_keys[i].1 {
+                                                SortDir::Asc => t.sort_keys[i].1 = SortDir::Desc,
+                                                SortDir::Desc => {
+                                                    t.sort_keys.remove(i);
                                                 }
-                                                crate::ui::screens::explorer::SortDir::Desc => None,
                                             },
-                                            _ => {
-                                                t.sort_dir = crate::ui::screens::explorer::SortDir::Asc;
-                                                Some(col)
-                                            }
-                                        };
+                                        }
+                                    }
+                                    // `S` drops every sort key at once —
+                                    // unwinding them one column at a time is
+                                    // tedious once a few are stacked up.
+                                    KeyCode::Char('S') => {
+                                        if t.sort_keys.is_empty() {
+                                            self.toasts.push(
+                                                ToastKind::Info,
+                                                "no sort to clear".to_string(),
+                                            );
+                                        } else {
+                                            t.sort_keys.clear();
+                                            self.toasts.push(
+                                                ToastKind::Info,
+                                                "sort cleared".to_string(),
+                                            );
+                                        }
                                     }
                                     KeyCode::Up | KeyCode::Char('k') => {
                                         if t.selected_row > 0 {
@@ -4065,27 +4082,9 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 .active_tab()
                                 .map(|tab| match tab {
                                     WorkspaceTab::Table(t) => {
-                                        let mut rec_refs: Vec<&crate::driver::Record> = t
-                                            .page
-                                            .records
-                                            .iter()
-                                            .filter(|r| {
-                                                t.filter
-                                                    .as_ref()
-                                                    .map(|f| {
-                                                        crate::ui::screens::explorer::record_matches_filter(r, f)
-                                                    })
-                                                    .unwrap_or(true)
-                                            })
-                                            .collect();
-                                        if let Some(sort_col) = t.sort_col {
-                                            rec_refs.sort_by(|a, b| {
-                                                crate::ui::screens::explorer::compare_records(
-                                                    a, b, sort_col, t.sort_dir,
-                                                )
-                                            });
-                                        }
-                                        rec_refs
+                                        // Same display order the grid shows,
+                                        // so `row_idx` means the same thing here.
+                                        crate::ui::screens::explorer::visible_records(t)
                                             .get(row_idx)
                                             .and_then(|r| r.values.get(col_idx))
                                             .map(|v| match v {
