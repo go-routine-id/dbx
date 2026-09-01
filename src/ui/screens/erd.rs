@@ -776,6 +776,7 @@ fn draw_tables(
 /// Relationship labels (at flowmaid's label-box centre) and crow's-foot
 /// cardinalities as text just off each edge endpoint — terminal users
 /// read text faster than mini-glyphs.
+#[allow(clippy::too_many_arguments)] // one viewport transform, passed as parts
 fn draw_edge_text(
     buf: &mut Buffer,
     scene: &ErScene,
