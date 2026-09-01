@@ -14,6 +14,18 @@ pub struct Theme {
     pub success: Color,
     pub warning: Color,
     pub error: Color,
+
+    // --- Syntax highlighting (SQL editor) ---
+    pub syntax_string: Color,
+    pub syntax_number: Color,
+    /// Quoted identifiers (`backticks`).
+    pub syntax_ident: Color,
+
+    /// Border colours cycled over ERD entities so neighbouring tables stay
+    /// distinguishable. Muted on purpose: the raw terminal colours they
+    /// replaced made the diagram read as a rainbow against a palette that is
+    /// otherwise deliberately quiet.
+    pub entity_accents: [Color; 6],
 }
 
 impl Theme {
@@ -29,6 +41,21 @@ impl Theme {
             success: Color::from_u32(0x3fb950),
             warning: Color::from_u32(0xd29922),
             error: Color::from_u32(0xf85149),
+
+            syntax_string: Color::from_u32(0xa5d6ff),
+            syntax_number: Color::from_u32(0xf0883e),
+            syntax_ident: Color::from_u32(0x7ee787),
+
+            // None of these is the warning amber, which marks the *selected*
+            // entity — a selection must never be mistaken for one more table.
+            entity_accents: [
+                Color::from_u32(0x7c83ff), // indigo (the accent)
+                Color::from_u32(0x39c5cf), // cyan
+                Color::from_u32(0x56d364), // green
+                Color::from_u32(0xdb61a2), // pink
+                Color::from_u32(0xa371f7), // purple
+                Color::from_u32(0xf0883e), // orange
+            ],
         }
     }
 
@@ -100,6 +127,51 @@ impl Default for Theme {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The design's rule is "widgets never hardcode colors". This walks the
+    /// actual source so the rule is enforced, not just documented — the ERD
+    /// alone had drifted to six raw terminal colours.
+    #[test]
+    fn test_no_widget_hardcodes_a_colour() {
+        let mut offenders = Vec::new();
+        for file in [
+            "src/app.rs",
+            "src/ui/screens/erd.rs",
+            "src/ui/screens/query.rs",
+            "src/ui/screens/explorer.rs",
+            "src/ui/screens/picker.rs",
+        ] {
+            let src = std::fs::read_to_string(file).unwrap_or_default();
+            for (i, line) in src.lines().enumerate() {
+                if line.contains("Color::") {
+                    offenders.push(format!("{file}:{}: {}", i + 1, line.trim()));
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "colours must come from Theme, found:\n{}",
+            offenders.join("\n")
+        );
+    }
+
+    #[test]
+    fn test_entity_accents_never_collide_with_the_selection_colour() {
+        let t = Theme::dark();
+        // The selected ERD entity is drawn in `warning`; if a table happened to
+        // cycle onto the same colour the selection would be invisible.
+        assert!(
+            !t.entity_accents.contains(&t.warning),
+            "an entity accent matches the selection colour"
+        );
+        // And they must all differ from each other, or two neighbouring tables
+        // would look like one.
+        for (i, a) in t.entity_accents.iter().enumerate() {
+            for b in &t.entity_accents[i + 1..] {
+                assert_ne!(a, b, "duplicate entity accent");
+            }
+        }
+    }
 
     /// A row selected by mouse (pane unfocused) must not change colour versus
     /// one selected by the arrow keys — only its weight. The first attempt

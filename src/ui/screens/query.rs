@@ -3,7 +3,7 @@
 
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, Paragraph, Row as TableRow, Table, TableState,
@@ -826,7 +826,7 @@ pub fn highlight_sql_line(line: &str, theme: &Theme) -> Vec<Span<'static>> {
                 } else if current_word.chars().all(|c| c.is_ascii_digit()) {
                     spans.push(Span::styled(
                         current_word.clone(),
-                        Style::default().fg(Color::Rgb(240, 140, 80)),
+                        Style::default().fg(theme.syntax_number),
                     ));
                 } else {
                     spans.push(Span::styled(current_word.clone(), theme.base()));
@@ -846,10 +846,12 @@ pub fn highlight_sql_line(line: &str, theme: &Theme) -> Vec<Span<'static>> {
                         break;
                     }
                 }
+                // Backticked identifiers read as names, plain quotes as
+                // string values — different meanings, different tokens.
                 let style = if quote_char == '`' {
-                    Style::default().fg(Color::Rgb(120, 200, 120))
+                    Style::default().fg(theme.syntax_ident)
                 } else {
-                    Style::default().fg(Color::Rgb(230, 200, 100))
+                    Style::default().fg(theme.syntax_string)
                 };
                 spans.push(Span::styled(literal, style));
             } else if ch == '-' && chars.peek().map(|(_, c)| *c) == Some('-') {
@@ -873,7 +875,7 @@ pub fn highlight_sql_line(line: &str, theme: &Theme) -> Vec<Span<'static>> {
         } else if current_word.chars().all(|c| c.is_ascii_digit()) {
             spans.push(Span::styled(
                 current_word,
-                Style::default().fg(Color::Rgb(240, 140, 80)),
+                Style::default().fg(theme.syntax_number),
             ));
         } else {
             spans.push(Span::styled(current_word, theme.base()));

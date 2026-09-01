@@ -13,7 +13,7 @@ use flowmaid::scene::Hit;
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::symbols::Marker;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::canvas::{Canvas, Circle, Line as CanvasLine};
@@ -40,16 +40,6 @@ const PAN_STEP_COLS: f64 = 4.0;
 /// the canvas border.
 const OVERSCROLL_CELLS: f64 = 60.0;
 
-/// Border accents cycled over entities (mirrors flowmaid's per-entity
-/// accent idea, terminal edition).
-const ACCENTS: [Color; 6] = [
-    Color::Cyan,
-    Color::Green,
-    Color::Magenta,
-    Color::Yellow,
-    Color::Blue,
-    Color::Red,
-];
 
 /// Viewport: world pixel coordinate shown at the top-left of the canvas,
 /// plus a zoom factor (1.0 = default scale).
@@ -610,11 +600,11 @@ pub fn render_erd(
     // within the current view: f(vy) = vy + vh (top), f(vy + vh) = vy.
     let flip = move |y: f64| 2.0 * vy + vh - y;
 
-    draw_edges(f, scene, canvas_area, vx, vw, vy, vh, flip);
+    draw_edges(f, scene, theme, canvas_area, vx, vw, vy, vh, flip);
 
     let buf = f.buffer_mut();
-    draw_tables(buf, scene, canvas_area, vx, vy, pcol, prow, erd.selected_node);
-    draw_edge_text(buf, scene, canvas_area, vx, vy, pcol, prow);
+    draw_tables(buf, scene, theme, canvas_area, vx, vy, pcol, prow, erd.selected_node);
+    draw_edge_text(buf, scene, theme, canvas_area, vx, vy, pcol, prow);
 
     let status = format!(
         " hjkl/arrows pan · 0 reset · +/- zoom ({:.2}x) · click node = menu · E export svg/mmd · offset ({:.0}, {:.0})px · scene {}x{} ",
@@ -629,6 +619,7 @@ pub fn render_erd(
 fn draw_edges(
     frame: &mut Frame,
     scene: &ErScene,
+    theme: &Theme,
     area: Rect,
     vx: f64,
     vw: f64,
@@ -642,7 +633,7 @@ fn draw_edges(
         .marker(Marker::Braille)
         .paint(|ctx| {
             for (j, edge) in scene.scene.edges.iter().enumerate() {
-                let color = Color::Gray;
+                let color = theme.border;
                 // Prefer routed waypoints (long edges threaded through
                 // per-layer channels); fall back to the single cubic bezier.
                 let points: Vec<(f64, f64)> = if edge.waypoints.len() >= 2 {
@@ -687,6 +678,7 @@ fn draw_edges(
 fn draw_tables(
     buf: &mut Buffer,
     scene: &ErScene,
+    theme: &Theme,
     area: Rect,
     vx: f64,
     vy: f64,
@@ -712,17 +704,17 @@ fn draw_tables(
         // schema" at a glance.
         let is_external = table.name.contains('.');
         let accent = if is_external {
-            Color::DarkGray
+            theme.text_dim
         } else {
-            ACCENTS[i % ACCENTS.len()]
+            theme.entity_accents[i % theme.entity_accents.len()]
         };
         // Selected node: brighter, bold border so it reads as the active
         // target (e.g. for Enter→DDL / click→DDL).
         let is_selected = selected == Some(i);
-        let border_color = if is_selected { Color::Yellow } else { accent };
+        let border_color = if is_selected { theme.warning } else { accent };
         let border_style = if is_selected {
             Style::default()
-                .fg(Color::Yellow)
+                .fg(theme.warning)
                 .add_modifier(Modifier::BOLD)
         } else {
             Style::default().fg(accent)
@@ -752,7 +744,7 @@ fn draw_tables(
                     inner.y + r as u16,
                     more,
                     inner.width as usize,
-                    Style::default().fg(Color::DarkGray),
+                    Style::default().fg(theme.text_dim),
                 );
                 break;
             }
@@ -763,7 +755,7 @@ fn draw_tables(
                 y,
                 left,
                 inner.width as usize,
-                Style::default().fg(Color::White),
+                Style::default().fg(theme.text),
             );
             if !row.keys.is_empty() {
                 let kw = row.keys.len() as u16;
@@ -773,7 +765,7 @@ fn draw_tables(
                         y,
                         row.keys.clone(),
                         kw as usize,
-                        Style::default().fg(Color::Yellow),
+                        Style::default().fg(theme.warning),
                     );
                 }
             }
@@ -787,14 +779,15 @@ fn draw_tables(
 fn draw_edge_text(
     buf: &mut Buffer,
     scene: &ErScene,
+    theme: &Theme,
     area: Rect,
     vx: f64,
     vy: f64,
     pcol: f64,
     prow: f64,
 ) {
-    let label_style = Style::default().fg(Color::Cyan);
-    let card_style = Style::default().fg(Color::DarkGray);
+    let label_style = Style::default().fg(theme.accent);
+    let card_style = Style::default().fg(theme.text_dim);
 
     for (j, edge) in scene.scene.edges.iter().enumerate() {
         if let Some((text, (cx, cy), _w)) = &edge.label {
