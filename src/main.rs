@@ -1,5 +1,6 @@
 //! dbx — terminal database explorer. M0: foundation shell (no DB yet).
 
+mod actions;
 mod app;
 mod clipboard;
 mod config;
