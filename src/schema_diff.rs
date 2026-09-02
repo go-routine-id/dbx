@@ -146,7 +146,7 @@ pub fn diff_schemas(source: &[CollectionMeta], target: &[CollectionMeta]) -> Vec
 /// target) are emitted as **comments**: losing data must be a deliberate act,
 /// not something a generated script does on your behalf.
 pub fn migration_sql(diffs: &[Difference], namespace: &str, driver_name: &str) -> String {
-    let q = |ident: &str| crate::app::quote_ident_pub(ident, driver_name);
+    let q = |ident: &str| crate::sql::quote_ident(ident, driver_name);
     let mut out = String::new();
     for d in diffs {
         let t = format!("{}.{}", q(namespace), q(d.table()));

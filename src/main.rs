@@ -7,6 +7,7 @@ mod driver;
 mod explain;
 mod export;
 mod schema_diff;
+mod sql;
 mod theme;
 mod ui;
 mod update;
