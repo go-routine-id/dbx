@@ -45,6 +45,9 @@ const TICK_CAP: Duration = Duration::from_millis(60);
 /// Kept internal — never shown to the user as-is; the modal renders it as
 /// the bold-italic word "NULL".
 pub use crate::sql::NULL_SENTINEL;
+use crate::keymap::{
+    EXPLORER_HELP_BINDINGS, EXPLORER_HINTS, PICKER_HELP_BINDINGS, PICKER_HINTS,
+};
 use crate::actions::{
     QueryRun, collect_schema, erd_menu_item_at, finish_console_query, open_collection_tab,
     open_tree_node, refresh_table_page, run_erd_menu_action, start_console_query, step_column,
@@ -146,88 +149,6 @@ fn refresh_autocomplete(
 
 
 
-const PICKER_HINTS: [(&str, &str); 7] = [
-    ("Enter", "connect"),
-    ("a", "add"),
-    ("e", "edit"),
-    ("d", "delete"),
-    ("t", "test"),
-    ("q", "quit"),
-    ("?", "help"),
-];
-
-const EXPLORER_HINTS: [(&str, &str); 12] = [
-    ("Tab", "pane"),
-    ("c", "new console"),
-    ("g", "erd"),
-    ("Ctrl+Enter", "run SQL"),
-    ("Enter/Space", "open/expand"),
-    ("y/Y", "copy cell/row"),
-    ("Ctrl+E", "export"),
-    ("e", "edit cell"),
-    ("x", "delete row"),
-    ("i", "insert row"),
-    ("w", "close tab"),
-    ("Esc", "picker"),
-];
-
-const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
-    ("Enter", "connect to selected database"),
-    ("a", "add new connection"),
-    ("e", "edit selected connection"),
-    ("d", "delete selected connection"),
-    ("t", "test connection ping"),
-    ("q", "quit"),
-    ("Esc", "close popup / back"),
-];
-
-const EXPLORER_HELP_BINDINGS: [(&str, &str); 45] = [
-    ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
-    ("c", "open new SQL Query Console tab"),
-    ("g", "open In-Terminal ERD diagram for selected database"),
-    ("Ctrl+T", "search all objects / jump to a table"),
-    ("Ctrl+Enter / Alt+Enter / F5", "execute SQL query in active console"),
-    ("Home / End (in editor)", "jump to start / end of line (also Ctrl+A / Ctrl+E)"),
-    ("s / S (in table tab)", "add a sort column (asc/desc/off) / clear all sorting"),
-    ("Ctrl+B", "collapse / restore the explorer tree"),
-    ("Ctrl+Space (in editor)", "ask for autocomplete suggestions"),
-    ("Esc (while running)", "cancel the query in flight"),
-    ("Ctrl+R", "reconnect after a dropped connection"),
-    ("Ctrl+Shift+I", "import rows from a CSV file into the active table"),
-    ("Alt+H", "open query history for this connection"),
-    ("Alt+F", "open saved query collections"),
-    ("Ctrl+S", "save current query to a collection"),
-    ("Ctrl+F", "pretty-print SQL in the editor"),
-    ("[ / ]", "switch workspace tab (or result set in console)"),
-    ("j / Down", "move cursor / selection down"),
-    ("k / Up", "move cursor / selection up"),
-    ("h / Left", "move cursor / column selection left"),
-    ("l / Right", "move cursor / column selection right"),
-    ("Space", "expand / collapse database node in tree"),
-    ("Enter", "open table in workspace grid"),
-    ("s", "sort data grid by active column (asc → desc → off)"),
-    ("/", "filter data grid rows (col op value, e.g. status = paid)"),
-    ("y / c", "copy active cell value to system clipboard"),
-    ("Y / Ctrl+Y", "copy active row as formatted JSON to clipboard"),
-    ("Ctrl+E", "open export dialog (CSV, JSON, SQL INSERT) for current dataset"),
-    ("e / Enter", "edit active cell value (shows safe SQL confirmation)"),
-    ("e (on tree table)", "edit table schema (ALTER: drop/add column, rename)"),
-    ("a (in tree)", "create schema / table / view / type / function"),
-    ("x", "delete selected row (shows safe SQL confirmation)"),
-    ("v (in table tab)", "expand the selected row vertically (wide tables)"),
-    ("Ctrl+F / Ctrl+G", "search all cells / jump to the next match"),
-    ("E (in ERD tab)", "export the diagram as ~/dbx_erd_<schema>.svg + .mmd"),
-    ("Ctrl+W (in console)", "cycle auto re-run: off / 1s / 5s / 15s / 60s"),
-    ("Ctrl+P (in console)", "EXPLAIN the query and show the plan tree"),
-    ("f (on an FK cell)", "open the row this foreign key references"),
-    ("F (on any cell)", "find every row in the schema that references it"),
-    ("Ctrl+K", "list running queries (x cancels, r refreshes)"),
-    ("Alt+D", "compare this schema with another saved connection"),
-    ("i", "open INSERT-row modal — fill fields, server applies DEFAULT for skipped"),
-    ("F1", "view table DDL schema popup"),
-    ("n / p", "next / previous page in data grid"),
-    ("w", "close active workspace tab"),
-];
 
 pub enum ScreenMode {
     Picker,

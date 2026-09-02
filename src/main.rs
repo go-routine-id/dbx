@@ -7,6 +7,7 @@ mod config;
 mod driver;
 mod explain;
 mod export;
+mod keymap;
 mod schema_diff;
 mod sql;
 mod theme;
