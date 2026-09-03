@@ -16,16 +16,25 @@ over SSH.
 
 Prebuilt binaries ship on every [release](https://github.com/go-routine-id/dbx/releases/latest).
 
+Not sure which asset to grab? Check your platform first:
+
+```bash
+uname -s -m
+# Darwin arm64  → dbx-macos-arm64
+# Darwin x86_64 → dbx-macos-x86_64
+# Linux  x86_64 → dbx-linux-x86_64
+```
+
 ### macOS
 
 ```bash
 # Apple Silicon (M1/M2/M3)
 curl -L -o dbx https://github.com/go-routine-id/dbx/releases/latest/download/dbx-macos-arm64
-chmod +x dbx && sudo mv dbx /usr/local/bin/
+chmod +x dbx && sudo mkdir -p /usr/local/bin && sudo mv dbx /usr/local/bin/
 
 # Intel
 curl -L -o dbx https://github.com/go-routine-id/dbx/releases/latest/download/dbx-macos-x86_64
-chmod +x dbx && sudo mv dbx /usr/local/bin/
+chmod +x dbx && sudo mkdir -p /usr/local/bin && sudo mv dbx /usr/local/bin/
 ```
 
 Gatekeeper may block the unsigned binary — allow it with `xattr -d com.apple.quarantine /usr/local/bin/dbx`.
@@ -34,7 +43,7 @@ Gatekeeper may block the unsigned binary — allow it with `xattr -d com.apple.q
 
 ```bash
 curl -L -o dbx https://github.com/go-routine-id/dbx/releases/latest/download/dbx-linux-x86_64
-chmod +x dbx && sudo mv dbx /usr/local/bin/
+chmod +x dbx && sudo mkdir -p /usr/local/bin && sudo mv dbx /usr/local/bin/
 ```
 
 ### Windows (x64)
