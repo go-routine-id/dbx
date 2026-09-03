@@ -273,15 +273,8 @@
     <div style="text-align:center;margin-bottom:24px">
       <a class="btn primary" href="https://github.com/go-routine-id/dbx/releases/latest">Download latest release →</a>
     </div>
-    <pre class="reveal"><span class="c"># 1. Pick the right asset for your platform</span>
-uname -s -m
-<span class="c">#   Darwin arm64  → dbx-macos-arm64</span>
-<span class="c">#   Darwin x86_64 → dbx-macos-x86_64</span>
-<span class="c">#   Linux  x86_64 → dbx-linux-x86_64</span>
-
-<span class="c"># 2. Download (example: macOS Apple Silicon) &amp; install</span>
-curl -L -o dbx https://github.com/go-routine-id/dbx/releases/latest/download/dbx-macos-arm64
-chmod +x dbx && sudo mkdir -p /usr/local/bin && sudo mv dbx /usr/local/bin/
+    <pre class="reveal"><span class="c"># One-line install (macOS &amp; Linux) — detects your platform automatically</span>
+curl -fsSL https://raw.githubusercontent.com/go-routine-id/dbx/main/install.sh | bash
 
 <span class="c"># Windows — x64: download dbx-windows-x86_64.exe, rename ke dbx.exe, taruh di PATH</span>
 

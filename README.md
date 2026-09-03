@@ -16,6 +16,16 @@ over SSH.
 
 Prebuilt binaries ship on every [release](https://github.com/go-routine-id/dbx/releases/latest).
 
+### One-line install (macOS & Linux)
+
+Detects your platform, downloads the right binary, and installs it:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/go-routine-id/dbx/main/install.sh | bash
+```
+
+### Manual install
+
 Not sure which asset to grab? Check your platform first:
 
 ```bash
