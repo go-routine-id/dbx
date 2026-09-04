@@ -162,7 +162,8 @@ impl Driver for PostgresDriver {
     }
 
     /// Active backends from `pg_stat_activity`, excluding this connection and
-    /// idle sessions — only work actually in flight is worth showing.
+    /// idle sessions — only work actually in flight is worth showing. Newest
+    /// first, as the trait contract promises.
     async fn process_list(&self) -> Result<QueryResult> {
         let sql = "\
             SELECT pid, usename AS user, datname AS database, state, \
@@ -170,7 +171,7 @@ impl Driver for PostgresDriver {
                    query \
             FROM pg_stat_activity \
             WHERE pid <> pg_backend_pid() AND state <> 'idle' \
-            ORDER BY query_start";
+            ORDER BY query_start DESC";
         self.execute(&Namespace("public".to_string()), sql).await
     }
 
@@ -507,10 +508,10 @@ impl Driver for PostgresDriver {
 
         let start = Instant::now();
         let trimmed = query.trim_start();
-        let is_select = trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("select")
-            || trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("show")
-            || trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("explain")
-            || trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("with");
+        let is_select = super::starts_with_keyword(trimmed, "select")
+            || super::starts_with_keyword(trimmed, "show")
+            || super::starts_with_keyword(trimmed, "explain")
+            || super::starts_with_keyword(trimmed, "with");
 
         if is_select {
             let rows = sqlx::query(AssertSqlSafe(query))

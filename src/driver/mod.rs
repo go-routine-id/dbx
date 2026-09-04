@@ -316,3 +316,13 @@ pub async fn connect_driver(cfg: &ConnectionConfig) -> Result<Arc<dyn Driver>> {
     }
 }
 
+/// Case-insensitive "does this SQL start with keyword `kw`" test. Byte-slicing
+/// at a fixed index (`trimmed[..6]`) panics when the cut lands inside a
+/// multi-byte char — a console query can start with arbitrary Unicode — so
+/// the prefix is taken with `get`, which yields None at a non-boundary.
+pub(crate) fn starts_with_keyword(trimmed: &str, kw: &str) -> bool {
+    trimmed
+        .get(..kw.len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case(kw))
+}
+

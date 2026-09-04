@@ -265,14 +265,29 @@ impl App {
     /// Establish a driver for `cfg`, honouring its optional `[ssh]` section:
     /// spawns the port forward first and re-points the config at the loopback
     /// end. The tunnel guard is stored on `self` so it lives exactly as long
-    /// as the driver; any previous tunnel is torn down first. On a driver
-    /// error the just-started tunnel is dropped (killed) before returning.
+    /// as the driver.
+    ///
+    /// A previous tunnel is kept alive until the new one is proven: a failed
+    /// reconnect must not kill the working forward the user still has. The one
+    /// case where the old tunnel must go first is a fixed `local_port` — the
+    /// new forward can't bind it while the old one holds it — so on
+    /// establish-failure the old tunnel is dropped and the establish retried
+    /// once. On a driver error the just-started tunnel is dropped (killed)
+    /// before returning.
     async fn connect_with_tunnel(
         &mut self,
         cfg: &crate::config::ConnectionConfig,
     ) -> anyhow::Result<Arc<dyn Driver>> {
-        self.ssh_tunnel = None; // dropping kills a previous tunnel
-        let (eff, tunnel) = crate::tunnel::SshTunnel::establish(cfg).await?;
+        let (eff, tunnel) = match crate::tunnel::SshTunnel::establish(cfg).await {
+            Ok(pair) => pair,
+            Err(first_err) => {
+                if self.ssh_tunnel.is_none() {
+                    return Err(first_err);
+                }
+                self.ssh_tunnel = None; // dropping frees a fixed local_port
+                crate::tunnel::SshTunnel::establish(cfg).await?
+            }
+        };
         let drv = crate::driver::connect_driver(&eff).await?;
         self.ssh_tunnel = tunnel;
         Ok(drv)
@@ -732,16 +747,16 @@ impl App {
                     {
                         let page_size = self.config.effective_page_size();
                         if let Some(err) = open_tree_node(exp, &drv, &mut self.toasts, page_size).await {
-                            // A dead connection gets one reconnect-and-retry;
-                            // anything else is just reported.
+                            // A dead connection gets one reconnect; anything
+                            // else is just reported. No automatic retry here:
+                            // the reconnect rebuilt the tree with the selection
+                            // reset, so re-running would open the FIRST node,
+                            // not the one the user clicked.
                             if self.try_reconnect(&err).await {
-                                if let (Some(drv2), Some(exp2)) =
-                                    (&self.active_driver.clone(), &mut self.explorer_state)
-                                    && let Some(err2) =
-                                        open_tree_node(exp2, drv2, &mut self.toasts, page_size).await
-                                {
-                                    self.toasts.push(ToastKind::Error, err2);
-                                }
+                                self.toasts.push(
+                                    ToastKind::Info,
+                                    "reconnected — open the node again to retry".to_string(),
+                                );
                             } else {
                                 self.toasts.push(ToastKind::Error, err);
                             }
@@ -3224,10 +3239,15 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             // Overwrite guard: if the target file already exists,
                             // ask the user to confirm before clobbering it. The
                             // first Enter flips the flag + warns; the second one
-                            // (with the flag set) proceeds.
-                            if !confirm_overwrite
-                                && std::path::Path::new(&target_path).exists()
-                            {
+                            // (with the flag set) proceeds. Existence is checked
+                            // on the RESOLVED path — the write goes through
+                            // resolve_path (which expands `~`), and a literal
+                            // "~/..." relative path never exists, so the raw
+                            // string would silently bypass this guard.
+                            let target_exists = crate::export::resolve_path(&target_path)
+                                .map(|p| p.exists())
+                                .unwrap_or(false);
+                            if !confirm_overwrite && target_exists {
                                 if let Some(m) = exp.export_modal.as_mut() {
                                     m.confirm_overwrite = true;
                                 }
@@ -4305,20 +4325,18 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 let page_size = app.config.effective_page_size();
                                 let err =
                                     open_tree_node(exp, drv, &mut app.toasts, page_size).await;
-                                // A dead connection gets one reconnect-and-retry
-                                // (exp/drv borrows end above so app can be
-                                // borrowed whole); anything else is reported.
+                                // A dead connection gets one reconnect;
+                                // anything else is reported. No automatic
+                                // retry: the reconnect rebuilt the tree with
+                                // the selection reset, so re-running would
+                                // open the FIRST node, not the user's.
                                 if let Some(err) = err {
                                     if app.try_reconnect(&err).await {
-                                        if let (Some(drv2), Some(exp2)) = (
-                                            &app.active_driver.clone(),
-                                            &mut app.explorer_state,
-                                        ) && let Some(err2) =
-                                            open_tree_node(exp2, drv2, &mut app.toasts, page_size)
-                                                .await
-                                        {
-                                            app.toasts.push(ToastKind::Error, err2);
-                                        }
+                                        app.toasts.push(
+                                            ToastKind::Info,
+                                            "reconnected — open the node again to retry"
+                                                .to_string(),
+                                        );
                                     } else {
                                         app.toasts.push(ToastKind::Error, err);
                                     }

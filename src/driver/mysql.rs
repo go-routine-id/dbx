@@ -405,11 +405,11 @@ impl Driver for MySqlDriver {
 
         let start = Instant::now();
         let trimmed = query.trim_start();
-        let is_select = trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("select")
-            || trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("show")
-            || trimmed.len() >= 7 && trimmed[..7].eq_ignore_ascii_case("explain")
-            || trimmed.len() >= 8 && trimmed[..8].eq_ignore_ascii_case("describe")
-            || trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("desc");
+        let is_select = super::starts_with_keyword(trimmed, "select")
+            || super::starts_with_keyword(trimmed, "show")
+            || super::starts_with_keyword(trimmed, "explain")
+            || super::starts_with_keyword(trimmed, "describe")
+            || super::starts_with_keyword(trimmed, "desc");
 
         if is_select {
             let rows = sqlx::query(AssertSqlSafe(query))

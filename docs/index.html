@@ -3,9 +3,9 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>dbx — Terminal Database Explorer for MySQL &amp; PostgreSQL</title>
-<meta name="description" content="dbx is a fast terminal (TUI) database explorer for MySQL &amp; PostgreSQL. Browse schemas, run SQL in multi-tab consoles, visualize ERDs, and edit data inline." />
-<meta name="keywords" content="terminal database explorer, TUI database client, MySQL, PostgreSQL, SQL, ERD, terminal UI, database browser, ratatui" />
+<title>dbx — Terminal Database Explorer for MySQL, PostgreSQL, SQL Server &amp; SQLite</title>
+<meta name="description" content="dbx is a fast terminal (TUI) database explorer for MySQL, PostgreSQL, SQL Server and SQLite. Browse schemas, run SQL in multi-tab consoles, visualize ERDs, and edit data inline — locally or over SSH." />
+<meta name="keywords" content="terminal database explorer, TUI database client, MySQL, PostgreSQL, SQL Server, SQLite, SQL, ERD, terminal UI, database browser, ratatui" />
 <meta name="author" content="go-routine" />
 <meta name="robots" content="index, follow" />
 <meta name="theme-color" content="#0c0b0a" />
@@ -15,14 +15,14 @@
 <meta property="og:type" content="website" />
 <meta property="og:site_name" content="go-routine" />
 <meta property="og:title" content="dbx — Terminal Database Explorer" />
-<meta property="og:description" content="A fast terminal (TUI) database client for MySQL &amp; PostgreSQL: browse schemas, run SQL, visualize ERDs, and edit data inline." />
+<meta property="og:description" content="A fast terminal (TUI) database client for MySQL, PostgreSQL, SQL Server and SQLite: browse schemas, run SQL, visualize ERDs, and edit data inline — locally or over SSH." />
 <meta property="og:url" content="https://opensource.go-routine.com/dbx/" />
 <meta property="og:image" content="https://github.com/user-attachments/assets/a8b3a8e1-30b6-4998-aecf-864842dac0bd" />
 
 <!-- Twitter -->
 <meta name="twitter:card" content="summary_large_image" />
 <meta name="twitter:title" content="dbx — Terminal Database Explorer" />
-<meta name="twitter:description" content="A fast terminal (TUI) database client for MySQL &amp; PostgreSQL. Browse schemas, run SQL, draw ERDs, edit data inline." />
+<meta name="twitter:description" content="A fast terminal (TUI) database client for MySQL, PostgreSQL, SQL Server and SQLite. Browse schemas, run SQL, draw ERDs, edit data inline." />
 <meta name="twitter:image" content="https://github.com/user-attachments/assets/a8b3a8e1-30b6-4998-aecf-864842dac0bd" />
 
 <!-- Structured data -->
@@ -31,7 +31,7 @@
   "@context": "https://schema.org",
   "@type": "SoftwareApplication",
   "name": "dbx",
-  "description": "A terminal (TUI) database explorer for MySQL and PostgreSQL: browse schemas, run SQL, visualize ERDs, and edit data inline.",
+  "description": "A terminal (TUI) database explorer for MySQL, PostgreSQL, SQL Server and SQLite: browse schemas, run SQL, visualize ERDs, and edit data inline.",
   "applicationCategory": "DeveloperApplication",
   "operatingSystem": "Linux, macOS, Windows",
   "url": "https://opensource.go-routine.com/dbx/",
@@ -220,10 +220,14 @@
     <div class="grid">
       <div class="card reveal"><span class="glyph">🌳</span><h3>Explorer tree</h3><p>Schema → tables → columns &amp; indexes, plus views, routines and sequences.</p></div>
       <div class="card reveal"><span class="glyph">🗂</span><h3>Multi-tab consoles</h3><p>Persistent scratch SQL files, query history, favorites and autocomplete.</p></div>
-      <div class="card reveal"><span class="glyph">📊</span><h3>Result grid</h3><p>Paging, client-side sort &amp; filter, and CSV / JSON / SQL-INSERT export.</p></div>
+      <div class="card reveal"><span class="glyph">📊</span><h3>Result grid</h3><p>Paging, client-side sort &amp; filter, and CSV / JSON / SQL-INSERT / xlsx export.</p></div>
       <div class="card reveal"><span class="glyph">🔎</span><h3>DDL popup</h3><p>Table definitions, indexes and foreign keys at a keystroke.</p></div>
       <div class="card reveal"><span class="glyph">🕸</span><h3>In-terminal ERD</h3><p>Braille canvas with crow's-foot notation, pannable and zoomable with the mouse.</p></div>
       <div class="card reveal"><span class="glyph">✏️</span><h3>Inline data editing</h3><p>Edit cells, insert rows, delete with a SQL preview, and set NULL on nullable columns.</p></div>
+      <div class="card reveal"><span class="glyph">🔐</span><h3>SSH tunnel</h3><p>Reach databases behind a bastion with a per-connection SSH config — password or key auth.</p></div>
+      <div class="card reveal"><span class="glyph">🔁</span><h3>Transactions</h3><p>Toggle autocommit, then commit or roll back explicitly — works across all four drivers.</p></div>
+      <div class="card reveal"><span class="glyph">🔌</span><h3>Auto-reconnect</h3><p>Dropped connections are re-established transparently and your query is retried.</p></div>
+      <div class="card reveal"><span class="glyph">🌗</span><h3>Dark &amp; light themes</h3><p>A palette for bright terminals too — one line in the config switches over.</p></div>
     </div>
   </div>
 </section>

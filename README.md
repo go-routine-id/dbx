@@ -82,7 +82,7 @@ binary lives in a root-owned directory, re-run it with `sudo`. Your config
 
 | | Feature |
 |---|---|
-| ✅ | Database explorer tree (schema → table → columns/indexes) — MySQL & PostgreSQL |
+| ✅ | Database explorer tree (schema → table → columns/indexes) — all four drivers |
 | ✅ | Multi-tab query consoles with persistent scratch files |
 | ✅ | Result grid with paging + CSV / SQL export |
 | ✅ | DDL popup (table definition, indexes, foreign keys) |
@@ -105,6 +105,9 @@ binary lives in a root-owned directory, re-run it with `sudo`. Your config
 | ✅ | SSH tunnel per connection (`[connections.ssh]`) |
 | ✅ | Light theme (`theme = "light"`) |
 | ✅ | Excel (xlsx) + SQL dump export formats |
+| ✅ | Transactions — autocommit toggle (`Ctrl+T`) with commit / rollback |
+| ✅ | Automatic reconnect on dropped connections, with query retry |
+| ✅ | Per-node context menu in the explorer tree (`Ctrl+O`) |
 
 The ERD renderer uses [flowmaid](https://github.com/go-routine-id/flowmaid)
 for automatic layout and crow's-foot geometry, painted into a

@@ -343,9 +343,7 @@ impl Driver for SqliteDriver {
         };
         let start = Instant::now();
         let trimmed = query.trim_start();
-        let starts_with = |kw: &str| {
-            trimmed.len() >= kw.len() && trimmed[..kw.len()].eq_ignore_ascii_case(kw)
-        };
+        let starts_with = |kw: &str| super::starts_with_keyword(trimmed, kw);
         let returns_rows =
             starts_with("select") || starts_with("pragma") || starts_with("explain") || starts_with("with");
 

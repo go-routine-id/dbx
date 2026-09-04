@@ -86,7 +86,7 @@ pub struct ConnectionConfig {
 /// SSH tunnel settings — the `[connections.ssh]` table in config.toml.
 /// Authentication (agent, keys, `~/.ssh/config`) is delegated to the system
 /// `ssh` binary; dbx never handles SSH credentials itself.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SshConfig {
     /// Bastion host (may also be an alias from `~/.ssh/config`).
     pub host: String,
@@ -102,6 +102,20 @@ pub struct SshConfig {
     /// picked at connect time.
     #[serde(default)]
     pub local_port: u16,
+}
+
+// By hand so the port matches the serde default (22): a derived Default
+// would give port 0, and `ssh -p 0` is nonsense.
+impl Default for SshConfig {
+    fn default() -> Self {
+        Self {
+            host: String::new(),
+            port: default_ssh_port(),
+            user: None,
+            identity_file: None,
+            local_port: 0,
+        }
+    }
 }
 
 fn default_ssh_port() -> u16 {

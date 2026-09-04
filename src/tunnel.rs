@@ -160,6 +160,11 @@ impl SshTunnel {
         let mut eff = cfg.clone();
         eff.host = DEFAULT_HOST.to_string();
         eff.port = Some(local_port);
+        // A unix socket is always local — combined with [ssh] it would make
+        // the driver ignore the tunnel entirely (MySQL prefers the socket),
+        // so the tunnel wins and the socket is dropped from the effective
+        // config.
+        eff.socket = None;
         // TLS (ssl/ssl_mode) still applies end to end *inside* the tunnel, so
         // it is intentionally left untouched.
         Ok((eff, Some(SshTunnel { _child: child, local_port })))

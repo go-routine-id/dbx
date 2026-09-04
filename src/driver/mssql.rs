@@ -286,13 +286,14 @@ impl Driver for MssqlDriver {
 
         // On-disk size is best-effort: the DMV needs VIEW DATABASE STATE, so
         // a permission error degrades to "size unknown" rather than sinking
-        // the table list.
+        // the table list. No index_id filter here — the struct contract is
+        // "table + indexes", and heap/clustered alone would under-report
+        // tables with large nonclustered indexes.
         let size_sql = "\
             SELECT t.name, SUM(s.used_page_count) * 8192 AS size_bytes \
             FROM sys.tables t \
             JOIN sys.schemas sch ON sch.schema_id = t.schema_id \
-            JOIN sys.dm_db_partition_stats s \
-              ON s.object_id = t.object_id AND s.index_id IN (0, 1) \
+            JOIN sys.dm_db_partition_stats s ON s.object_id = t.object_id \
             WHERE sch.name = @P1 \
             GROUP BY t.name";
         let size_res = match client.query(size_sql, &[&ns.0]).await {
@@ -547,21 +548,24 @@ impl Driver for MssqlDriver {
 
     async fn execute(&self, _ns: &Namespace, query: &str) -> Result<QueryResult> {
         // When an interactive transaction is open, run on its dedicated
-        // connection; otherwise use the main client. Lock order is always
+        // connection; otherwise use the main client — and DROP the tx lock
+        // first, so begin_tx/in_tx aren't stuck behind an unrelated
+        // long-running query. Lock order when both are held stays
         // tx_client → client, so no deadlock.
         let mut tx_guard = self.tx_client.lock().await;
         let mut main_guard;
         let client: &mut MssqlClient = if let Some(c) = tx_guard.as_mut() {
             c
         } else {
+            drop(tx_guard);
             main_guard = self.client.lock().await;
             &mut main_guard
         };
 
         let start = Instant::now();
         let trimmed = query.trim_start();
-        let is_select = trimmed.len() >= 6 && trimmed[..6].eq_ignore_ascii_case("select")
-            || trimmed.len() >= 4 && trimmed[..4].eq_ignore_ascii_case("with");
+        let is_select = super::starts_with_keyword(trimmed, "select")
+            || super::starts_with_keyword(trimmed, "with");
 
         if is_select {
             run_select(client, query, start).await
@@ -781,7 +785,7 @@ impl Driver for MssqlDriver {
             JOIN sys.dm_exec_sessions s ON s.session_id = r.session_id \
             CROSS APPLY sys.dm_exec_sql_text(r.sql_handle) t \
             WHERE r.session_id <> @@SPID \
-            ORDER BY r.start_time";
+            ORDER BY r.start_time DESC";
         let mut client = open_client(&self.cfg)
             .await
             .context("failed to open a connection for the process list")?;
@@ -844,11 +848,12 @@ fn convert_mssql_row(row: &Row) -> Result<Record> {
                     opt(row.try_get::<f32, _>(i), |v| Value::Float(v as f64))
                 }
             }
-            ColumnType::Money => opt(row.try_get::<f64, _>(i), Value::Float),
-            // tiberius decodes BOTH money types to ColumnData::F64 (smallmoney
-            // is i32/1e4 widened), so an f32 read never matches and would
-            // silently surface every smallmoney as NULL.
-            ColumnType::Money4 => opt(row.try_get::<f64, _>(i), Value::Float),
+            ColumnType::Money | ColumnType::Money4 => {
+                // tiberius decodes BOTH money types to ColumnData::F64
+                // (smallmoney is i32/1e4 widened), so an f32 read never
+                // matches and would silently surface smallmoney as NULL.
+                opt(row.try_get::<f64, _>(i), money_to_value)
+            }
             ColumnType::Decimaln | ColumnType::Numericn => opt(
                 row.try_get::<tiberius::numeric::Numeric, _>(i),
                 |n| Value::Decimal(format_numeric(n)),
@@ -870,7 +875,9 @@ fn convert_mssql_row(row: &Row) -> Result<Record> {
                 Value::DateTime(t.to_string())
             }),
             ColumnType::DatetimeOffsetn => opt(
-                row.try_get::<sqlx::types::chrono::DateTime<sqlx::types::chrono::Utc>, _>(i),
+                // FixedOffset keeps the stored offset — decoding to Utc would
+                // silently shift the displayed wall-clock time.
+                row.try_get::<sqlx::types::chrono::DateTime<sqlx::types::chrono::FixedOffset>, _>(i),
                 |dt| Value::DateTime(dt.to_rfc3339()),
             ),
             ColumnType::BigVarBin | ColumnType::BigBinary | ColumnType::Image => {
@@ -931,6 +938,23 @@ fn format_numeric(n: tiberius::numeric::Numeric) -> String {
     }
 }
 
+/// money/smallmoney are fixed-point with scale 4, but tiberius decodes them
+/// to f64 (dividing by 1e4). Re-rendering with exactly 4 decimals recovers
+/// the intended decimal text for any value within f64's ~15 significant
+/// decimal digits (|v| < ~9e11 at scale 4); beyond that the precision was
+/// already lost at decode time and can't be recovered. At least 2 decimals
+/// are kept so values still read as currency.
+fn money_to_value(v: f64) -> Value {
+    let s = format!("{v:.4}");
+    let (int_part, frac) = s.split_once('.').unwrap_or((s.as_str(), ""));
+    let frac = frac.trim_end_matches('0');
+    if frac.len() <= 2 {
+        Value::Decimal(format!("{int_part}.{frac:0<2}"))
+    } else {
+        Value::Decimal(format!("{int_part}.{frac}"))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -950,5 +974,17 @@ mod tests {
         assert_eq!(format_numeric(Numeric::new_with_scale(5, 2)), "0.05");
         assert_eq!(format_numeric(Numeric::new_with_scale(-42, 0)), "-42");
         assert_eq!(format_numeric(Numeric::new_with_scale(0, 4)), "0.0000");
+    }
+
+    #[test]
+    fn test_money_to_value_recovers_the_decimal_text() {
+        assert_eq!(money_to_value(12.34), Value::Decimal("12.34".to_string()));
+        assert_eq!(money_to_value(100.0), Value::Decimal("100.00".to_string()));
+        assert_eq!(money_to_value(0.5), Value::Decimal("0.50".to_string()));
+        assert_eq!(
+            money_to_value(-1234.5678),
+            Value::Decimal("-1234.5678".to_string())
+        );
+        assert_eq!(money_to_value(0.0001), Value::Decimal("0.0001".to_string()));
     }
 }

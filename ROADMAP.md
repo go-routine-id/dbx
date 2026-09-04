@@ -1,5 +1,11 @@
 # dbx Roadmap
 
+> Status (v0.5.0, Sep 2026): M0–M4 shipped, and most of the post-v0.1
+> backlog below has landed — write ops, `EXPLAIN` viewer, mouse support,
+> saved queries, and four drivers (MySQL, PostgreSQL, SQL Server, SQLite).
+> Remaining backlog is marked **todo**; everything else is in
+> [README.md](README.md).
+
 Design north star: **DataGrip UX** (keyboard-first interactions) with
 **opencode UI** (muted palette, single accent color, rounded borders, animated
 loading states, toasts).
@@ -80,7 +86,7 @@ history, rich result grid.
 | 2.5 | Error display | MySQL error panel with message + line jump in editor |
 | 2.6 | Query history (P3) | Per-connection persisted history, `ctrl+e` popup, load-to-console |
 | 2.7 | Autocomplete — **scoped in two tiers** | **Tier 1 (M2):** keywords + table/column names from metadata cache, trigger after `.` only when the left side is an unambiguous table/alias name (simple heuristic). **Tier 2 (stretch/M2.5):** true alias-aware resolution via [`sqlparser-rs`](https://github.com/apache/datafusion-sqlparser-rs) on partial queries. Don't hand-roll a SQL parser |
-| 2.8 | Context menu (P4) | `ctrl+o` on table: Open data / Generate SELECT / Copy name / Show DDL |
+| 2.8 | Context menu (P4) | `ctrl+o` on table: Open data / Generate SELECT / Copy name / Show DDL — **done** (per-node menu in the explorer tree) |
 | 2.9 | **Tests** | Tokenizer edge cases (strings, comments, delimiters); integration: run/cancel query against Docker MySQL, verify `KILL QUERY` actually frees the server |
 | 2.10 | **Destructive statement guard** | Tokenizer detects `DROP` / `TRUNCATE` / `DELETE` without `WHERE` → confirm dialog (FR-3.13). Console executes arbitrary SQL, so this is M2 scope |
 
@@ -127,7 +133,7 @@ its DDL; a connection without FKs shows a friendly empty state.
 | # | Task | Output |
 |---|------|--------|
 | 4.1 | Visual pass | Every screen matches docs/screens.md: empty states, toasts, transitions, status-bar hints everywhere |
-| 4.2 | Light theme | Same tokens, light palette, `--theme light` or config |
+| 4.2 | Light theme | Same tokens, light palette, `--theme light` or config — **done** (`theme = "light"` in config) |
 | 4.3 | Config completeness | All options documented; sane defaults; `--config` override |
 | 4.4 | Performance pass | No allocation hotspots in render loop; large result sets stay responsive |
 | 4.5 | Docs | README with screenshots/demo GIF, install & usage, keybinding cheat sheet |
@@ -143,11 +149,11 @@ gives the full M0–M3 experience; CI builds green; README demo matches reality.
 
 | Area | Items |
 |---|---|
-| Write ops | Inline cell edit, add/delete row with DataGrip-style "pending changes + submit" dialog (`EDIT_DATA` capability) |
-| Query analysis | `EXPLAIN` viewer (text/XML plan), multi-statement results |
-| Databases | PostgreSQL, SQLite (sqlx — trait-ready); SQL Server + Azure SQL ([tiberius](https://github.com/prisma/tiberius), TDS protocol); then NoSQL (MongoDB, Redis) via the capability model — see [docs/architecture.md](docs/architecture.md) |
-| Input | Mouse support (click, scroll, drag splitter), optional vim-mode editing |
-| Productivity | Saved/favorite queries, connection switcher in-app (`ctrl+d`), table data filter bar (WHERE builder), keyset (cursor) pagination for very large tables |
+| Write ops | ✅ Inline cell edit, add/delete row with SQL preview (`EDIT_DATA` capability) |
+| Query analysis | ✅ `EXPLAIN` viewer with costliest-node highlight (`ctrl+p`); ✅ multi-statement results |
+| Databases | ✅ PostgreSQL, SQLite (sqlx); ✅ SQL Server (tiberius/TDS, 2012+ for OFFSET/FETCH paging) — **todo:** Azure SQL variants, NoSQL (MongoDB, Redis) via the capability model |
+| Input | ✅ Mouse support (click, scroll, drag splitter) — **todo:** optional vim-mode editing |
+| Productivity | ✅ Saved/favorite queries + per-connection history; ✅ connection switcher in-app; ✅ SSH tunnel per connection; ✅ transactions (autocommit toggle, commit/rollback); ✅ auto-reconnect with query retry; ✅ xlsx + SQL-dump export — **todo:** table data filter bar (WHERE builder), keyset (cursor) pagination for very large tables |
 
 ## Non-goals (for now)
 
