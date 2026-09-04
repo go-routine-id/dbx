@@ -75,6 +75,37 @@ pub struct ConnectionConfig {
     /// The legacy `ssl: true` boolean is honoured when `ssl_mode` is unset.
     #[serde(default, deserialize_with = "de_ssl_mode_opt")]
     pub ssl_mode: Option<SslMode>,
+    /// Optional SSH bastion: when present, the driver connects through a
+    /// local port forwarded by a spawned `ssh -L` process instead of
+    /// reaching `host` directly. Config file only (not in the form modal);
+    /// edit sessions preserve the section untouched.
+    #[serde(default)]
+    pub ssh: Option<SshConfig>,
+}
+
+/// SSH tunnel settings — the `[connections.ssh]` table in config.toml.
+/// Authentication (agent, keys, `~/.ssh/config`) is delegated to the system
+/// `ssh` binary; dbx never handles SSH credentials itself.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SshConfig {
+    /// Bastion host (may also be an alias from `~/.ssh/config`).
+    pub host: String,
+    /// SSH port. Missing → 22.
+    #[serde(default = "default_ssh_port")]
+    pub port: u16,
+    /// SSH user. Missing → ssh's own default (config file or login name).
+    pub user: Option<String>,
+    /// Private key passed as `ssh -i` (`~` is expanded). Missing → ssh's own
+    /// key lookup (agent, `~/.ssh/config` IdentityFile).
+    pub identity_file: Option<String>,
+    /// Loopback port the forward listens on. `0`/missing → a free port is
+    /// picked at connect time.
+    #[serde(default)]
+    pub local_port: u16,
+}
+
+fn default_ssh_port() -> u16 {
+    22
 }
 
 impl ConnectionConfig {
@@ -108,11 +139,17 @@ impl ConnectionConfig {
     /// Display string for connection list (redacting password).
     pub fn display_url(&self) -> String {
         let user_part = self.user.as_deref().unwrap_or("root");
-        if let Some(sock) = &self.socket {
+        let base = if let Some(sock) = &self.socket {
             format!("{}://{}@unix({})", self.driver_str(), user_part, sock)
         } else {
             let port = self.port.unwrap_or_else(|| self.driver.default_port());
             format!("{}://{}@{}:{}", self.driver_str(), user_part, self.host, port)
+        };
+        match &self.ssh {
+            Some(ssh) if !ssh.host.trim().is_empty() => {
+                format!("{base} via ssh:{}", ssh.host.trim())
+            }
+            _ => base,
         }
     }
 
@@ -173,6 +210,9 @@ pub struct AppConfig {
     /// Last executed queries per connection name (most recent first).
     #[serde(default)]
     pub query_history: HashMap<String, Vec<String>>,
+    /// Colour palette: `dark` (default) or `light` for bright terminals.
+    #[serde(default)]
+    pub theme: crate::theme::ThemeName,
 }
 
 impl AppConfig {

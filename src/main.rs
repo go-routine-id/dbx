@@ -11,6 +11,7 @@ mod keymap;
 mod schema_diff;
 mod sql;
 mod theme;
+mod tunnel;
 mod ui;
 mod update;
 

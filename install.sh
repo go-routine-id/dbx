@@ -64,6 +64,26 @@ trap 'rm -rf "$tmp"' EXIT
 
 info "downloading $url"
 curl -fsSL -o "$tmp/dbx" "$url" || fail "download failed (asset $asset, version $VERSION)"
+
+# --- Verify integrity ---------------------------------------------------------
+# Releases ship <asset>.sha256 next to each binary. Older releases predate
+# checksums, so a missing file only warns; a mismatched one fails hard.
+if curl -fsSL -o "$tmp/dbx.sha256" "$url.sha256" 2>/dev/null; then
+  expected="$(awk '{print $1}' "$tmp/dbx.sha256")"
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$tmp/dbx" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$tmp/dbx" | awk '{print $1}')"
+  else
+    warn "no sha256sum/shasum available — skipping integrity check"
+    actual="$expected"
+  fi
+  [ "$expected" = "$actual" ] || fail "checksum mismatch — the download is corrupted or tampered with, aborting"
+  info "checksum verified (sha256)"
+else
+  warn "this release has no published checksum — skipping integrity check"
+fi
+
 chmod +x "$tmp/dbx"
 
 # --- Install -----------------------------------------------------------------

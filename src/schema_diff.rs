@@ -255,6 +255,7 @@ mod tests {
                 socket: None,
                 ssl: false,
                 ssl_mode: None,
+                ssh: None,
             }
         }
         async fn schema(drv: &dyn Driver) -> Vec<CollectionMeta> {

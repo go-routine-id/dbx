@@ -27,6 +27,9 @@ pub struct ExportModalState {
     pub target_path: String,
     pub active_field: usize, // 0: Format selector, 1: Path input
     pub default_table_name: String,
+    /// Source table when exporting from a table tab — a SQL dump uses it to
+    /// fetch the DDL. None for console-result exports.
+    pub collection: Option<CollectionRef>,
     /// Set when the user pressed Enter on an existing path and we asked them
     /// to confirm overwriting. Cleared when the modal is (re)opened.
     pub confirm_overwrite: bool,
@@ -553,6 +556,9 @@ pub struct ExplorerState {
     /// Explorer tree folded away to give the workspace the full width.
     pub tree_collapsed: bool,
     pub erd_menu: Option<ErdMenuState>,
+    /// Same context menu, but opened from the explorer tree (`Ctrl+O` on a
+    /// table node) instead of the ERD canvas.
+    pub tree_menu: Option<ErdMenuState>,
     /// Query-plan overlay (`Ctrl+P` in a console).
     pub explain_plan: Option<ExplainPlanState>,
     /// Running-query monitor (`Ctrl+K`).
@@ -563,6 +569,8 @@ pub struct ExplorerState {
     /// Rect of the ERD context menu as last painted — lets a mouse click pick
     /// the item under the cursor.
     pub erd_menu_area: Option<Rect>,
+    /// Painted rect of the tree context menu, for mouse hit-testing.
+    pub tree_menu_area: Option<Rect>,
     pub driver_capabilities: crate::driver::Capabilities,
     /// X start of each workspace tab (terminal columns), recorded at draw
     /// time so a mouse click maps to the right tab.
@@ -608,7 +616,9 @@ impl ExplorerState {
             create_object_modal: None,
             tree_collapsed: false,
             erd_menu: None,
+            tree_menu: None,
             erd_menu_area: None,
+            tree_menu_area: None,
             explain_plan: None,
             process_list: None,
             diff_picker: None,
@@ -858,6 +868,14 @@ pub fn render_explorer(
         render_erd_menu(f, rect, &menu, theme);
     } else {
         state.erd_menu_area = None;
+    }
+
+    if let Some(menu) = state.tree_menu.clone() {
+        let rect = erd_menu_rect(area, &menu);
+        state.tree_menu_area = Some(rect);
+        render_erd_menu(f, rect, &menu, theme);
+    } else {
+        state.tree_menu_area = None;
     }
 }
 

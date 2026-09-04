@@ -3,6 +3,42 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+/// Which palette the UI draws with. Stored in the config file as
+/// `theme = "dark" | "light"`; missing/unknown values fall back to dark.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeName {
+    #[default]
+    Dark,
+    Light,
+}
+
+// Lenient by hand: a derived Deserialize would fail the WHOLE config parse on
+// a typo like `theme = "lihgt"`, and the load fallback would then show an
+// empty connection list (and risk overwriting the real config on save).
+// Unknown spellings degrade to the default palette instead.
+impl<'de> serde::Deserialize<'de> for ThemeName {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = <String as serde::Deserialize>::deserialize(d)?;
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "light" => ThemeName::Light,
+            _ => ThemeName::Dark,
+        })
+    }
+}
+
+impl ThemeName {
+    pub fn theme(&self) -> Theme {
+        match self {
+            ThemeName::Dark => Theme::dark(),
+            ThemeName::Light => Theme::light(),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Theme {
     pub background: Color,
@@ -55,6 +91,39 @@ impl Theme {
                 Color::from_u32(0xdb61a2), // pink
                 Color::from_u32(0xa371f7), // purple
                 Color::from_u32(0xf0883e), // orange
+            ],
+        }
+    }
+
+    /// Light theme for bright terminals — same roles as [`Self::dark`],
+    /// re-based on a white ground with deepened accents so they keep their
+    /// contrast against it.
+    pub fn light() -> Self {
+        Self {
+            background: Color::from_u32(0xffffff),
+            panel: Color::from_u32(0xf6f8fa),
+            border: Color::from_u32(0xd0d7de),
+            accent: Color::from_u32(0x5a5fd6),
+            text: Color::from_u32(0x1f2328),
+            text_dim: Color::from_u32(0x59636e),
+            success: Color::from_u32(0x1a7f37),
+            warning: Color::from_u32(0x9a6700),
+            error: Color::from_u32(0xd1242f),
+
+            syntax_string: Color::from_u32(0x0a3069),
+            syntax_number: Color::from_u32(0x953800),
+            syntax_ident: Color::from_u32(0x116329),
+
+            // Darker cousins of the dark-theme set: the pastel originals would
+            // wash out on white, and none may collide with `warning` (the ERD
+            // selection colour).
+            entity_accents: [
+                Color::from_u32(0x5a5fd6), // indigo (the accent)
+                Color::from_u32(0x1b7c83), // cyan
+                Color::from_u32(0x2da44e), // green
+                Color::from_u32(0xbf3989), // pink
+                Color::from_u32(0x8250df), // purple
+                Color::from_u32(0xbc4c00), // orange
             ],
         }
     }
@@ -157,20 +226,39 @@ mod tests {
 
     #[test]
     fn test_entity_accents_never_collide_with_the_selection_colour() {
-        let t = Theme::dark();
-        // The selected ERD entity is drawn in `warning`; if a table happened to
-        // cycle onto the same colour the selection would be invisible.
-        assert!(
-            !t.entity_accents.contains(&t.warning),
-            "an entity accent matches the selection colour"
-        );
-        // And they must all differ from each other, or two neighbouring tables
-        // would look like one.
-        for (i, a) in t.entity_accents.iter().enumerate() {
-            for b in &t.entity_accents[i + 1..] {
-                assert_ne!(a, b, "duplicate entity accent");
+        for t in [Theme::dark(), Theme::light()] {
+            // The selected ERD entity is drawn in `warning`; if a table happened to
+            // cycle onto the same colour the selection would be invisible.
+            assert!(
+                !t.entity_accents.contains(&t.warning),
+                "an entity accent matches the selection colour"
+            );
+            // And they must all differ from each other, or two neighbouring tables
+            // would look like one.
+            for (i, a) in t.entity_accents.iter().enumerate() {
+                for b in &t.entity_accents[i + 1..] {
+                    assert_ne!(a, b, "duplicate entity accent");
+                }
             }
         }
+    }
+
+    #[test]
+    fn test_light_theme_is_actually_light() {
+        let light = Theme::light();
+        let dark = Theme::dark();
+        // The palettes must be a genuine inversion: a light theme whose text
+        // is brighter than its background is unreadable.
+        let lum = |c: Color| match c {
+            Color::Rgb(r, g, b) => (r as u32 + g as u32 + b as u32) / 3,
+            _ => 0,
+        };
+        assert!(lum(light.background) > lum(light.text));
+        assert!(lum(dark.background) < lum(dark.text));
+        // And every light token must differ from its dark counterpart —
+        // a half-renamed palette would leave dark-only remnants.
+        assert_ne!(light.accent, dark.accent);
+        assert_ne!(light.entity_accents, dark.entity_accents);
     }
 
     /// A row selected by mouse (pane unfocused) must not change colour versus

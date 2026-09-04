@@ -50,6 +50,7 @@ use crate::keymap::{
 };
 use crate::actions::{
     QueryRun, collect_schema, erd_menu_item_at, finish_console_query, open_collection_tab,
+    retry_console_query,
     open_tree_node, refresh_table_page, run_erd_menu_action, start_console_query, step_column,
 };
 use crate::sql::{
@@ -174,6 +175,10 @@ pub struct App {
     form_modal: Option<ConnectionForm>,
     // In-flight test ping for the form modal. None = idle.
     form_test_rx: Option<tokio::sync::mpsc::Receiver<Result<std::time::Duration, String>>>,
+    // In-flight test ping from the picker's `t` key. Polled on tick like
+    // form_test_rx — awaiting it inline would freeze the event loop (an SSH
+    // tunnel alone is allowed 10s to come up).
+    picker_test_rx: Option<tokio::sync::mpsc::Receiver<Result<std::time::Duration, String>>>,
     /// One-shot startup update check. `Some(latest)` means a newer release.
     update_check_rx: Option<tokio::sync::mpsc::Receiver<Option<String>>>,
     /// Console query running in the background, if any.
@@ -194,10 +199,21 @@ pub struct App {
     active_connection_name: Option<String>,
     /// Full config of the active connection — used for reconnect.
     active_connection: Option<crate::config::ConnectionConfig>,
+    /// Live SSH forward for the active connection (from its `[ssh]` section).
+    /// Dropping the guard kills the `ssh -L` process, so it never outlives
+    /// the driver it serves.
+    ssh_tunnel: Option<crate::tunnel::SshTunnel>,
     /// Picker-pane area from the last draw — maps a mouse click to a connection.
     picker_hit_area: Option<Rect>,
     /// In-flight ERD drag-to-pan state (mouse gesture).
     erd_drag: Option<ErdDrag>,
+    /// Autocommit mode for the query console (`Ctrl+T`). When off, every
+    /// console run opens an interactive transaction on a dedicated connection
+    /// that stays open until F6 (commit) or F7 (rollback).
+    autocommit: bool,
+    /// Mirror of `driver.in_tx()` for the status bar — refreshed after every
+    /// console run / commit / rollback (the real state lives in the driver).
+    tx_active: bool,
 }
 
 /// Mouse drag state for panning the ERD view. `start` anchors the
@@ -213,10 +229,11 @@ struct ErdDrag {
 
 impl App {
     pub fn new(config: AppConfig, config_path: PathBuf) -> Self {
+        let theme = config.theme.theme();
         Self {
             config,
             config_path,
-            theme: Theme::dark(),
+            theme,
             toasts: Toasts::default(),
             help_open: false,
             help_scroll: 0,
@@ -225,6 +242,7 @@ impl App {
             selected_connection: 0,
             form_modal: None,
             form_test_rx: None,
+            picker_test_rx: None,
             update_check_rx: None,
             query_run: None,
             confirm_delete_modal: None,
@@ -234,8 +252,86 @@ impl App {
             connecting: false,
             active_connection_name: None,
             active_connection: None,
+            ssh_tunnel: None,
             picker_hit_area: None,
             erd_drag: None,
+            autocommit: true,
+            tx_active: false,
+        }
+    }
+
+    /// If `err` looks like a dropped connection, rebuild the driver from the
+    /// stored connection config. Returns true when a fresh connection is in
+    /// Establish a driver for `cfg`, honouring its optional `[ssh]` section:
+    /// spawns the port forward first and re-points the config at the loopback
+    /// end. The tunnel guard is stored on `self` so it lives exactly as long
+    /// as the driver; any previous tunnel is torn down first. On a driver
+    /// error the just-started tunnel is dropped (killed) before returning.
+    async fn connect_with_tunnel(
+        &mut self,
+        cfg: &crate::config::ConnectionConfig,
+    ) -> anyhow::Result<Arc<dyn Driver>> {
+        self.ssh_tunnel = None; // dropping kills a previous tunnel
+        let (eff, tunnel) = crate::tunnel::SshTunnel::establish(cfg).await?;
+        let drv = crate::driver::connect_driver(&eff).await?;
+        self.ssh_tunnel = tunnel;
+        Ok(drv)
+    }
+
+    /// place and the failed operation is worth retrying once.
+    ///
+    /// Mirrors the manual Ctrl+R path (10s timeout, namespace refresh) so an
+    /// automatic rescue behaves exactly like the manual one.
+    async fn try_reconnect(&mut self, err: &str) -> bool {
+        if !crate::actions::looks_like_disconnect(err) {
+            return false;
+        }
+        let Some(cfg) = self.active_connection.clone() else {
+            return false;
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            self.connect_with_tunnel(&cfg),
+        )
+        .await;
+        match result {
+            Ok(Ok(new_drv)) => {
+                if let Ok(ns) = new_drv.namespaces().await
+                    && let Some(exp) = &mut self.explorer_state
+                {
+                    exp.namespaces = ns;
+                    exp.tables.clear();
+                    exp.rebuild_tree_nodes();
+                    exp.selected_tree_index = 0;
+                }
+                self.active_driver = Some(new_drv);
+                // The old connection is gone, so any open transaction went
+                // with it — the server rolled it back on disconnect.
+                if self.tx_active {
+                    self.tx_active = false;
+                    self.toasts.push(
+                        ToastKind::Warning,
+                        "the open transaction was rolled back by the disconnect".to_string(),
+                    );
+                }
+                self.toasts.push(
+                    ToastKind::Success,
+                    "connection dropped — reconnected".to_string(),
+                );
+                true
+            }
+            Ok(Err(e)) => {
+                self.toasts
+                    .push(ToastKind::Error, format!("reconnect failed: {e:#}"));
+                false
+            }
+            Err(_) => {
+                self.toasts.push(
+                    ToastKind::Error,
+                    "reconnect timed out after 10s".to_string(),
+                );
+                false
+            }
         }
     }
 
@@ -278,6 +374,7 @@ impl App {
                         || e.schema_edit_modal.is_some()
                         || e.create_object_modal.is_some()
                         || e.erd_menu.is_some()
+                        || e.tree_menu.is_some()
                         || e.explain_plan.is_some()
                         || e.process_list.is_some()
                         || e.schema_diff.is_some()
@@ -498,6 +595,17 @@ impl App {
             return Ok(());
         }
 
+        // Same hover-highlight for the tree context menu.
+        if matches!(mouse.kind, MouseEventKind::Moved)
+            && let Some(exp) = &mut self.explorer_state
+            && let Some(rect) = exp.tree_menu_area
+            && let Some(menu) = &mut exp.tree_menu
+            && let Some(idx) = erd_menu_item_at(rect, mouse.column, mouse.row)
+        {
+            menu.selected = idx;
+            return Ok(());
+        }
+
         if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
             return Ok(());
         }
@@ -547,6 +655,21 @@ impl App {
             let cref = exp.erd_menu.as_ref().map(|m| m.collection.clone());
             exp.erd_menu = None;
             exp.erd_menu_area = None;
+            if let (Some(idx), Some(cref)) = (hit, cref) {
+                let drv = drv.clone();
+                let page_size = self.config.effective_page_size();
+                run_erd_menu_action(exp, &drv, &mut self.toasts, page_size, cref, idx).await;
+            }
+            return Ok(());
+        }
+        // Tree context menu: identical click behaviour.
+        if exp.tree_menu.is_some() {
+            let hit = exp
+                .tree_menu_area
+                .and_then(|rect| erd_menu_item_at(rect, mouse.column, mouse.row));
+            let cref = exp.tree_menu.as_ref().map(|m| m.collection.clone());
+            exp.tree_menu = None;
+            exp.tree_menu_area = None;
             if let (Some(idx), Some(cref)) = (hit, cref) {
                 let drv = drv.clone();
                 let page_size = self.config.effective_page_size();
@@ -608,7 +731,21 @@ impl App {
                         && let Some(drv) = self.active_driver.clone()
                     {
                         let page_size = self.config.effective_page_size();
-                        open_tree_node(exp, &drv, &mut self.toasts, page_size).await;
+                        if let Some(err) = open_tree_node(exp, &drv, &mut self.toasts, page_size).await {
+                            // A dead connection gets one reconnect-and-retry;
+                            // anything else is just reported.
+                            if self.try_reconnect(&err).await {
+                                if let (Some(drv2), Some(exp2)) =
+                                    (&self.active_driver.clone(), &mut self.explorer_state)
+                                    && let Some(err2) =
+                                        open_tree_node(exp2, drv2, &mut self.toasts, page_size).await
+                                {
+                                    self.toasts.push(ToastKind::Error, err2);
+                                }
+                            } else {
+                                self.toasts.push(ToastKind::Error, err);
+                            }
+                        }
                     }
                     return Ok(());
                 }
@@ -1157,6 +1294,23 @@ impl App {
                     return;
                 }
 
+                // Tree context menu: same navigation as the ERD menu.
+                if let Some(menu) = &mut exp.tree_menu {
+                    match key.code {
+                        KeyCode::Esc => exp.tree_menu = None,
+                        KeyCode::Up | KeyCode::Char('k') => {
+                            menu.selected = menu.selected.saturating_sub(1);
+                        }
+                        KeyCode::Down | KeyCode::Char('j') => {
+                            menu.selected = (menu.selected + 1)
+                                .min(crate::ui::screens::explorer::ERD_MENU_OPTIONS.len() - 1);
+                        }
+                        KeyCode::Enter => {} // handled in the event loop
+                        _ => {}
+                    }
+                    return;
+                }
+
                 // Object search overlay owns all keys while it's open.
                 if let Some(s) = &mut exp.object_search {
                     match key.code {
@@ -1425,9 +1579,11 @@ impl App {
                         self.active_driver = None;
                         self.explorer_state = None;
                         // Teardown must mirror connect: drop the retained
-                        // connection config (and its password) too.
+                        // connection config (and its password) too. The tunnel
+                        // guard going away kills the ssh forwarder.
                         self.active_connection = None;
                         self.active_connection_name = None;
+                        self.ssh_tunnel = None;
                         return;
                     }
                     // Ctrl+B folds the explorer away so the console gets the
@@ -1488,6 +1644,7 @@ impl App {
                                         target_path: path,
                                         active_field: 0,
                                         default_table_name: t.collection.name.clone(),
+                                        collection: Some(t.collection.clone()),
                                         confirm_overwrite: false,
                                     });
                                 }
@@ -1500,6 +1657,7 @@ impl App {
                                             target_path: path,
                                             active_field: 0,
                                             default_table_name: "query_result".to_string(),
+                                            collection: None,
                                             confirm_overwrite: false,
                                         });
                                     } else {
@@ -2462,10 +2620,13 @@ impl App {
                 }
                 KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.focused_field == FormField::Driver => {
                     use crate::config::DriverType;
-                    // Only the drivers that are actually implemented are
-                    // offered — SQL Server would just fail at connect time.
-                    const CYCLE: [DriverType; 3] =
-                        [DriverType::MySql, DriverType::Postgres, DriverType::Sqlite];
+                    // Every implemented driver is offered in the cycle.
+                    const CYCLE: [DriverType; 4] = [
+                        DriverType::MySql,
+                        DriverType::Postgres,
+                        DriverType::Sqlite,
+                        DriverType::SqlServer,
+                    ];
                     let cur = CYCLE.iter().position(|d| *d == form.driver).unwrap_or(0);
                     let delta = if key.code == KeyCode::Left {
                         CYCLE.len() - 1
@@ -2700,7 +2861,14 @@ impl App {
                 let status = match (&self.active_connection_name, &self.active_driver) {
                     (Some(name), Some(drv)) => {
                         let info = drv.info();
-                        format!("● {name} · {} {}", info.name, info.server_version)
+                        let tx = if self.tx_active {
+                            " · [TX open — F6 commit / F7 rollback]"
+                        } else if !self.autocommit {
+                            " · [autocommit off]"
+                        } else {
+                            ""
+                        };
+                        format!("● {name} · {} {}{tx}", info.name, info.server_version)
                     }
                     _ => "● not connected".to_string(),
                 };
@@ -2795,6 +2963,13 @@ impl Drop for TerminalGuard {
     }
 }
 
+/// Set by the termination-signal handler; the event loop turns it into a
+/// normal quit. Never `std::process::exit` from the handler: exit skips
+/// destructors, so the `App`'s SshTunnel guard would leak a live ssh
+/// forwarder (orphaned, port still bound) on SIGTERM.
+static TERMINATION_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -2805,25 +2980,24 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
     let _guard = TerminalGuard::enter().context("failed to initialize terminal")?;
 
     tokio::spawn(async {
-        // Graceful shutdown on termination: restore the terminal (raw mode +
-        // alternate screen) before exiting so the user isn't left with a
-        // broken shell. Unix listens for SIGTERM (Ctrl+C already arrives as a
-        // key event in raw mode); Windows has no SIGTERM, so it listens for
-        // Ctrl+C instead.
+        // Graceful shutdown on termination: flag the event loop to quit
+        // through its normal path — dropping App kills the SSH tunnel and
+        // dropping TerminalGuard restores the terminal (raw mode + alternate
+        // screen) on the way out. Unix listens for SIGTERM (Ctrl+C already
+        // arrives as a key event in raw mode); Windows has no SIGTERM, so it
+        // listens for Ctrl+C instead.
         #[cfg(unix)]
         {
             use tokio::signal::unix::{SignalKind, signal};
             if let Ok(mut sigterm) = signal(SignalKind::terminate()) {
                 sigterm.recv().await;
-                TerminalGuard::restore();
-                std::process::exit(130);
+                TERMINATION_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
         #[cfg(windows)]
         {
             if tokio::signal::ctrl_c().await.is_ok() {
-                TerminalGuard::restore();
-                std::process::exit(130);
+                TERMINATION_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
             }
         }
     });
@@ -2859,6 +3033,12 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
     app.update_check_rx = Some(update_rx);
 
     while !app.should_quit {
+        // SIGTERM arrives as a flag, not a key event — quit through the
+        // normal path so App (SSH tunnel) and TerminalGuard drop cleanly.
+        if TERMINATION_REQUESTED.load(std::sync::atomic::Ordering::SeqCst) {
+            app.should_quit = true;
+            continue;
+        }
         terminal
             .draw(|f| app.draw(f, &spinner))
             .context("failed to draw frame")?;
@@ -2919,7 +3099,12 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         let res = match tokio::time::timeout(
                             Duration::from_secs(60),
                             async {
-                                match crate::driver::connect_driver(&cfg).await {
+                                // The tunnel guard lives only for this test:
+                                // it drops (killing ssh) when the block ends.
+                                let (eff, _tunnel) = crate::tunnel::SshTunnel::establish(&cfg)
+                                    .await
+                                    .map_err(|e| format!("tunnel failed: {e:#}"))?;
+                                match crate::driver::connect_driver(&eff).await {
                                     Ok(driver) => driver.ping().await
                                         .map_err(|e| format!("ping failed: {e:#}")),
                                     Err(e) => Err(format!("connect failed: {e:#}")),
@@ -2977,7 +3162,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                     // Timeout so a hung network can't freeze the TUI forever.
                     match tokio::time::timeout(
                         std::time::Duration::from_secs(10),
-                        crate::driver::connect_driver(&cfg),
+                        app.connect_with_tunnel(&cfg),
                     )
                     .await
                     {
@@ -3003,6 +3188,15 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 }
                             }
                             app.active_driver = Some(new_drv);
+                            // The old connection took any open transaction
+                            // with it — the server rolled it back on drop.
+                            if app.tx_active {
+                                app.tx_active = false;
+                                app.toasts.push(
+                                    ToastKind::Warning,
+                                    "the open transaction was rolled back by the reconnect".to_string(),
+                                );
+                            }
                             app.toasts.push(
                                 ToastKind::Success,
                                 format!("reconnected: {} {}", info.name, info.server_version),
@@ -3024,6 +3218,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             let format = modal.format;
                             let target_path = modal.target_path.clone();
                             let table_name = modal.default_table_name.clone();
+                            let collection = modal.collection.clone();
                             let confirm_overwrite = modal.confirm_overwrite;
 
                             // Overwrite guard: if the target file already exists,
@@ -3055,26 +3250,66 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             };
 
                             if let Some((cols, recs)) = export_data {
-                                let content = match format {
-                                    ExportFormat::Csv => Ok(Exporter::format_csv(&cols, &recs)),
+                                // A dump includes the table's DDL; fetch it
+                                // now — a console result has no source table,
+                                // and a failed lookup degrades to INSERTs only.
+                                let ddl: Option<String> = if format == ExportFormat::SqlDump {
+                                    match &collection {
+                                        Some(cref) => match drv.definition(cref).await {
+                                            Ok(d) => Some(d),
+                                            Err(e) => {
+                                                app.toasts.push(
+                                                    ToastKind::Warning,
+                                                    format!("could not fetch DDL — exporting INSERTs only: {e:#}"),
+                                                );
+                                                None
+                                            }
+                                        },
+                                        None => None,
+                                    }
+                                } else {
+                                    None
+                                };
+
+                                let content: Result<Vec<u8>, String> = match format {
+                                    ExportFormat::Csv => {
+                                        Ok(Exporter::format_csv(&cols, &recs).into_bytes())
+                                    }
                                     ExportFormat::Json => Exporter::format_json(&cols, &recs)
+                                        .map(String::into_bytes)
                                         .map_err(|e| format!("JSON export error: {e:#}")),
-                                    ExportFormat::SqlInsert => Ok(Exporter::format_sql_insert(&table_name, &cols, &recs)),
+                                    ExportFormat::SqlInsert => Ok(Exporter::format_sql_insert(
+                                        &table_name,
+                                        &cols,
+                                        &recs,
+                                    )
+                                    .into_bytes()),
+                                    ExportFormat::SqlDump => Ok(Exporter::format_sql_dump(
+                                        &table_name,
+                                        ddl.as_deref(),
+                                        &cols,
+                                        &recs,
+                                    )
+                                    .into_bytes()),
+                                    ExportFormat::Xlsx => Exporter::format_xlsx(&cols, &recs)
+                                        .map_err(|e| format!("xlsx export error: {e:#}")),
                                 };
 
                                 match content {
-                                    Ok(text) => match Exporter::save_to_file(&target_path, &text) {
-                                        Ok(saved_path) => {
-                                            app.toasts.push(
-                                                ToastKind::Success,
-                                                format!("exported {} rows to {}", recs.len(), saved_path.display()),
-                                            );
-                                            exp.export_modal = None;
+                                    Ok(bytes) => {
+                                        match Exporter::save_bytes_to_file(&target_path, &bytes) {
+                                            Ok(saved_path) => {
+                                                app.toasts.push(
+                                                    ToastKind::Success,
+                                                    format!("exported {} rows to {}", recs.len(), saved_path.display()),
+                                                );
+                                                exp.export_modal = None;
+                                            }
+                                            Err(e) => {
+                                                app.toasts.push(ToastKind::Error, format!("failed to save export file: {e:#}"));
+                                            }
                                         }
-                                        Err(e) => {
-                                            app.toasts.push(ToastKind::Error, format!("failed to save export file: {e:#}"));
-                                        }
-                                    },
+                                    }
                                     Err(e) => {
                                         app.toasts.push(ToastKind::Error, e);
                                     }
@@ -3602,6 +3837,14 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                     .to_string(),
                             );
                         }
+                        // Refresh the tx mirror from the REAL driver state:
+                        // the aborted task may have already opened a
+                        // transaction, and a stale `false` here would brick
+                        // the console (new runs fail "already open", F6/F7
+                        // refuse "no transaction") until a reconnect.
+                        if let Some(drv) = &app.active_driver {
+                            app.tx_active = drv.in_tx().await;
+                        }
                         app.toasts
                             .push(ToastKind::Info, "query cancelled".to_string());
                         continue;
@@ -3702,8 +3945,20 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 );
                                 // The second connection is transient: it lives
                                 // only for this comparison, so the app keeps
-                                // its single-active-driver model.
-                                let other = match crate::driver::connect_driver(&cfg).await {
+                                // its single-active-driver model. Its tunnel
+                                // (if any) dies with the comparison as well.
+                                let (eff_cfg, _other_tunnel) =
+                                    match crate::tunnel::SshTunnel::establish(&cfg).await {
+                                        Ok(pair) => pair,
+                                        Err(e) => {
+                                            app.toasts.push(
+                                                ToastKind::Error,
+                                                format!("tunnel to '{target_name}' failed: {e:#}"),
+                                            );
+                                            continue;
+                                        }
+                                    };
+                                let other = match crate::driver::connect_driver(&eff_cfg).await {
                                     Ok(d) => d,
                                     Err(e) => {
                                         app.toasts.push(
@@ -3938,6 +4193,26 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         continue;
                     }
 
+                    // Tree context menu: Enter runs the highlighted action.
+                    if exp.tree_menu.is_some() && key.code == KeyCode::Enter {
+                        let (cref, selected) = {
+                            let m = exp.tree_menu.as_ref().unwrap();
+                            (m.collection.clone(), m.selected)
+                        };
+                        exp.tree_menu = None;
+                        let page_size = app.config.effective_page_size();
+                        run_erd_menu_action(
+                            exp,
+                            drv,
+                            &mut app.toasts,
+                            page_size,
+                            cref,
+                            selected,
+                        )
+                        .await;
+                        continue;
+                    }
+
                     // Enter on an ERD tab with a keyboard-selected node
                     // (`.`/`,` moves the selection) opens its context menu —
                     // the same path as a mouse click on the node.
@@ -3972,6 +4247,12 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         && exp.create_object_modal.is_none()
                         && exp.sql_confirm_modal.is_none()
                         && exp.object_search.is_none()
+                        // A context menu must capture the keyboard: without
+                        // this gate, e/a/g/Space would reach the tree handler
+                        // BEHIND the open menu, stacking overlays and firing
+                        // actions the user never aimed at.
+                        && exp.tree_menu.is_none()
+                        && exp.erd_menu.is_none()
                         && exp.focused_pane == FocusedPane::Tree
                     {
                         match key.code {
@@ -4004,9 +4285,44 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 }
                                 continue;
                             }
+                            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                // Ctrl+O: context menu for the selected table —
+                                // same actions as clicking a node in the ERD.
+                                if let Some(node) = exp.selected_node() {
+                                    if let TreeNodeKind::Table(cref, _, _) = &node.kind {
+                                        exp.tree_menu = Some(
+                                            crate::ui::screens::explorer::ErdMenuState {
+                                                collection: cref.clone(),
+                                                selected: 0,
+                                                menu_at: None,
+                                            },
+                                        );
+                                    }
+                                }
+                                continue;
+                            }
                             KeyCode::Char(' ') | KeyCode::Enter => {
                                 let page_size = app.config.effective_page_size();
-                                open_tree_node(exp, drv, &mut app.toasts, page_size).await;
+                                let err =
+                                    open_tree_node(exp, drv, &mut app.toasts, page_size).await;
+                                // A dead connection gets one reconnect-and-retry
+                                // (exp/drv borrows end above so app can be
+                                // borrowed whole); anything else is reported.
+                                if let Some(err) = err {
+                                    if app.try_reconnect(&err).await {
+                                        if let (Some(drv2), Some(exp2)) = (
+                                            &app.active_driver.clone(),
+                                            &mut app.explorer_state,
+                                        ) && let Some(err2) =
+                                            open_tree_node(exp2, drv2, &mut app.toasts, page_size)
+                                                .await
+                                        {
+                                            app.toasts.push(ToastKind::Error, err2);
+                                        }
+                                    } else {
+                                        app.toasts.push(ToastKind::Error, err);
+                                    }
+                                }
                             }
                             KeyCode::Char('e') => {
                                 // Edit schema (ALTER). Gated on the DDL
@@ -4147,6 +4463,74 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         let is_ctrl_enter = is_run_chord;
                         let is_f5 = key.code == KeyCode::F(5);
 
+                        let tab_is_console = exp
+                            .active_tab()
+                            .is_some_and(|t| matches!(t, WorkspaceTab::Console(_)));
+
+                        // Ctrl+T toggles autocommit. Refused while a
+                        // transaction is open — commit or roll it back first,
+                        // so the toggle can never silently decide the fate of
+                        // pending writes.
+                        if tab_is_console
+                            && key.code == KeyCode::Char('t')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            // Gate on the real driver state, not the mirror —
+                            // the mirror can go stale (e.g. a cancelled run
+                            // that had already opened a transaction).
+                            app.tx_active = drv.in_tx().await;
+                            if app.tx_active {
+                                app.toasts.push(
+                                    ToastKind::Warning,
+                                    "a transaction is open — F6 to commit, F7 to roll back".to_string(),
+                                );
+                            } else {
+                                app.autocommit = !app.autocommit;
+                                let state = if app.autocommit {
+                                    "on".to_string()
+                                } else {
+                                    "off — console queries now open a transaction".to_string()
+                                };
+                                app.toasts.push(ToastKind::Info, format!("autocommit {state}"));
+                            }
+                            continue;
+                        }
+
+                        // F6 commits / F7 rolls back the open transaction.
+                        if tab_is_console && matches!(key.code, KeyCode::F(6) | KeyCode::F(7)) {
+                            // Same reason as Ctrl+T: trust the driver, not the
+                            // mirror, so a stale mirror can't brick the tx.
+                            app.tx_active = drv.in_tx().await;
+                            if !app.tx_active {
+                                app.toasts.push(
+                                    ToastKind::Info,
+                                    "no transaction is open".to_string(),
+                                );
+                            } else {
+                                let commit = key.code == KeyCode::F(6);
+                                let result = if commit {
+                                    drv.commit_tx().await
+                                } else {
+                                    drv.rollback_tx().await
+                                };
+                                match result {
+                                    Ok(()) => app.toasts.push(
+                                        ToastKind::Success,
+                                        if commit {
+                                            "transaction committed".to_string()
+                                        } else {
+                                            "transaction rolled back".to_string()
+                                        },
+                                    ),
+                                    Err(e) => app
+                                        .toasts
+                                        .push(ToastKind::Error, format!("{e:#}")),
+                                }
+                                app.tx_active = drv.in_tx().await;
+                            }
+                            continue;
+                        }
+
                         // Don't run the query under a history/favorites popup —
                         // Ctrl+Enter is muscle memory for "run" but the popup
                         // owns the keystroke until Esc/Enter dismisses it.
@@ -4156,7 +4540,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 _ => true,
                             })
                         {
-                            start_console_query(exp, drv, &mut app.toasts, &mut app.query_run);
+                            start_console_query(exp, drv, &mut app.toasts, &mut app.query_run, !app.autocommit);
                             if let Some(WorkspaceTab::Console(c)) = exp.active_tab_mut() {
                                 c.last_run = Some(Instant::now());
                             }
@@ -4319,6 +4703,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                                 drv,
                                                 &mut app.toasts,
                                                 &mut app.query_run,
+                                                !app.autocommit,
                                             );
                                         }
                                         None => app.toasts.push(
@@ -4433,6 +4818,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                         drv,
                                         &mut app.toasts,
                                         &mut app.query_run,
+                                        !app.autocommit,
                                     );
                                 }
                                 // `i` → open the INSERT-row modal. All fields start
@@ -4533,39 +4919,46 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                     }
                 }
             } else {
-                // Test connection 't' key handled with async tokio spawn
+                // Test connection 't' key: spawn and poll on tick — awaiting
+                // inline would freeze the event loop, and the spawned task
+                // needs its own ceiling because an SSH tunnel alone may take
+                // 10s to come up.
                 if !app.help_open && app.form_modal.is_none() && key.code == KeyCode::Char('t') {
-                    if let Some(cfg) = app.config.connections.get(app.selected_connection).cloned() {
+                    if app.picker_test_rx.is_some() {
+                        app.toasts.push(ToastKind::Info, "a test is already running".to_string());
+                    } else if let Some(cfg) = app.config.connections.get(app.selected_connection).cloned() {
                         app.toasts.push(ToastKind::Info, format!("testing ping to '{}'...", cfg.name));
-                        let (tx, mut rx) = tokio::sync::mpsc::channel::<Result<Duration, String>>(1);
+                        let (tx, rx) = tokio::sync::mpsc::channel::<Result<Duration, String>>(1);
                         tokio::spawn(async move {
-                            match crate::driver::connect_driver(&cfg).await {
-                                Ok(driver) => match driver.ping().await {
-                                    Ok(dur) => { let _ = tx.send(Ok(dur)).await; }
-                                    Err(e) => { let _ = tx.send(Err(format!("ping failed: {e:#}"))).await; }
-                                },
-                                Err(e) => { let _ = tx.send(Err(format!("connect failed: {e:#}"))).await; }
-                            }
+                            let test = async {
+                                // Transient tunnel: established for the test
+                                // and killed when the closure ends.
+                                let (eff, _tunnel) = crate::tunnel::SshTunnel::establish(&cfg)
+                                    .await
+                                    .map_err(|e| format!("tunnel failed: {e:#}"))?;
+                                let driver = crate::driver::connect_driver(&eff)
+                                    .await
+                                    .map_err(|e| format!("connect failed: {e:#}"))?;
+                                driver
+                                    .ping()
+                                    .await
+                                    .map_err(|e| format!("ping failed: {e:#}"))
+                            };
+                            // Hard ceiling so a hung server can't hold the
+                            // forwarder (or the channel) forever.
+                            let res = match tokio::time::timeout(Duration::from_secs(30), test).await {
+                                Ok(res) => res,
+                                Err(_) => Err("ping timed out (30s)".to_string()),
+                            };
+                            let _ = tx.send(res).await;
                         });
-
-                        match tokio::time::timeout(Duration::from_millis(3000), rx.recv()).await {
-                            Ok(Some(res)) => match res {
-                                Ok(dur) => app.toasts.push(ToastKind::Success, format!("ping ok ({:.2?})", dur)),
-                                Err(err) => app.toasts.push(ToastKind::Error, err),
-                            },
-                            Ok(None) => {
-                                app.toasts.push(ToastKind::Error, "ping task ended unexpectedly".to_string());
-                            }
-                            Err(_) => {
-                                app.toasts.push(ToastKind::Error, "ping timed out (3s)".to_string());
-                            }
-                        }
+                        app.picker_test_rx = Some(rx);
                     }
                 } else if !app.help_open && app.form_modal.is_none() && key.code == KeyCode::Enter {
                     if let Some(cfg) = app.config.connections.get(app.selected_connection).cloned() {
                         app.connecting = true;
                         app.toasts.push(ToastKind::Info, format!("connecting to '{}'...", cfg.name));
-                        match crate::driver::connect_driver(&cfg).await {
+                        match app.connect_with_tunnel(&cfg).await {
                             Ok(drv) => {
                                 let info = drv.info();
                                 let capabilities = drv.capabilities();
@@ -4574,8 +4967,17 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 app.active_driver = Some(drv);
                                 app.active_connection_name = Some(cfg.name.clone());
                                 app.active_connection = Some(cfg.clone());
+                                // A fresh driver has no transaction state — reset
+                                // the console's tx mode along with the connection.
+                                app.autocommit = true;
+                                app.tx_active = false;
                                 app.mode = ScreenMode::Connected;
-                                app.toasts.push(ToastKind::Success, format!("connected: {} {}", info.name, info.server_version));
+                                let via = app
+                                    .ssh_tunnel
+                                    .as_ref()
+                                    .map(|t| format!(" (ssh tunnel :{})", t.local_port))
+                                    .unwrap_or_default();
+                                app.toasts.push(ToastKind::Success, format!("connected: {} {}{via}", info.name, info.server_version));
                             }
                             Err(e) => {
                                 app.toasts.push(ToastKind::Error, format!("connection failed: {e:#}"));
@@ -4604,18 +5006,60 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
             if let Some(run) = &mut app.query_run {
                 match run.rx.try_recv() {
                     Ok(outcome) => {
-                        let (tab, text) = (run.tab, run.query_text.clone());
+                        let (tab, text, is_retry, active_ns) = (
+                            run.tab,
+                            run.query_text.clone(),
+                            run.is_retry,
+                            run.active_ns.clone(),
+                        );
                         app.query_run = None;
-                        if let Some(exp) = &mut app.explorer_state {
-                            finish_console_query(
-                                exp,
-                                &mut app.toasts,
-                                &mut app.config,
-                                app.active_connection_name.as_ref(),
-                                tab,
-                                &text,
-                                outcome,
-                            );
+                        // A dropped connection gets one automatic
+                        // reconnect-and-retry; a retry that fails (or any
+                        // other error) is just reported. Only single-statement
+                        // runs are retried: re-running a script would re-apply
+                        // the statements that already committed before the
+                        // connection dropped.
+                        let single_statement = crate::ui::screens::query::split_statements(&text)
+                            .into_iter()
+                            .filter(|s| !crate::ui::screens::query::is_comment_only(s))
+                            .count()
+                            == 1;
+                        let retried = match &outcome {
+                            Err(err) if !is_retry && single_statement && app.try_reconnect(err).await => {
+                                if let (Some(exp), Some(drv)) =
+                                    (&mut app.explorer_state, &app.active_driver)
+                                {
+                                    retry_console_query(
+                                        exp,
+                                        drv,
+                                        &mut app.query_run,
+                                        tab,
+                                        &text,
+                                        active_ns,
+                                        !app.autocommit,
+                                    );
+                                }
+                                true
+                            }
+                            _ => false,
+                        };
+                        if !retried {
+                            if let Some(exp) = &mut app.explorer_state {
+                                finish_console_query(
+                                    exp,
+                                    &mut app.toasts,
+                                    &mut app.config,
+                                    app.active_connection_name.as_ref(),
+                                    tab,
+                                    &text,
+                                    outcome,
+                                );
+                            }
+                        }
+                        // Refresh the status-bar mirror: a tx-mode run may have
+                        // opened (or, on a begin failure, failed to open) a tx.
+                        if let Some(drv) = &app.active_driver {
+                            app.tx_active = drv.in_tx().await;
                         }
                     }
                     Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
@@ -4655,6 +5099,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         || e.schema_edit_modal.is_some()
                         || e.create_object_modal.is_some()
                         || e.erd_menu.is_some()
+                        || e.tree_menu.is_some()
                         || e.explain_plan.is_some()
                         || e.process_list.is_some()
                         || e.schema_diff.is_some()
@@ -4691,7 +5136,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
             if watch_due
                 && let (Some(drv), Some(exp)) = (&app.active_driver.clone(), &mut app.explorer_state)
             {
-                start_console_query(exp, drv, &mut app.toasts, &mut app.query_run);
+                start_console_query(exp, drv, &mut app.toasts, &mut app.query_run, !app.autocommit);
                 if let Some(WorkspaceTab::Console(c)) = exp.active_tab_mut() {
                     c.last_run = Some(Instant::now());
                 }
@@ -4732,6 +5177,27 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             });
                         }
                         app.form_test_rx = None;
+                    }
+                }
+            }
+            // Poll the picker 't' test result — toast only, there is no modal
+            // to surface it in.
+            if let Some(rx) = &mut app.picker_test_rx {
+                match rx.try_recv() {
+                    Ok(res) => {
+                        match res {
+                            Ok(dur) => app
+                                .toasts
+                                .push(ToastKind::Success, format!("ping ok ({:.2?})", dur)),
+                            Err(err) => app.toasts.push(ToastKind::Error, err),
+                        }
+                        app.picker_test_rx = None;
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        app.toasts
+                            .push(ToastKind::Error, "ping task ended unexpectedly".to_string());
+                        app.picker_test_rx = None;
                     }
                 }
             }

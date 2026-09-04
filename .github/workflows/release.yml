@@ -46,15 +46,23 @@ jobs:
       - name: Build (release)
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Stage binary
+      - name: Stage binary + checksum
         shell: bash
-        run: mv "target/${{ matrix.target }}/release/dbx${{ matrix.ext }}" "./${{ matrix.name }}${{ matrix.ext }}"
+        run: |
+          mv "target/${{ matrix.target }}/release/dbx${{ matrix.ext }}" "./${{ matrix.name }}${{ matrix.ext }}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.name }}${{ matrix.ext }}" > "${{ matrix.name }}${{ matrix.ext }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.name }}${{ matrix.ext }}" > "${{ matrix.name }}${{ matrix.ext }}.sha256"
+          fi
 
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: ${{ matrix.name }}${{ matrix.ext }}
+          path: |
+            ${{ matrix.name }}${{ matrix.ext }}
+            ${{ matrix.name }}${{ matrix.ext }}.sha256
 
   release:
     needs: build

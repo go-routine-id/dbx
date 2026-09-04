@@ -21,6 +21,10 @@ fn escape_ident(ident: &str) -> String {
 pub struct PostgresDriver {
     pool: PgPool,
     info: DriverInfo,
+    /// Dedicated connection held open while an interactive transaction is
+    /// active — BEGIN/COMMIT/ROLLBACK and every statement between them must
+    /// run on one connection, not whatever the pool hands out per call.
+    tx_conn: tokio::sync::Mutex<Option<sqlx::pool::PoolConnection<sqlx::Postgres>>>,
 }
 
 impl PostgresDriver {
@@ -72,7 +76,7 @@ impl PostgresDriver {
             query_language: "SQL".to_string(),
         };
 
-        Ok(Self { pool, info })
+        Ok(Self { pool, info, tx_conn: tokio::sync::Mutex::new(None) })
     }
 
     /// Shared helper for the "list object names in a schema" queries
@@ -488,7 +492,16 @@ impl Driver for PostgresDriver {
     }
 
     async fn execute(&self, ns: &Namespace, query: &str) -> Result<QueryResult> {
-        let mut conn = self.pool.acquire().await.context("failed to acquire connection from pool")?;
+        // When an interactive transaction is open, run on its dedicated
+        // connection; otherwise borrow a pooled connection for this call only.
+        let mut tx_guard = self.tx_conn.lock().await;
+        let mut pooled: sqlx::pool::PoolConnection<sqlx::Postgres>;
+        let conn: &mut sqlx::postgres::PgConnection = if let Some(c) = tx_guard.as_mut() {
+            &mut **c
+        } else {
+            pooled = self.pool.acquire().await.context("failed to acquire connection from pool")?;
+            &mut *pooled
+        };
         let set_path_sql = format!("SET search_path TO {}, public", escape_ident(&ns.0));
         let _ = sqlx::query(AssertSqlSafe(set_path_sql.as_str())).execute(&mut *conn).await;
 
@@ -543,6 +556,35 @@ impl Driver for PostgresDriver {
                 execution_time: elapsed,
             })
         }
+    }
+
+    async fn begin_tx(&self) -> Result<()> {
+        let mut guard = self.tx_conn.lock().await;
+        if guard.is_some() {
+            anyhow::bail!("a transaction is already open");
+        }
+        let mut conn = self.pool.acquire().await.context("failed to acquire connection from pool")?;
+        sqlx::query("BEGIN").execute(&mut *conn).await.context("failed to BEGIN")?;
+        *guard = Some(conn);
+        Ok(())
+    }
+
+    async fn commit_tx(&self) -> Result<()> {
+        let mut conn = self.tx_conn.lock().await.take()
+            .context("no transaction is open")?;
+        sqlx::query("COMMIT").execute(&mut *conn).await.context("failed to COMMIT")?;
+        Ok(())
+    }
+
+    async fn rollback_tx(&self) -> Result<()> {
+        let mut conn = self.tx_conn.lock().await.take()
+            .context("no transaction is open")?;
+        sqlx::query("ROLLBACK").execute(&mut *conn).await.context("failed to ROLLBACK")?;
+        Ok(())
+    }
+
+    async fn in_tx(&self) -> bool {
+        self.tx_conn.lock().await.is_some()
     }
 
     async fn definition(&self, c: &CollectionRef) -> Result<String> {

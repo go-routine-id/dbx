@@ -40,6 +40,10 @@ fn escape_literal(s: &str) -> String {
 pub struct SqliteDriver {
     pool: SqlitePool,
     info: DriverInfo,
+    /// Dedicated connection held open while an interactive transaction is
+    /// active — BEGIN/COMMIT/ROLLBACK and every statement between them must
+    /// run on one connection, not whatever the pool hands out per call.
+    tx_conn: tokio::sync::Mutex<Option<sqlx::pool::PoolConnection<sqlx::Sqlite>>>,
 }
 
 impl SqliteDriver {
@@ -78,6 +82,7 @@ impl SqliteDriver {
                 server_version: version,
                 query_language: "SQL".to_string(),
             },
+            tx_conn: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -326,6 +331,16 @@ impl Driver for SqliteDriver {
     /// SQLite has no `search_path`; the namespace is already part of every
     /// qualified name, so `ns` is unused here.
     async fn execute(&self, _ns: &Namespace, query: &str) -> Result<QueryResult> {
+        // When an interactive transaction is open, run on its dedicated
+        // connection; otherwise borrow a pooled connection for this call only.
+        let mut tx_guard = self.tx_conn.lock().await;
+        let mut pooled: sqlx::pool::PoolConnection<sqlx::Sqlite>;
+        let conn: &mut sqlx::sqlite::SqliteConnection = if let Some(c) = tx_guard.as_mut() {
+            &mut **c
+        } else {
+            pooled = self.pool.acquire().await.context("failed to acquire connection from pool")?;
+            &mut *pooled
+        };
         let start = Instant::now();
         let trimmed = query.trim_start();
         let starts_with = |kw: &str| {
@@ -336,7 +351,7 @@ impl Driver for SqliteDriver {
 
         if returns_rows {
             let rows = sqlx::query(AssertSqlSafe(query))
-                .fetch_all(&self.pool)
+                .fetch_all(&mut *conn)
                 .await
                 .with_context(|| format!("query execution failed: {query}"))?;
             let elapsed = start.elapsed();
@@ -359,7 +374,7 @@ impl Driver for SqliteDriver {
             })
         } else {
             let res = sqlx::query(AssertSqlSafe(query))
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await
                 .with_context(|| format!("statement execution failed: {query}"))?;
             Ok(QueryResult {
@@ -369,6 +384,35 @@ impl Driver for SqliteDriver {
                 execution_time: start.elapsed(),
             })
         }
+    }
+
+    async fn begin_tx(&self) -> Result<()> {
+        let mut guard = self.tx_conn.lock().await;
+        if guard.is_some() {
+            anyhow::bail!("a transaction is already open");
+        }
+        let mut conn = self.pool.acquire().await.context("failed to acquire connection from pool")?;
+        sqlx::query("BEGIN").execute(&mut *conn).await.context("failed to BEGIN")?;
+        *guard = Some(conn);
+        Ok(())
+    }
+
+    async fn commit_tx(&self) -> Result<()> {
+        let mut conn = self.tx_conn.lock().await.take()
+            .context("no transaction is open")?;
+        sqlx::query("COMMIT").execute(&mut *conn).await.context("failed to COMMIT")?;
+        Ok(())
+    }
+
+    async fn rollback_tx(&self) -> Result<()> {
+        let mut conn = self.tx_conn.lock().await.take()
+            .context("no transaction is open")?;
+        sqlx::query("ROLLBACK").execute(&mut *conn).await.context("failed to ROLLBACK")?;
+        Ok(())
+    }
+
+    async fn in_tx(&self) -> bool {
+        self.tx_conn.lock().await.is_some()
     }
 
     /// SQLite stores the original `CREATE` text, so the DDL is exact rather
@@ -458,8 +502,13 @@ mod tests {
     }
 
     async fn seeded_db() -> TempDb {
+        // Wall-clock nanoseconds alone can repeat for two tests starting on
+        // the same tick (parallel test threads) — a per-process counter
+        // guarantees a unique path regardless of clock granularity.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "dbx-sqlite-test-{}-{:?}.db",
+            "dbx-sqlite-test-{}-{seq}-{:?}.db",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -498,6 +547,7 @@ mod tests {
             socket: None,
             ssl: false,
             ssl_mode: None,
+            ssh: None,
         }
     }
 
@@ -648,5 +698,55 @@ mod tests {
         let mut cfg = cfg_for(&missing);
         cfg.database = None;
         assert!(SqliteDriver::connect(&cfg).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_interactive_transaction_commit_and_rollback() {
+        use crate::driver::Driver;
+
+        async fn user_count(drv: &SqliteDriver, ns: &Namespace) -> crate::driver::Value {
+            drv.execute(ns, "SELECT COUNT(*) AS n FROM users")
+                .await
+                .unwrap()
+                .records[0]
+                .values[0]
+                .clone()
+        }
+
+        let db = seeded_db().await;
+        let drv = SqliteDriver::connect(&cfg_for(&db.0)).await.unwrap();
+        let main = Namespace("main".to_string());
+
+        // Rollback path: the inserted row must vanish.
+        drv.begin_tx().await.unwrap();
+        assert!(drv.in_tx().await);
+        drv.execute(&main, "INSERT INTO users (id, name) VALUES (9001, 'tx-rollback')")
+            .await
+            .unwrap();
+        assert!(drv.begin_tx().await.is_err(), "nested BEGIN must fail");
+        drv.rollback_tx().await.unwrap();
+        assert!(!drv.in_tx().await);
+
+        // Commit path: the row persists. (If execute had silently used a
+        // pooled connection, the INSERT would have escaped the transaction
+        // and the rollback above would have changed nothing.)
+        drv.begin_tx().await.unwrap();
+        drv.execute(&main, "INSERT INTO users (id, name) VALUES (9002, 'tx-commit')")
+            .await
+            .unwrap();
+        drv.commit_tx().await.unwrap();
+        assert!(!drv.in_tx().await);
+
+        let baseline = user_count(&drv, &main).await;
+        drv.begin_tx().await.unwrap();
+        drv.execute(&main, "INSERT INTO users (id, name) VALUES (9003, 'tx-gone')")
+            .await
+            .unwrap();
+        drv.rollback_tx().await.unwrap();
+        assert_eq!(user_count(&drv, &main).await, baseline, "rolled-back row must not persist");
+
+        // Commit/rollback without an open transaction are clear errors.
+        assert!(drv.commit_tx().await.is_err());
+        assert!(drv.rollback_tx().await.is_err());
     }
 }

@@ -1,6 +1,7 @@
 //! Database driver abstraction and generic data model.
 //! See docs/architecture.md for capability model and architectural design.
 
+pub mod mssql;
 pub mod mysql;
 pub mod postgres;
 pub mod sqlite;
@@ -206,6 +207,28 @@ pub trait Driver: Send + Sync {
     /// QUERY_TEXT capability
     async fn execute(&self, ns: &Namespace, query: &str) -> Result<QueryResult>;
 
+    // ---- Interactive transactions. A driver that can hold one dedicated
+    // connection open overrides these; the defaults report "unsupported" so
+    // a connectionless driver stays valid. ----
+
+    /// Open a transaction on a dedicated connection. While one is open,
+    /// `execute` runs inside it instead of borrowing from the pool.
+    async fn begin_tx(&self) -> Result<()> {
+        anyhow::bail!("this driver does not support interactive transactions")
+    }
+    /// Commit and close the open transaction.
+    async fn commit_tx(&self) -> Result<()> {
+        anyhow::bail!("this driver does not support interactive transactions")
+    }
+    /// Roll back and close the open transaction.
+    async fn rollback_tx(&self) -> Result<()> {
+        anyhow::bail!("this driver does not support interactive transactions")
+    }
+    /// Whether a transaction is currently open.
+    async fn in_tx(&self) -> bool {
+        false
+    }
+
     /// DDL capability
     async fn definition(&self, c: &CollectionRef) -> Result<String>;
 
@@ -287,7 +310,8 @@ pub async fn connect_driver(cfg: &ConnectionConfig) -> Result<Arc<dyn Driver>> {
             Ok(Arc::new(drv))
         }
         DriverType::SqlServer => {
-            anyhow::bail!("driver '{:?}' is not yet supported", cfg.driver);
+            let drv = mssql::MssqlDriver::connect(cfg).await?;
+            Ok(Arc::new(drv))
         }
     }
 }

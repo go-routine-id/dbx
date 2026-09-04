@@ -38,7 +38,7 @@ pub const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 45] = [
+pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 48] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
@@ -66,15 +66,18 @@ pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 45] = [
     ("/", "filter data grid rows (col op value, e.g. status = paid)"),
     ("y / c", "copy active cell value to system clipboard"),
     ("Y / Ctrl+Y", "copy active row as formatted JSON to clipboard"),
-    ("Ctrl+E", "open export dialog (CSV, JSON, SQL INSERT) for current dataset"),
+    ("Ctrl+E", "open export dialog (CSV, JSON, SQL INSERT, SQL dump, xlsx)"),
     ("e / Enter", "edit active cell value (shows safe SQL confirmation)"),
     ("e (on tree table)", "edit table schema (ALTER: drop/add column, rename)"),
     ("a (in tree)", "create schema / table / view / type / function"),
+    ("Ctrl+O (on tree table)", "context menu: view DDL / open rows / edit schema / delete table"),
     ("x", "delete selected row (shows safe SQL confirmation)"),
     ("v (in table tab)", "expand the selected row vertically (wide tables)"),
     ("Ctrl+F / Ctrl+G", "search all cells / jump to the next match"),
     ("E (in ERD tab)", "export the diagram as ~/dbx_erd_<schema>.svg + .mmd"),
     ("Ctrl+W (in console)", "cycle auto re-run: off / 1s / 5s / 15s / 60s"),
+    ("Ctrl+T (in console)", "toggle autocommit — off = each run opens a transaction"),
+    ("F6 / F7 (in console)", "commit / roll back the open transaction"),
     ("Ctrl+P (in console)", "EXPLAIN the query and show the plan tree"),
     ("f (on an FK cell)", "open the row this foreign key references"),
     ("F (on any cell)", "find every row in the schema that references it"),

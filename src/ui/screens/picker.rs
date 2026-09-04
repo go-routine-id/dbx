@@ -84,6 +84,9 @@ pub struct ConnectionForm {
     /// TLS settings, preserved through edit so saving never downgrades them.
     pub ssl: bool,
     pub ssl_mode: Option<crate::config::SslMode>,
+    /// SSH tunnel settings. Not edited in the form (config file only), but
+    /// preserved through edit so saving never silently drops the tunnel.
+    pub ssh: Option<crate::config::SshConfig>,
     /// Last Ctrl+T result, kept visible inside the modal so the user always
     /// sees the test outcome right where they're editing. Cleared on the next
     /// Ctrl+T press.
@@ -130,6 +133,7 @@ impl ConnectionForm {
             database: env_default("DBX_DEFAULT_DATABASE"),
             ssl: false,
             ssl_mode: None,
+            ssh: None,
             last_test_result: None,
         }
     }
@@ -148,6 +152,7 @@ impl ConnectionForm {
             database: cfg.database.clone().unwrap_or_default(),
             ssl: cfg.ssl,
             ssl_mode: cfg.ssl_mode,
+            ssh: cfg.ssh.clone(),
             last_test_result: None,
         }
     }
@@ -164,6 +169,7 @@ impl ConnectionForm {
             socket: None,
             ssl: self.ssl,
             ssl_mode: self.ssl_mode,
+            ssh: self.ssh.clone(),
         }
     }
 }

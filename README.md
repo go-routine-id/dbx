@@ -101,7 +101,10 @@ binary lives in a root-owned directory, re-run it with `sudo`. Your config
 | ✅ | Running-query monitor with cancel (`Ctrl+K`) |
 | ✅ | Console watch mode — auto re-run every 1/5/15/60s (`Ctrl+W`) |
 | ✅ | ERD export to SVG + Mermaid (`E`) |
-| 🚧 | SQL Server (architecture ready, driver not implemented) |
+| ✅ | SQL Server support (tiberius / TDS) |
+| ✅ | SSH tunnel per connection (`[connections.ssh]`) |
+| ✅ | Light theme (`theme = "light"`) |
+| ✅ | Excel (xlsx) + SQL dump export formats |
 
 The ERD renderer uses [flowmaid](https://github.com/go-routine-id/flowmaid)
 for automatic layout and crow's-foot geometry, painted into a
@@ -123,7 +126,7 @@ inside a terminal grid.
 |---|---|
 | MySQL | ✅ implemented |
 | PostgreSQL | ✅ implemented |
-| SQL Server | 🚧 architecture ready (`DriverType` enum exists, no implementation) |
+| SQL Server | ✅ implemented (tiberius; 2012+ for OFFSET/FETCH paging) |
 | SQLite | ✅ implemented (file-based — set the file path in the `database` field) |
 
 All SQL is built through a generic helper layer (`quote_ident`,
@@ -173,6 +176,31 @@ Config lives in `config.toml` (`~/.config/dbx/config.toml`, or `$DBX_CONFIG` /
 |---|---|---|
 | `connections` | `[]` | Saved connection entries |
 | `page_size` | `50` | Rows fetched per page in the data grid |
+| `theme` | `"dark"` | Colour palette: `dark` or `light` (for bright terminals) |
+
+A connection can reach its database through an SSH bastion — add an
+`[connections.ssh]` table to the entry (config file only; the add/edit form
+preserves it). dbx spawns the system `ssh` with `-N -L` and points the driver
+at the forwarded loopback port; authentication comes from your agent /
+`~/.ssh/config` (BatchMode is on, so interactive prompts are never expected):
+
+```toml
+[[connections]]
+name = "prod-pg"
+driver = "postgres"
+host = "db.internal"      # resolved on the bastion side
+port = 5432
+user = "app"
+password = "$ENV:PROD_PG_PASS"
+database = "appdb"
+
+[connections.ssh]
+host = "bastion.example.com"
+# port = 22                     # optional, this is the default
+# user = "deploy"               # optional, falls back to ssh's own default
+# identity_file = "~/.ssh/id_ed25519"  # optional, ~ is expanded
+# local_port = 15432            # optional, a free port is picked when 0/missing
+```
 
 Environment variables:
 

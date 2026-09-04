@@ -94,6 +94,15 @@ pub struct QueryRun {
     pub tab: usize,
     pub started: Instant,
     pub query_text: String,
+    /// Namespace the run executes against, captured at start. The retry after
+    /// a reconnect must reuse it: reconnecting rebuilds the tree with the
+    /// selection reset, so re-deriving from the tree would silently run the
+    /// query in the first database instead of the user's.
+    pub active_ns: crate::driver::Namespace,
+    /// True when this run is itself the single automatic retry after a
+    /// reconnect — a retry that fails must NOT trigger another reconnect,
+    /// or a dead server would reconnect-loop forever.
+    pub is_retry: bool,
 }
 
 /// Validate the active console's SQL and start executing it in the background.
@@ -106,6 +115,7 @@ pub fn start_console_query(
     drv: &Arc<dyn crate::driver::Driver>,
     toasts: &mut Toasts,
     run: &mut Option<QueryRun>,
+    use_tx: bool,
 ) {
     // Only one query at a time: starting a second would orphan the first,
     // leaving its console spinning forever with no way to cancel it.
@@ -174,9 +184,11 @@ pub fn start_console_query(
         );
         return;
     }
-    // Stateful scripts (SET @x, transactions) run on separate pooled
-    // connections, so session state doesn't persist — warn up front.
-    if statements.len() > 1 {
+    // Stateful scripts (SET @x, manual BEGIN..COMMIT) run on separate pooled
+    // connections, so session state doesn't persist — warn up front. Inside an
+    // interactive transaction every statement shares one connection, so the
+    // warning doesn't apply there.
+    if statements.len() > 1 && !use_tx {
         toasts.push(
             ToastKind::Warning,
             "multi-statement: SET @x / BEGIN..COMMIT won't persist between statements".to_string(),
@@ -187,11 +199,25 @@ pub fn start_console_query(
 
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     let drv = drv.clone();
+    let run_ns = active_ns.clone();
     let handle = tokio::spawn(async move {
+        // Autocommit off → the whole run lives in a lazily-opened transaction
+        // on a dedicated connection, until the user commits or rolls back.
+        // A transaction may already be open from a previous run — that is the
+        // point of the mode — so only BEGIN when none is.
+        if use_tx
+            && !drv.in_tx().await
+            && let Err(e) = drv.begin_tx().await
+        {
+            let _ = tx
+                .send(Err(format!("failed to begin transaction: {e:#}")))
+                .await;
+            return;
+        }
         let mut results = Vec::new();
         let mut outcome = Ok(Vec::new());
         for stmt in &statements {
-            match drv.execute(&active_ns, stmt).await {
+            match drv.execute(&run_ns, stmt).await {
                 Ok(r) => results.push(r),
                 Err(e) => {
                     outcome = Err(format!("{e:#}"));
@@ -211,6 +237,78 @@ pub fn start_console_query(
         tab,
         started: Instant::now(),
         query_text,
+        active_ns,
+        is_retry: false,
+    });
+}
+
+/// Re-run a console query that failed on a dropped connection, after
+/// `try_reconnect` put a fresh driver in place. The new run is flagged
+/// `is_retry` so a second failure is reported, not reconnected again.
+///
+/// `active_ns` comes from the failed run's `QueryRun` — never re-derived from
+/// the tree, which `try_reconnect` has just rebuilt with the selection reset.
+pub fn retry_console_query(
+    exp: &mut crate::ui::screens::explorer::ExplorerState,
+    drv: &Arc<dyn crate::driver::Driver>,
+    run: &mut Option<QueryRun>,
+    tab: usize,
+    query_text: &str,
+    active_ns: crate::driver::Namespace,
+    use_tx: bool,
+) {
+    let statements: Vec<String> = crate::ui::screens::query::split_statements(query_text)
+        .into_iter()
+        .filter(|s| !crate::ui::screens::query::is_comment_only(s))
+        .collect();
+    if statements.is_empty() {
+        return;
+    }
+    // The console's error state was set by the failed run; clear it so the
+    // tab goes back to "executing" while the retry is in flight.
+    if let Some(WorkspaceTab::Console(console)) = exp.tabs.get_mut(tab) {
+        console.is_executing = true;
+        console.execution_error = None;
+    }
+
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let drv = drv.clone();
+    let run_ns = active_ns.clone();
+    let handle = tokio::spawn(async move {
+        if use_tx
+            && !drv.in_tx().await
+            && let Err(e) = drv.begin_tx().await
+        {
+            let _ = tx
+                .send(Err(format!("failed to begin transaction: {e:#}")))
+                .await;
+            return;
+        }
+        let mut results = Vec::new();
+        let mut outcome = Ok(Vec::new());
+        for stmt in &statements {
+            match drv.execute(&run_ns, stmt).await {
+                Ok(r) => results.push(r),
+                Err(e) => {
+                    outcome = Err(format!("{e:#}"));
+                    break;
+                }
+            }
+        }
+        if outcome.is_ok() {
+            outcome = Ok(results);
+        }
+        let _ = tx.send(outcome).await;
+    });
+
+    *run = Some(QueryRun {
+        rx,
+        handle,
+        tab,
+        started: Instant::now(),
+        query_text: query_text.to_string(),
+        active_ns,
+        is_retry: true,
     });
 }
 
@@ -305,12 +403,16 @@ pub fn step_column(
 ///
 /// Shared by Enter/Space and by a mouse click, so clicking a table does the
 /// same thing as selecting it and pressing Enter.
+///
+/// Returns the error message when opening a table/view failed — the caller
+/// decides whether to toast it or reconnect-and-retry. Other node kinds keep
+/// reporting through toasts internally.
 pub async fn open_tree_node(
     exp: &mut crate::ui::screens::explorer::ExplorerState,
     drv: &Arc<dyn crate::driver::Driver>,
     toasts: &mut Toasts,
     page_size: u64,
-) {
+) -> Option<String> {
     if let Some(node) = exp.selected_node() {
         match &node.kind {
             TreeNodeKind::Database(ns) => {
@@ -381,7 +483,7 @@ pub async fn open_tree_node(
                 )
                 .await
                 {
-                    toasts.push(ToastKind::Error, format!("failed to load view: {e}"));
+                    return Some(format!("failed to load view: {e}"));
                 }
             }
             TreeNodeKind::Routine(cref) => {
@@ -417,13 +519,53 @@ pub async fn open_tree_node(
                 )
                 .await
                 {
-                    toasts.push(ToastKind::Error, format!("failed to load table: {e}"));
+                    return Some(format!("failed to load table: {e}"));
                 }
             }
         }
     }
+    None
 }
 
+/// Heuristic: does this error mean the connection died (as opposed to a
+/// query being wrong)? Matched on message text because sqlx surfaces
+/// disconnects as opaque io/driver errors. Used to decide whether an
+/// automatic reconnect-and-retry is worth attempting.
+pub fn looks_like_disconnect(err: &str) -> bool {
+    let e = err.to_lowercase();
+    [
+        "connection closed",
+        "closed the connection",
+        "connection reset",
+        "broken pipe",
+        "connection refused",
+        "terminating connection",
+        "server closed",
+        "not connected",
+        "lost connection",
+        "unexpected eof",
+    ]
+    .iter()
+    .any(|p| e.contains(p))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn test_looks_like_disconnect() {
+        for (msg, want) in [
+            ("error communicating with server: Connection closed", true),
+            ("pool timed out while waiting for an open connection", false),
+            ("db error: ERROR: syntax error at or near \"SELCT\"", false),
+            ("io error: Broken pipe (os error 32)", true),
+            ("Server closed the connection unexpectedly", true),
+            ("Lost connection to MySQL server during query", true),
+            ("failed to BEGIN", false),
+        ] {
+            assert_eq!(super::looks_like_disconnect(msg), want, "for: {msg}");
+        }
+    }
+}
 /// Read every table's structure in `ns`. Errors on individual tables are
 /// skipped rather than failing the whole comparison — a diff over the tables
 /// we could read is more useful than no diff at all.
