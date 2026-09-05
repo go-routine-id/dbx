@@ -1,6 +1,6 @@
 # dbx Roadmap
 
-> Status (v0.5.0, Sep 2026): M0–M4 shipped, and most of the post-v0.1
+> Status (v0.5.1, Sep 2026): M0–M4 shipped, and most of the post-v0.1
 > backlog below has landed — write ops, `EXPLAIN` viewer, mouse support,
 > saved queries, and seven drivers (MySQL, PostgreSQL, SQL Server, SQLite,
 > ClickHouse, MongoDB, Redis).
