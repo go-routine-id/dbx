@@ -58,6 +58,11 @@ pub fn quote_style_for(driver_name: &str) -> QuoteStyle {
         // SQLite accepts both. Backtick is the most ergonomic for
         // round-tripped queries.
         QuoteStyle::Backtick
+    } else if lower.contains("mongo") {
+        // mongo: schemaless — no SQL identifier quoting is ever generated
+        // for it (no EDIT_DATA/DDL), but keep the arm explicit so a changed
+        // default never leaks in silently.
+        QuoteStyle::Double
     } else {
         QuoteStyle::Double
     }

@@ -16,6 +16,7 @@ pub enum DriverType {
     Postgres,
     SqlServer,
     Sqlite,
+    MongoDB, // mongo
 }
 
 impl DriverType {
@@ -25,6 +26,7 @@ impl DriverType {
             DriverType::Postgres => 5432,
             DriverType::SqlServer => 1433,
             DriverType::Sqlite => 0,
+            DriverType::MongoDB => 27017, // mongo
         }
     }
 }
@@ -173,6 +175,7 @@ impl ConnectionConfig {
             DriverType::Postgres => "postgres",
             DriverType::SqlServer => "sqlserver",
             DriverType::Sqlite => "sqlite",
+            DriverType::MongoDB => "mongodb", // mongo
         }
     }
 }

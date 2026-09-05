@@ -304,6 +304,7 @@ pub fn render_form_modal(
                 DriverType::Postgres => "PostgreSQL",
                 DriverType::SqlServer => "SQL Server",
                 DriverType::Sqlite => "SQLite",
+                DriverType::MongoDB => "MongoDB", // mongo
             };
             if is_focused {
                 spans.push(Span::styled("◀ ", theme.accent()));
