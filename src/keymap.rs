@@ -38,7 +38,7 @@ pub const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 49] = [
+pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 50] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
