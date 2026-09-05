@@ -318,6 +318,7 @@ pub fn render_form_modal(
                 DriverType::Postgres => "PostgreSQL",
                 DriverType::SqlServer => "SQL Server",
                 DriverType::Sqlite => "SQLite",
+                DriverType::ClickHouse => "ClickHouse", // clickhouse
             };
             if is_focused {
                 spans.push(Span::styled("◀ ", theme.accent()));

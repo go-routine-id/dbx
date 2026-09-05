@@ -58,6 +58,9 @@ pub fn quote_style_for(driver_name: &str) -> QuoteStyle {
         // SQLite accepts both. Backtick is the most ergonomic for
         // round-tripped queries.
         QuoteStyle::Backtick
+    } else if lower.contains("clickhouse") {
+        // clickhouse: backtick is ClickHouse's native quoting style.
+        QuoteStyle::Backtick
     } else {
         QuoteStyle::Double
     }

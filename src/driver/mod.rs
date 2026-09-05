@@ -1,6 +1,7 @@
 //! Database driver abstraction and generic data model.
 //! See docs/architecture.md for capability model and architectural design.
 
+pub mod clickhouse; // clickhouse
 pub mod mssql;
 pub mod mysql;
 pub mod postgres;
@@ -311,6 +312,11 @@ pub async fn connect_driver(cfg: &ConnectionConfig) -> Result<Arc<dyn Driver>> {
         }
         DriverType::SqlServer => {
             let drv = mssql::MssqlDriver::connect(cfg).await?;
+            Ok(Arc::new(drv))
+        }
+        DriverType::ClickHouse => {
+            // clickhouse
+            let drv = clickhouse::ClickHouseDriver::connect(cfg).await?;
             Ok(Arc::new(drv))
         }
     }

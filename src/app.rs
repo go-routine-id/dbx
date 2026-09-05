@@ -2636,11 +2636,12 @@ impl App {
                 KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.focused_field == FormField::Driver => {
                     use crate::config::DriverType;
                     // Every implemented driver is offered in the cycle.
-                    const CYCLE: [DriverType; 4] = [
+                    const CYCLE: [DriverType; 5] = [
                         DriverType::MySql,
                         DriverType::Postgres,
                         DriverType::Sqlite,
                         DriverType::SqlServer,
+                        DriverType::ClickHouse, // clickhouse
                     ];
                     let cur = CYCLE.iter().position(|d| *d == form.driver).unwrap_or(0);
                     let delta = if key.code == KeyCode::Left {
