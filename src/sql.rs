@@ -40,6 +40,9 @@ pub enum QuoteStyle {
     /// SQL Server: `[identifier]` or `"identifier"` (the latter is
     /// non-standard and conflicts with string literals in some contexts).
     Bracket,
+    /// redis: no quoting at all — Redis has no identifier syntax (key
+    /// prefixes are plain strings); the identifier is emitted unchanged.
+    Raw,
 }
 
 /// Map a driver-info name to its identifier quoting style. Defaults to
@@ -58,6 +61,10 @@ pub fn quote_style_for(driver_name: &str) -> QuoteStyle {
         // SQLite accepts both. Backtick is the most ergonomic for
         // round-tripped queries.
         QuoteStyle::Backtick
+    } else if lower.contains("redis") {
+        // redis: keys aren't SQL identifiers; quoting them would corrupt
+        // any text the user pastes into the command console.
+        QuoteStyle::Raw
     } else {
         QuoteStyle::Double
     }
@@ -72,6 +79,7 @@ pub fn quote_ident_with(ident: &str, style: QuoteStyle) -> String {
         QuoteStyle::Double => format!("\"{}\"", ident.replace('"', "\"\"")),
         QuoteStyle::Backtick => format!("`{}`", ident.replace('`', "``")),
         QuoteStyle::Bracket => format!("[{}]", ident.replace(']', "]]")),
+        QuoteStyle::Raw => ident.to_string(), // redis
     }
 }
 

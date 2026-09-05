@@ -4,6 +4,7 @@
 pub mod mssql;
 pub mod mysql;
 pub mod postgres;
+pub mod redis; // redis
 pub mod sqlite;
 
 use std::fmt;
@@ -311,6 +312,11 @@ pub async fn connect_driver(cfg: &ConnectionConfig) -> Result<Arc<dyn Driver>> {
         }
         DriverType::SqlServer => {
             let drv = mssql::MssqlDriver::connect(cfg).await?;
+            Ok(Arc::new(drv))
+        }
+        // redis
+        DriverType::Redis => {
+            let drv = redis::RedisDriver::connect(cfg).await?;
             Ok(Arc::new(drv))
         }
     }

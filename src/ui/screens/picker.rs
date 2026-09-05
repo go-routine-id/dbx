@@ -292,6 +292,9 @@ pub fn render_form_modal(
         // label says so rather than the generic "Database".
         let label_text = if field == FormField::Database && form.driver == DriverType::Sqlite {
             "File path"
+        } else if field == FormField::Database && form.driver == DriverType::Redis {
+            // redis: `database` carries the numeric logical-db index.
+            "DB index"
         } else {
             field.label()
         };
@@ -304,6 +307,7 @@ pub fn render_form_modal(
                 DriverType::Postgres => "PostgreSQL",
                 DriverType::SqlServer => "SQL Server",
                 DriverType::Sqlite => "SQLite",
+                DriverType::Redis => "Redis", // redis
             };
             if is_focused {
                 spans.push(Span::styled("◀ ", theme.accent()));

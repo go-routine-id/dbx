@@ -2636,11 +2636,12 @@ impl App {
                 KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.focused_field == FormField::Driver => {
                     use crate::config::DriverType;
                     // Every implemented driver is offered in the cycle.
-                    const CYCLE: [DriverType; 4] = [
+                    const CYCLE: [DriverType; 5] = [
                         DriverType::MySql,
                         DriverType::Postgres,
                         DriverType::Sqlite,
                         DriverType::SqlServer,
+                        DriverType::Redis, // redis
                     ];
                     let cur = CYCLE.iter().position(|d| *d == form.driver).unwrap_or(0);
                     let delta = if key.code == KeyCode::Left {
@@ -5258,18 +5259,6 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{CollectionRef, Namespace, Record, Value};
-
-    fn cref(ns: &str, tbl: &str) -> CollectionRef {
-        CollectionRef {
-            namespace: Namespace(ns.to_string()),
-            name: tbl.to_string(),
-        }
-    }
-
-    fn row(values: Vec<Value>) -> Record {
-        Record { values }
-    }
 
     #[test]
     fn test_step_column_keeps_selection_inside_the_window() {
