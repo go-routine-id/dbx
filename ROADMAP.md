@@ -2,7 +2,8 @@
 
 > Status (v0.5.0, Sep 2026): M0–M4 shipped, and most of the post-v0.1
 > backlog below has landed — write ops, `EXPLAIN` viewer, mouse support,
-> saved queries, and four drivers (MySQL, PostgreSQL, SQL Server, SQLite).
+> saved queries, and seven drivers (MySQL, PostgreSQL, SQL Server, SQLite,
+> ClickHouse, MongoDB, Redis).
 > Remaining backlog is marked **todo**; everything else is in
 > [README.md](README.md).
 
@@ -151,7 +152,7 @@ gives the full M0–M3 experience; CI builds green; README demo matches reality.
 |---|---|
 | Write ops | ✅ Inline cell edit, add/delete row with SQL preview (`EDIT_DATA` capability) |
 | Query analysis | ✅ `EXPLAIN` viewer with costliest-node highlight (`ctrl+p`); ✅ multi-statement results |
-| Databases | ✅ PostgreSQL, SQLite (sqlx); ✅ SQL Server (tiberius/TDS, 2012+ for OFFSET/FETCH paging) — **todo:** Azure SQL variants, NoSQL (MongoDB, Redis) via the capability model |
+| Databases | ✅ PostgreSQL, SQLite (sqlx); ✅ SQL Server (tiberius/TDS, 2012+ for OFFSET/FETCH paging); ✅ ClickHouse (HTTP); ✅ MongoDB (read-only console); ✅ Redis (prefix-grouped key browser) — **todo:** Azure SQL variants, deeper NoSQL write support |
 | Input | ✅ Mouse support (click, scroll, drag splitter) — **todo:** optional vim-mode editing |
 | Productivity | ✅ Saved/favorite queries + per-connection history; ✅ connection switcher in-app; ✅ SSH tunnel per connection; ✅ transactions (autocommit toggle, commit/rollback); ✅ auto-reconnect with query retry; ✅ xlsx + SQL-dump export — **todo:** table data filter bar (WHERE builder), keyset (cursor) pagination for very large tables |
 

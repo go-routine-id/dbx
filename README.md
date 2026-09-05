@@ -82,7 +82,7 @@ binary lives in a root-owned directory, re-run it with `sudo`. Your config
 
 | | Feature |
 |---|---|
-| ✅ | Database explorer tree (schema → table → columns/indexes) — all four drivers |
+| ✅ | Database explorer tree (schema → table → columns/indexes) — seven drivers |
 | ✅ | Multi-tab query consoles with persistent scratch files |
 | ✅ | Result grid with paging + CSV / SQL export |
 | ✅ | DDL popup (table definition, indexes, foreign keys) |
@@ -108,6 +108,10 @@ binary lives in a root-owned directory, re-run it with `sudo`. Your config
 | ✅ | Transactions — autocommit toggle (`Ctrl+T`) with commit / rollback |
 | ✅ | Automatic reconnect on dropped connections, with query retry |
 | ✅ | Per-node context menu in the explorer tree (`Ctrl+O`) |
+| ✅ | Create Table / Create Database forms with live SQL preview — type-aware per driver |
+| ✅ | Grid column resize (`<` / `>`, or Alt+drag the header separator) + multi-column sort stack |
+| ✅ | mTLS client certificates for MySQL / PostgreSQL (`ssl_ca` / `ssl_cert` / `ssl_key`) |
+| ✅ | ClickHouse, MongoDB and Redis drivers (see driver table below) |
 | ✅ | Create table (column form with live SQL preview, `a` → table) and create database (`N` on a database node) |
 
 The ERD renderer uses [flowmaid](https://github.com/go-routine-id/flowmaid)
@@ -132,6 +136,29 @@ inside a terminal grid.
 | PostgreSQL | ✅ implemented |
 | SQL Server | ✅ implemented (tiberius; 2012+ for OFFSET/FETCH paging) |
 | SQLite | ✅ implemented (file-based — set the file path in the `database` field) |
+| ClickHouse | ✅ implemented (HTTP interface, port 8123/8443; read/query-focused) |
+| MongoDB | ✅ implemented (browse collections, inferred schema, read-only JSON console) |
+| Redis | ✅ implemented (keys grouped by `:` prefix, raw command console, INFO/SLOWLOG) |
+
+### MongoDB console format
+
+The query console on a MongoDB connection takes one JSON object per command,
+run against the selected database:
+
+```json
+{ "collection": "users", "find": { "filter": {"age": {"$gte": 18}}, "sort": {"_id": 1}, "limit": 50 } }
+{ "collection": "users", "aggregate": [ {"$group": {"_id": "$city", "n": {"$sum": 1}}} ] }
+```
+
+Extended values: `{"$oid": "<24-hex>"}` for ObjectId, `{"$date": "<rfc3339>"}`
+for BSON dates. v1 is read-only (find/aggregate, hard cap 1000 rows).
+
+### Redis console
+
+The console on a Redis connection accepts raw commands (`SCAN 0 MATCH user:*`,
+`HGETALL user:1`, `INFO`, `SLOWLOG GET 10`) with shell-style quoting; replies
+render in the result grid. The explorer groups keys into collections by their
+first `:` prefix.
 
 All SQL is built through a generic helper layer (`quote_ident`,
 `single_row_suffix`, `render_*`, `build_where_for_row`, `build_insert_sql`)
