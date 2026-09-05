@@ -207,6 +207,8 @@ pub struct App {
     picker_hit_area: Option<Rect>,
     /// In-flight ERD drag-to-pan state (mouse gesture).
     erd_drag: Option<ErdDrag>,
+    /// In-flight grid column-resize drag (Alt+drag on a header separator).
+    col_resize_drag: Option<ColResizeDrag>,
     /// Autocommit mode for the query console (`Ctrl+T`). When off, every
     /// console run opens an interactive transaction on a dedicated connection
     /// that stays open until F6 (commit) or F7 (rollback).
@@ -225,6 +227,16 @@ struct ErdDrag {
     last_x: u16,
     last_y: u16,
     moved: bool,
+}
+
+/// Mouse drag state for resizing a grid column: the absolute column index,
+/// the x where the press landed, and the width the column had at press time
+/// (deltas apply to that, so the drag is smooth however fast events arrive).
+#[derive(Clone, Copy, Debug)]
+struct ColResizeDrag {
+    col: usize,
+    start_x: u16,
+    start_w: u16,
 }
 
 impl App {
@@ -255,6 +267,7 @@ impl App {
             ssh_tunnel: None,
             picker_hit_area: None,
             erd_drag: None,
+            col_resize_drag: None,
             autocommit: true,
             tx_active: false,
         }
@@ -525,6 +538,20 @@ impl App {
 
         // Figma-like mouse: drag pans the ERD, release after a click opens DDL.
         if matches!(mouse.kind, MouseEventKind::Drag(MouseButton::Left)) {
+            // An active column-resize drag owns the gesture until release.
+            if let Some(drag) = self.col_resize_drag {
+                if let Some(exp) = &mut self.explorer_state
+                    && let Some(WorkspaceTab::Table(t)) = exp.active_tab_mut()
+                {
+                    let delta = i32::from(mouse.column) - i32::from(drag.start_x);
+                    let new_w = (i32::from(drag.start_w) + delta).clamp(
+                        i32::from(crate::ui::screens::explorer::COL_WIDTH_MIN),
+                        i32::from(crate::ui::screens::explorer::COL_WIDTH_MAX),
+                    ) as u16;
+                    crate::ui::screens::explorer::set_col_width(t, drag.col, new_w);
+                }
+                return Ok(());
+            }
             if let Some(drag) = self.erd_drag {
                 let dx = i32::from(mouse.column) - i32::from(drag.last_x);
                 let dy = i32::from(mouse.row) - i32::from(drag.last_y);
@@ -550,6 +577,10 @@ impl App {
         }
 
         if matches!(mouse.kind, MouseEventKind::Up(MouseButton::Left)) {
+            // Releasing a column-resize drag just ends it — no click action.
+            if self.col_resize_drag.take().is_some() {
+                return Ok(());
+            }
             let was_click = self
                 .erd_drag
                 .as_ref()
@@ -775,6 +806,30 @@ impl App {
         match tab {
             WorkspaceTab::Table(t) => {
                 let Some(area) = t.grid_hit_area else { return Ok(()) };
+                // Alt+press on a header-row column separator starts a resize
+                // drag on the column to its left. Without Alt the same press
+                // stays an ordinary click (header click selects the column).
+                if mouse.modifiers.contains(KeyModifiers::ALT)
+                    && mouse.row == area.y
+                    && mouse.column >= area.x
+                    && mouse.column < area.x + area.width
+                {
+                    for (i, &(start, width)) in t.grid_col_rects.iter().enumerate() {
+                        let boundary = start.saturating_add(width);
+                        // One cell of slack each side of the boundary — the
+                        // gap cell between columns is only 1 wide.
+                        if mouse.column.abs_diff(boundary) <= 1 {
+                            let col = t.scroll_offset_x + i;
+                            let w = crate::ui::screens::explorer::col_width(t, col);
+                            self.col_resize_drag = Some(ColResizeDrag {
+                                col,
+                                start_x: mouse.column,
+                                start_w: w,
+                            });
+                            return Ok(());
+                        }
+                    }
+                }
                 // Column check so a click on empty sidebar space below the
                 // tree doesn't fall through to the grid.
                 if mouse.column >= area.x
@@ -802,11 +857,11 @@ impl App {
                             t.selected_row = data_row;
                         }
                     }
-                    // Column hit-test against the exact x-starts recorded at
+                    // Column hit-test against the exact rects recorded at
                     // render time. Clicking the header row selects the column.
                     let mut col_visible = 0usize;
-                    for (i, s) in t.grid_col_starts.iter().enumerate() {
-                        if mouse.column >= *s {
+                    for (i, &(start, _)) in t.grid_col_rects.iter().enumerate() {
+                        if mouse.column >= start {
                             col_visible = i;
                         } else {
                             break;
@@ -1952,6 +2007,32 @@ impl App {
                                                 "sort cleared".to_string(),
                                             );
                                         }
+                                    }
+                                    // `<` / `>` shrink / grow the focused
+                                    // column's rendered width (session-only;
+                                    // Alt+drag on a header separator does the
+                                    // same with the mouse).
+                                    KeyCode::Char('<') | KeyCode::Char('>') => {
+                                        use crate::ui::screens::explorer::{
+                                            COL_WIDTH_STEP, resize_col_width,
+                                        };
+                                        let col = t.selected_col;
+                                        let delta = if matches!(key.code, KeyCode::Char('>')) {
+                                            i32::from(COL_WIDTH_STEP)
+                                        } else {
+                                            -i32::from(COL_WIDTH_STEP)
+                                        };
+                                        let w = resize_col_width(t, col, delta);
+                                        let name = t
+                                            .page
+                                            .columns
+                                            .get(col)
+                                            .cloned()
+                                            .unwrap_or_default();
+                                        self.toasts.push(
+                                            ToastKind::Info,
+                                            format!("column '{name}' width: {w}"),
+                                        );
                                     }
                                     KeyCode::Up | KeyCode::Char('k') => {
                                         if t.selected_row > 0 {
