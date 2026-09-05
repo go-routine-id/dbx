@@ -458,10 +458,16 @@ impl Driver for MssqlDriver {
             JOIN sys.schemas rs ON rs.schema_id = rt.schema_id \
             JOIN sys.columns rc ON rc.object_id = rt.object_id AND rc.column_id = fkc.referenced_column_id \
             WHERE ps.name = @P1 AND pt.name = @P2";
-        let fk_rows = match client.query(fk_sql, &[&c.namespace.0, &c.name]).await {
-            Ok(s) => s.into_first_result().await.unwrap_or_default(),
-            Err(_) => Vec::new(),
-        };
+        // Errors propagate (not `unwrap_or_default`): an ERD built on a
+        // table whose FK query failed would silently miss relationships.
+        let fk_stream = client
+            .query(fk_sql, &[&c.namespace.0, &c.name])
+            .await
+            .with_context(|| format!("failed to list foreign keys of {}", c.name))?;
+        let fk_rows = fk_stream
+            .into_first_result()
+            .await
+            .with_context(|| format!("failed to read foreign keys of {}", c.name))?;
 
         let mut foreign_keys = Vec::new();
         let mut fk_col_names = std::collections::HashSet::new();

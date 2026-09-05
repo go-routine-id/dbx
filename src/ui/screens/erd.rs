@@ -176,7 +176,9 @@ fn er_to_mermaid(er: &ErDiagram) -> String {
             line,
             card(r.card_to, false),
             ident(&to.name),
-            r.label.clone().unwrap_or_else(|| "has".to_string())
+            // A composite FK's label is "col_a, col_b" — an unquoted label
+            // must be a single word, so it goes through `ident` too.
+            ident(r.label.as_deref().unwrap_or("has"))
         ));
     }
     out
@@ -473,7 +475,21 @@ fn build_er_diagram(collections: &[CollectionMeta]) -> ErDiagram {
     // columns, so cross-schema relationships stay visible.
     let ns = collections.first().map(|m| m.reference.namespace.clone());
     for meta in collections {
+        // Drivers report composite FKs as one row per column; group them back
+        // into ONE relation per constraint (order-preserving) so a two-column
+        // FK draws a single edge, not two parallel ones.
+        let mut order: Vec<&str> = Vec::new();
+        let mut by_name: std::collections::HashMap<&str, Vec<&crate::driver::ForeignKeyMeta>> =
+            std::collections::HashMap::new();
         for fk in &meta.foreign_keys {
+            if !by_name.contains_key(fk.name.as_str()) {
+                order.push(fk.name.as_str());
+            }
+            by_name.entry(fk.name.as_str()).or_default().push(fk);
+        }
+        for name in order {
+            let cols = &by_name[name];
+            let fk = cols[0];
             let ref_ns_is_this = Some(&fk.ref_namespace) == ns.as_ref();
             let parent_name = if ref_ns_is_this {
                 fk.ref_table.clone()
@@ -487,28 +503,32 @@ fn build_er_diagram(collections: &[CollectionMeta]) -> ErDiagram {
             //   points at a single parent row. (The parent's referenced
             //   column is unique by definition of a valid FK, so there's
             //   nothing to sniff here.)
-            // - card_to (child side) is ONE when the FK column itself is
-            //   PK/UNIQUE on the child (a 1:1 link — one parent has at most
-            //   one child), otherwise ZERO-OR-MANY (one parent has many
-            //   children).
-            let child_fk_unique = meta
-                .columns
-                .iter()
-                .find(|c| c.name == fk.column)
-                .map(|c| c.is_primary_key || c.is_unique)
-                .unwrap_or(false);
+            // - card_to (child side) is ONE when EVERY column of the FK is
+            //   PK/UNIQUE on the child (a 1:1 link), otherwise ZERO-OR-MANY.
+            let child_fk_unique = cols.iter().all(|fk| {
+                meta.columns
+                    .iter()
+                    .find(|c| c.name == fk.column)
+                    .map(|c| c.is_primary_key || c.is_unique)
+                    .unwrap_or(false)
+            });
             let card_to = if child_fk_unique {
                 Card::One
             } else {
                 Card::ZeroMany
             };
+            let label = cols
+                .iter()
+                .map(|f| f.column.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
             er.relations.push(Relation {
                 from,
                 to,
                 card_from: Card::One,
                 card_to,
                 identifying: true,
-                label: Some(fk.column.clone()),
+                label: Some(label),
             });
         }
     }
@@ -1111,5 +1131,177 @@ mod tests {
 
         // A click far outside the canvas hits nothing.
         assert_eq!(tab.node_at_mouse(200, 200), None);
+    }
+    #[test]
+    fn test_er_composite_fk_draws_one_relation() {
+        // Drivers report a two-column FK as two rows sharing one constraint
+        // name. Drawing one edge per row would double the relationship.
+        let orgs = table(
+            "orgs",
+            vec![
+                col("id", "int", true, false, true),
+                col("code", "varchar", true, false, true),
+            ],
+            vec![],
+        );
+        let members = table(
+            "members",
+            vec![
+                col("id", "int", true, false, true),
+                col("org_id", "int", false, true, false),
+                col("org_code", "varchar", false, true, false),
+            ],
+            vec![
+                ForeignKeyMeta {
+                    name: "members_org_fkey".to_string(),
+                    column: "org_id".to_string(),
+                    ref_namespace: Namespace("shop".to_string()),
+                    ref_table: "orgs".to_string(),
+                    ref_column: "id".to_string(),
+                },
+                ForeignKeyMeta {
+                    name: "members_org_fkey".to_string(),
+                    column: "org_code".to_string(),
+                    ref_namespace: Namespace("shop".to_string()),
+                    ref_table: "orgs".to_string(),
+                    ref_column: "code".to_string(),
+                },
+            ],
+        );
+        let er = build_er_diagram(&[orgs, members]);
+        assert_eq!(er.relations.len(), 1, "composite FK must draw one edge");
+        let rel = &er.relations[0];
+        assert_eq!(rel.label.as_deref(), Some("org_id, org_code"));
+        // Neither child column is unique on its own -> many members per org.
+        assert_eq!(rel.card_to, Card::ZeroMany);
+    }
+
+    #[test]
+    fn test_er_composite_fk_one_to_one_needs_every_column_unique() {
+        // Half a composite key being unique does not make the link 1:1.
+        let orgs = table(
+            "orgs",
+            vec![
+                col("id", "int", true, false, true),
+                col("code", "varchar", true, false, true),
+            ],
+            vec![],
+        );
+        let fks = |name: &str| {
+            vec![
+                ForeignKeyMeta {
+                    name: name.to_string(),
+                    column: "org_id".to_string(),
+                    ref_namespace: Namespace("shop".to_string()),
+                    ref_table: "orgs".to_string(),
+                    ref_column: "id".to_string(),
+                },
+                ForeignKeyMeta {
+                    name: name.to_string(),
+                    column: "org_code".to_string(),
+                    ref_namespace: Namespace("shop".to_string()),
+                    ref_table: "orgs".to_string(),
+                    ref_column: "code".to_string(),
+                },
+            ]
+        };
+        let half = table(
+            "half",
+            vec![
+                col("org_id", "int", false, true, true), // unique
+                col("org_code", "varchar", false, true, false), // not unique
+            ],
+            fks("half_org_fkey"),
+        );
+        let er = build_er_diagram(&[orgs.clone(), half]);
+        assert_eq!(er.relations[0].card_to, Card::ZeroMany);
+
+        let both = table(
+            "both",
+            vec![
+                col("org_id", "int", false, true, true),
+                col("org_code", "varchar", false, true, true),
+            ],
+            fks("both_org_fkey"),
+        );
+        let er = build_er_diagram(&[orgs, both]);
+        assert_eq!(er.relations[0].card_to, Card::One);
+    }
+
+    #[test]
+    fn test_er_distinct_constraints_to_same_parent_stay_separate() {
+        // Two independent single-column FKs to the same table are two
+        // relationships, not one grouped edge.
+        let users = table("users", vec![col("id", "int", true, false, true)], vec![]);
+        let msgs = table(
+            "messages",
+            vec![
+                col("sender_id", "int", false, true, false),
+                col("receiver_id", "int", false, true, false),
+            ],
+            vec![
+                ForeignKeyMeta {
+                    name: "messages_sender_fkey".to_string(),
+                    column: "sender_id".to_string(),
+                    ref_namespace: Namespace("shop".to_string()),
+                    ref_table: "users".to_string(),
+                    ref_column: "id".to_string(),
+                },
+                ForeignKeyMeta {
+                    name: "messages_receiver_fkey".to_string(),
+                    column: "receiver_id".to_string(),
+                    ref_namespace: Namespace("shop".to_string()),
+                    ref_table: "users".to_string(),
+                    ref_column: "id".to_string(),
+                },
+            ],
+        );
+        let er = build_er_diagram(&[users, msgs]);
+        assert_eq!(er.relations.len(), 2);
+        assert_eq!(er.relations[0].label.as_deref(), Some("sender_id"));
+        assert_eq!(er.relations[1].label.as_deref(), Some("receiver_id"));
+    }
+    #[test]
+    fn test_composite_fk_label_survives_the_mermaid_round_trip() {
+        // "org_id, org_code" is not a single word: emitted unquoted it makes
+        // flowmaid reject the whole diagram.
+        let orgs = table(
+            "orgs",
+            vec![
+                col("id", "int", true, false, true),
+                col("code", "varchar", true, false, true),
+            ],
+            vec![],
+        );
+        let members = table(
+            "members",
+            vec![
+                col("org_id", "int", false, true, false),
+                col("org_code", "varchar", false, true, false),
+            ],
+            vec![
+                ForeignKeyMeta {
+                    name: "members_org_fkey".to_string(),
+                    column: "org_id".to_string(),
+                    ref_namespace: Namespace("shop".to_string()),
+                    ref_table: "orgs".to_string(),
+                    ref_column: "id".to_string(),
+                },
+                ForeignKeyMeta {
+                    name: "members_org_fkey".to_string(),
+                    column: "org_code".to_string(),
+                    ref_namespace: Namespace("shop".to_string()),
+                    ref_table: "orgs".to_string(),
+                    ref_column: "code".to_string(),
+                },
+            ],
+        );
+        let src = er_to_mermaid(&build_er_diagram(&[orgs, members]));
+        assert!(src.contains("\"org_id, org_code\""), "label not quoted: {src}");
+
+        let mut tab = ErdTab::new(Namespace("shop".to_string()));
+        tab.generate_from_mermaid(&src);
+        assert!(tab.last_error.is_none(), "parse failed: {:?}", tab.last_error);
+        assert!(tab.scene.is_some());
     }
 }

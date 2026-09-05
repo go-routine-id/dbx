@@ -325,7 +325,9 @@ impl Driver for MySqlDriver {
             .bind(&c.name)
             .fetch_all(&self.pool)
             .await
-            .unwrap_or_default();
+            // Propagated, not swallowed: an ERD built on a table whose FK
+            // query failed would silently miss relationships.
+            .with_context(|| format!("failed to list foreign keys of {}", c.name))?;
 
         let mut foreign_keys = Vec::new();
         for r in fk_rows {

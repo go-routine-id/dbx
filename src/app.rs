@@ -156,6 +156,14 @@ pub enum ScreenMode {
     Connected,
 }
 
+/// Result of a backgrounded ERD metadata fetch: the tab it belongs to, and
+/// either the collected metadata plus the tables whose metadata failed
+/// (name, reason), or a fatal error message.
+type ErdGenResult = (
+    usize,
+    Result<(Vec<crate::driver::CollectionMeta>, Vec<(String, String)>), String>,
+);
+
 pub struct App {
     config: AppConfig,
     config_path: PathBuf,
@@ -179,6 +187,10 @@ pub struct App {
     // form_test_rx — awaiting it inline would freeze the event loop (an SSH
     // tunnel alone is allowed 10s to come up).
     picker_test_rx: Option<tokio::sync::mpsc::Receiver<Result<std::time::Duration, String>>>,
+    /// In-flight ERD metadata fetch for the `g` key: (tab index, metas +
+    /// names of tables whose meta failed). Spawned so the event loop keeps
+    /// rendering the tab's spinner instead of freezing through N awaits.
+    erd_gen_rx: Option<tokio::sync::mpsc::Receiver<ErdGenResult>>,
     /// One-shot startup update check. `Some(latest)` means a newer release.
     update_check_rx: Option<tokio::sync::mpsc::Receiver<Option<String>>>,
     /// Console query running in the background, if any.
@@ -255,6 +267,7 @@ impl App {
             form_modal: None,
             form_test_rx: None,
             picker_test_rx: None,
+            erd_gen_rx: None,
             update_check_rx: None,
             query_run: None,
             confirm_delete_modal: None,
@@ -4781,27 +4794,58 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                     }) {
                                         exp.active_tab_index = existing_idx;
                                         exp.focused_pane = FocusedPane::Workspace;
+                                    } else if app.erd_gen_rx.is_some() {
+                                        // Only one fetch is tracked at a time; starting a
+                                        // second would orphan the first tab on its spinner.
+                                        app.toasts.push(
+                                            ToastKind::Info,
+                                            "an ERD is still being generated — wait for it to finish".to_string(),
+                                        );
                                     } else {
-                                        app.toasts.push(ToastKind::Info, format!("generating ERD for '{}'...", target_ns.0));
+                                        // Open the tab immediately — ErdTab starts with
+                                        // is_loading = true, so the spinner renders from
+                                        // the first frame. The metadata walk (N awaited
+                                        // meta fetches) runs in a background task; doing
+                                        // it inline here froze the whole event loop and
+                                        // the "generating" toast never even rendered.
+                                        let erd_tab = crate::ui::screens::erd::ErdTab::new(target_ns.clone());
+                                        exp.tabs.push(WorkspaceTab::Erd(erd_tab));
+                                        let tab_idx = exp.tabs.len() - 1;
+                                        exp.active_tab_index = tab_idx;
+                                        exp.focused_pane = FocusedPane::Workspace;
+
                                         let drv_clone = drv.clone();
-                                        let mut erd_tab = crate::ui::screens::erd::ErdTab::new(target_ns.clone());
-                                        if let Ok(tbls) = drv_clone.collections(&target_ns).await {
-                                            let mut metas = Vec::new();
-                                            for tbl in tbls {
-                                                let cref = crate::driver::CollectionRef {
-                                                    namespace: target_ns.clone(),
-                                                    name: tbl.name,
-                                                };
-                                                if let Ok(meta) = drv_clone.collection_meta(&cref).await {
-                                                    metas.push(meta);
+                                        let (tx, rx) = tokio::sync::mpsc::channel(1);
+                                        app.erd_gen_rx = Some(rx);
+                                        tokio::spawn(async move {
+                                            let res = async {
+                                                let tbls = drv_clone
+                                                    .collections(&target_ns)
+                                                    .await
+                                                    .map_err(|e| {
+                                                        format!("failed to list tables in {}: {e}", target_ns.0)
+                                                    })?;
+                                                let mut metas = Vec::new();
+                                                let mut failed = Vec::new();
+                                                for tbl in tbls {
+                                                    let cref = crate::driver::CollectionRef {
+                                                        namespace: target_ns.clone(),
+                                                        name: tbl.name.clone(),
+                                                    };
+                                                    match drv_clone.collection_meta(&cref).await {
+                                                        Ok(meta) => metas.push(meta),
+                                                        // A skipped table loses its FKs —
+                                                        // report it by name instead of
+                                                        // silently drawing a diagram with
+                                                        // missing relationships.
+                                                        Err(e) => failed.push((tbl.name, e.to_string())),
+                                                    }
                                                 }
+                                                Ok((metas, failed))
                                             }
-                                            erd_tab.generate_from_meta(&metas);
-                                            exp.tabs.push(WorkspaceTab::Erd(erd_tab));
-                                            exp.active_tab_index = exp.tabs.len().saturating_sub(1);
-                                            exp.focused_pane = FocusedPane::Workspace;
-                                            app.toasts.push(ToastKind::Success, "ERD generated".to_string());
-                                        }
+                                            .await;
+                                            let _ = tx.send((tab_idx, res)).await;
+                                        });
                                     }
                                 }
                             }
@@ -5557,6 +5601,64 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         app.toasts
                             .push(ToastKind::Error, "ping task ended unexpectedly".to_string());
                         app.picker_test_rx = None;
+                    }
+                }
+            }
+            // Poll the background ERD metadata fetch (spawned by the `g` key).
+            if let Some(rx) = &mut app.erd_gen_rx {
+                match rx.try_recv() {
+                    Ok((tab_idx, res)) => {
+                        app.erd_gen_rx = None;
+                        if let Some(exp) = &mut app.explorer_state {
+                            match res {
+                                Ok((metas, failed)) => {
+                                    if let Some(WorkspaceTab::Erd(erd)) = exp.tabs.get_mut(tab_idx)
+                                    {
+                                        erd.generate_from_meta(&metas);
+                                    }
+                                    if failed.is_empty() {
+                                        app.toasts.push(ToastKind::Success, "ERD generated".to_string());
+                                    } else {
+                                        let names: Vec<&str> =
+                                            failed.iter().map(|(n, _)| n.as_str()).collect();
+                                        app.toasts.push(
+                                            ToastKind::Warning,
+                                            format!(
+                                                "ERD: {} table(s) skipped — relationships involving them are missing: {}",
+                                                failed.len(),
+                                                names.join(", ")
+                                            ),
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    if let Some(WorkspaceTab::Erd(erd)) = exp.tabs.get_mut(tab_idx)
+                                    {
+                                        erd.is_loading = false;
+                                        erd.last_error = Some(e.clone());
+                                    }
+                                    app.toasts
+                                        .push(ToastKind::Error, format!("failed to generate ERD: {e}"));
+                                }
+                            }
+                        }
+                    }
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {}
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        app.erd_gen_rx = None;
+                        app.toasts
+                            .push(ToastKind::Error, "ERD task ended unexpectedly".to_string());
+                        if let Some(exp) = &mut app.explorer_state {
+                            for tab in &mut exp.tabs {
+                                if let WorkspaceTab::Erd(erd) = tab
+                                    && erd.is_loading
+                                {
+                                    erd.is_loading = false;
+                                    erd.last_error =
+                                        Some("metadata fetch ended unexpectedly".to_string());
+                                }
+                            }
+                        }
                     }
                 }
             }
