@@ -401,6 +401,8 @@ impl App {
                         || e.import_csv_modal.is_some()
                         || e.schema_edit_modal.is_some()
                         || e.create_object_modal.is_some()
+                        || e.create_db_modal.is_some()
+                        || e.create_table_modal.is_some()
                         || e.erd_menu.is_some()
                         || e.tree_menu.is_some()
                         || e.explain_plan.is_some()
@@ -603,6 +605,8 @@ impl App {
                     || exp.import_csv_modal.is_some()
                     || exp.schema_edit_modal.is_some()
                     || exp.create_object_modal.is_some()
+                    || exp.create_db_modal.is_some()
+                    || exp.create_table_modal.is_some()
                 {
                     return Ok(());
                 }
@@ -731,6 +735,8 @@ impl App {
             || exp.import_csv_modal.is_some()
             || exp.schema_edit_modal.is_some()
             || exp.create_object_modal.is_some()
+            || exp.create_db_modal.is_some()
+            || exp.create_table_modal.is_some()
         {
             return Ok(());
         }
@@ -1616,6 +1622,91 @@ impl App {
                         return;
                     }
                     // Enter → generate CREATE in the event loop.
+                }
+
+                // Create-database modal: single name field. Enter falls
+                // through to the event loop, which executes the CREATE.
+                if exp.create_db_modal.is_some() {
+                    if key.code != KeyCode::Enter {
+                        match key.code {
+                            KeyCode::Esc => exp.create_db_modal = None,
+                            KeyCode::Backspace => {
+                                if let Some(m) = &mut exp.create_db_modal {
+                                    m.name.pop();
+                                }
+                            }
+                            KeyCode::Char(ch)
+                                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                if let Some(m) = &mut exp.create_db_modal {
+                                    m.name.push(ch);
+                                }
+                            }
+                            _ => {}
+                        }
+                        return;
+                    }
+                    // Enter → execute CREATE DATABASE in the event loop.
+                }
+
+                // Create-table form modal: a grid of editable cells. Enter
+                // falls through to the event loop, which executes the CREATE.
+                if exp.create_table_modal.is_some() {
+                    if key.code != KeyCode::Enter {
+                        if key.code == KeyCode::Esc {
+                            exp.create_table_modal = None;
+                            return;
+                        }
+                        let is_ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+                        let is_alt = key.modifiers.contains(KeyModifiers::ALT);
+                        let m = exp.create_table_modal.as_mut().unwrap();
+                        match key.code {
+                            KeyCode::Tab => m.next_cell(),
+                            KeyCode::BackTab => m.prev_cell(),
+                            KeyCode::Up if is_alt => m.reorder_column(-1),
+                            KeyCode::Down if is_alt => m.reorder_column(1),
+                            KeyCode::Up => m.move_row(-1),
+                            KeyCode::Down => m.move_row(1),
+                            KeyCode::Left => m.cycle_type(-1),
+                            KeyCode::Right => m.cycle_type(1),
+                            // Ctrl+A / Ctrl+D: add / drop a column row. Plain
+                            // a/d stay text — the form's name/default cells
+                            // take literal characters.
+                            KeyCode::Char('a') | KeyCode::Char('A') if is_ctrl => m.add_column(),
+                            KeyCode::Char('d') | KeyCode::Char('D') if is_ctrl => m.remove_column(),
+                            KeyCode::Char(' ') if !is_ctrl => {
+                                // Space toggles the flag cells; on text cells
+                                // it is an ordinary space.
+                                match m.focus_col {
+                                    3 | 4 if m.focus_row > 0 => m.toggle_flag_cell(),
+                                    _ => {
+                                        if let Some(buf) = m.focused_buffer_mut() {
+                                            buf.push(' ');
+                                        }
+                                    }
+                                }
+                            }
+                            KeyCode::Backspace => {
+                                if let Some(buf) = m.focused_buffer_mut() {
+                                    buf.pop();
+                                }
+                            }
+                            KeyCode::Char(ch) if !is_ctrl && !is_alt => {
+                                // The length cell only takes digits; the type
+                                // and flag cells ignore free text entirely.
+                                let is_len_cell = m.focus_col == 2 && m.focus_row > 0;
+                                if is_len_cell && !ch.is_ascii_digit() {
+                                    return;
+                                }
+                                if let Some(buf) = m.focused_buffer_mut() {
+                                    buf.push(ch);
+                                }
+                            }
+                            _ => {}
+                        }
+                        return;
+                    }
+                    // Enter → execute CREATE TABLE in the event loop.
                 }
 
                 match key.code {
@@ -3240,6 +3331,8 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 || e.import_csv_modal.is_some()
                                 || e.schema_edit_modal.is_some()
                                 || e.create_object_modal.is_some()
+                                || e.create_db_modal.is_some()
+                                || e.create_table_modal.is_some()
                                 || e.ddl_popup.is_some()
                         })
                         .unwrap_or(false);
@@ -3666,6 +3759,8 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         && exp.import_csv_modal.is_none()
                         && exp.schema_edit_modal.is_none()
                         && exp.create_object_modal.is_none()
+                        && exp.create_db_modal.is_none()
+                        && exp.create_table_modal.is_none()
                         && key.modifiers.contains(KeyModifiers::CONTROL)
                         && key.code == KeyCode::Char('t')
                     {
@@ -3805,10 +3900,33 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
 
                     // Create object: Enter generates a CREATE statement into the
                     // SQL-confirm modal (name must be non-empty, and the kind
-                    // must be supported by this driver).
+                    // must be supported by this driver). The Table kind instead
+                    // opens the create-table form — a stub one-column CREATE is
+                    // never what the user actually wants.
                     if exp.create_object_modal.is_some() && key.code == KeyCode::Enter {
+                        let c = exp.create_object_modal.as_ref().unwrap().clone();
+                        if c.kind == crate::ui::screens::explorer::CreateKind::Table {
+                            if !exp
+                                .driver_capabilities
+                                .contains(crate::driver::Capabilities::DDL)
+                            {
+                                app.toasts.push(
+                                    ToastKind::Warning,
+                                    "this driver does not support creating tables".to_string(),
+                                );
+                            } else {
+                                exp.create_table_modal = Some(
+                                    crate::ui::screens::explorer::CreateTableModalState::new(
+                                        c.namespace.clone(),
+                                        drv.info().name.clone(),
+                                        c.name.trim().to_string(),
+                                    ),
+                                );
+                            }
+                            exp.create_object_modal = None;
+                            continue;
+                        }
                         let sql = {
-                            let c = exp.create_object_modal.as_ref().unwrap();
                             if c.name.trim().is_empty() {
                                 None
                             } else {
@@ -3822,7 +3940,6 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         };
                         match sql {
                             Some(sql) => {
-                                let c = exp.create_object_modal.as_ref().unwrap();
                                 exp.sql_confirm_modal = Some(
                                     crate::ui::screens::explorer::SqlConfirmModalState {
                                         collection: crate::driver::CollectionRef {
@@ -3842,6 +3959,102 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             }
                         }
                         exp.create_object_modal = None;
+                        continue;
+                    }
+
+                    // Create database: Enter executes the previewed CREATE
+                    // DATABASE, then refreshes the tree so the new database
+                    // node shows up. The modal stays open on failure so the
+                    // name can be fixed.
+                    if exp.create_db_modal.is_some() && key.code == KeyCode::Enter {
+                        let m = exp.create_db_modal.as_ref().unwrap().clone();
+                        match m.sql_preview() {
+                            None => {
+                                app.toasts.push(
+                                    ToastKind::Warning,
+                                    "enter a database name".to_string(),
+                                );
+                            }
+                            Some(sql) => {
+                                // Any existing namespace works as the execution
+                                // context — CREATE DATABASE is server-scoped.
+                                let exec_ns = exp
+                                    .selected_node()
+                                    .and_then(|n| n.kind.namespace().cloned())
+                                    .or_else(|| exp.namespaces.first().cloned())
+                                    .unwrap_or(crate::driver::Namespace(String::new()));
+                                match drv.execute(&exec_ns, &sql).await {
+                                    Ok(_) => {
+                                        app.toasts.push(
+                                            ToastKind::Success,
+                                            format!("created database '{}'", m.name.trim()),
+                                        );
+                                        if let Some(conn) = &app.active_connection_name {
+                                            app.config.push_history(conn, &sql);
+                                        }
+                                        exp.create_db_modal = None;
+                                        // Re-list namespaces so the new database
+                                        // appears as a tree node (MySQL/MSSQL).
+                                        if let Ok(ns) = drv.namespaces().await {
+                                            exp.namespaces = ns;
+                                            exp.rebuild_tree_nodes();
+                                            exp.selected_tree_index =
+                                                exp.snap_to_selectable(exp.selected_tree_index);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        app.toasts.push(
+                                            ToastKind::Error,
+                                            format!("CREATE DATABASE failed: {e:#}"),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        continue;
+                    }
+
+                    // Create table: Enter executes the previewed CREATE TABLE,
+                    // then refreshes the namespace's table list so the new
+                    // table shows up in the tree. The modal stays open on
+                    // failure so the form can be fixed.
+                    if exp.create_table_modal.is_some() && key.code == KeyCode::Enter {
+                        let m = exp.create_table_modal.as_ref().unwrap().clone();
+                        match m.sql_preview() {
+                            None => {
+                                app.toasts.push(
+                                    ToastKind::Warning,
+                                    "table name + every column needs a name".to_string(),
+                                );
+                            }
+                            Some(sql) => {
+                                let ns = m.namespace.clone();
+                                match drv.execute(&ns, &sql).await {
+                                    Ok(_) => {
+                                        app.toasts.push(
+                                            ToastKind::Success,
+                                            format!("created table '{}'", m.table_name.trim()),
+                                        );
+                                        if let Some(conn) = &app.active_connection_name {
+                                            app.config.push_history(conn, &sql);
+                                        }
+                                        exp.create_table_modal = None;
+                                        if let Ok(t) = drv.collections(&ns).await {
+                                            exp.tables.insert(ns.0.clone(), t);
+                                            exp.rebuild_tree_nodes();
+                                            exp.selected_tree_index =
+                                                exp.snap_to_selectable(exp.selected_tree_index);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        app.toasts.push(
+                                            ToastKind::Error,
+                                            format!("CREATE TABLE failed: {e:#}"),
+                                        );
+                                    }
+                                }
+                            }
+                        }
                         continue;
                     }
 
@@ -4347,6 +4560,8 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                     if exp.ddl_popup.is_none()
                         && exp.schema_edit_modal.is_none()
                         && exp.create_object_modal.is_none()
+                        && exp.create_db_modal.is_none()
+                        && exp.create_table_modal.is_none()
                         && exp.sql_confirm_modal.is_none()
                         && exp.object_search.is_none()
                         // A context menu must capture the keyboard: without
@@ -4383,6 +4598,46 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                             );
                                         }
                                         _ => {}
+                                    }
+                                }
+                                continue;
+                            }
+                            KeyCode::Char('N') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                // Shift+N on a database node: create a new
+                                // database (small modal with a live SQL
+                                // preview; Enter there executes).
+                                if let Some(node) = exp.selected_node() {
+                                    if let TreeNodeKind::Database(_) = &node.kind {
+                                        if !exp
+                                            .driver_capabilities
+                                            .contains(crate::driver::Capabilities::DDL)
+                                        {
+                                            app.toasts.push(
+                                                ToastKind::Warning,
+                                                "this driver does not support creating databases".to_string(),
+                                            );
+                                            continue;
+                                        }
+                                        let driver_name = drv.info().name.clone();
+                                        // TODO(capabilities): no Capabilities bit
+                                        // expresses "can CREATE DATABASE" — every
+                                        // driver here reports DDL, but SQLite has
+                                        // no such statement (a database is a
+                                        // file). Gate on the driver name until a
+                                        // capability bit exists.
+                                        if driver_name.to_lowercase().contains("sqlite") {
+                                            app.toasts.push(
+                                                ToastKind::Warning,
+                                                "SQLite has no CREATE DATABASE — a database is a file".to_string(),
+                                            );
+                                            continue;
+                                        }
+                                        exp.create_db_modal = Some(
+                                            crate::ui::screens::explorer::CreateDatabaseModalState {
+                                                name: String::new(),
+                                                driver_name,
+                                            },
+                                        );
                                     }
                                 }
                                 continue;
@@ -5198,6 +5453,8 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         || e.import_csv_modal.is_some()
                         || e.schema_edit_modal.is_some()
                         || e.create_object_modal.is_some()
+                        || e.create_db_modal.is_some()
+                        || e.create_table_modal.is_some()
                         || e.erd_menu.is_some()
                         || e.tree_menu.is_some()
                         || e.explain_plan.is_some()

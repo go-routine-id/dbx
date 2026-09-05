@@ -108,6 +108,7 @@ binary lives in a root-owned directory, re-run it with `sudo`. Your config
 | ✅ | Transactions — autocommit toggle (`Ctrl+T`) with commit / rollback |
 | ✅ | Automatic reconnect on dropped connections, with query retry |
 | ✅ | Per-node context menu in the explorer tree (`Ctrl+O`) |
+| ✅ | Create table (column form with live SQL preview, `a` → table) and create database (`N` on a database node) |
 
 The ERD renderer uses [flowmaid](https://github.com/go-routine-id/flowmaid)
 for automatic layout and crow's-foot geometry, painted into a
