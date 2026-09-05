@@ -32,6 +32,11 @@ pub fn explain_sql(driver_name: &str, query: &str) -> String {
         // The plain `EXPLAIN` dumps VDBE opcodes, which is not what anyone
         // wants to read; the query plan is the useful view.
         format!("EXPLAIN QUERY PLAN {q}")
+    } else if lower.contains("clickhouse") {
+        // clickhouse: EXPLAIN PLAN yields the indented-text plan the default
+        // (Postgres-style) parser can flatten; plain EXPLAIN also works but
+        // being explicit guards against server default changes.
+        format!("EXPLAIN PLAN {q}")
     } else {
         format!("EXPLAIN {q}")
     }

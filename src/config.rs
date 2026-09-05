@@ -16,6 +16,7 @@ pub enum DriverType {
     Postgres,
     SqlServer,
     Sqlite,
+    ClickHouse, // clickhouse
 }
 
 impl DriverType {
@@ -25,6 +26,8 @@ impl DriverType {
             DriverType::Postgres => 5432,
             DriverType::SqlServer => 1433,
             DriverType::Sqlite => 0,
+            // ClickHouse's plain HTTP interface port (8443 when TLS is on).
+            DriverType::ClickHouse => 8123, // clickhouse
         }
     }
 }
@@ -173,6 +176,7 @@ impl ConnectionConfig {
             DriverType::Postgres => "postgres",
             DriverType::SqlServer => "sqlserver",
             DriverType::Sqlite => "sqlite",
+            DriverType::ClickHouse => "clickhouse", // clickhouse
         }
     }
 }
