@@ -39,6 +39,14 @@ pub struct MssqlDriver {
 
 /// Translates our TLS settings into tiberius terms. SQL Server's default is
 /// already `EncryptionLevel::Required`; the nuance is certificate trust.
+///
+/// mTLS limitation: tiberius 0.12 has no client-certificate API — its TLS
+/// streams (both the native-tls and rustls backends) hard-code
+/// `with_no_client_auth()`, and `Config` exposes only server-trust knobs
+/// (`trust_cert`, `trust_cert_ca`). `ConnectionConfig`'s
+/// `ssl_ca`/`ssl_cert`/`ssl_key` are therefore ignored for SQL Server;
+/// TLS client-certificate authentication against SQL Server is not
+/// possible with this driver version.
 fn tiberius_config(cfg: &ConnectionConfig) -> Config {
     let mut c = Config::new();
     c.host(&cfg.host);

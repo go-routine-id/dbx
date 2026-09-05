@@ -48,6 +48,15 @@ impl MySqlDriver {
             opts = opts.ssl_mode(ssl_mode);
         }
 
+        // mTLS: custom CA + client certificate (PEM paths). Absent fields
+        // keep today's behaviour exactly — sqlx only sends what is set.
+        if let Some(ca) = &cfg.ssl_ca {
+            opts = opts.ssl_ca(ca);
+        }
+        if let Some((cert, key)) = cfg.ssl_client_identity()? {
+            opts = opts.ssl_client_cert(cert).ssl_client_key(key);
+        }
+
         if let Some(user) = &cfg.user {
             opts = opts.username(user);
         }

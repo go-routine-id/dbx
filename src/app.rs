@@ -5258,18 +5258,6 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::driver::{CollectionRef, Namespace, Record, Value};
-
-    fn cref(ns: &str, tbl: &str) -> CollectionRef {
-        CollectionRef {
-            namespace: Namespace(ns.to_string()),
-            name: tbl.to_string(),
-        }
-    }
-
-    fn row(values: Vec<Value>) -> Record {
-        Record { values }
-    }
 
     #[test]
     fn test_step_column_keeps_selection_inside_the_window() {

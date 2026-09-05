@@ -84,6 +84,11 @@ pub struct ConnectionForm {
     /// TLS settings, preserved through edit so saving never downgrades them.
     pub ssl: bool,
     pub ssl_mode: Option<crate::config::SslMode>,
+    /// mTLS cert/key paths. Not edited in the form (config file only), but
+    /// preserved through edit so saving never silently drops them.
+    pub ssl_ca: Option<String>,
+    pub ssl_cert: Option<String>,
+    pub ssl_key: Option<String>,
     /// SSH tunnel settings. Not edited in the form (config file only), but
     /// preserved through edit so saving never silently drops the tunnel.
     pub ssh: Option<crate::config::SshConfig>,
@@ -133,6 +138,9 @@ impl ConnectionForm {
             database: env_default("DBX_DEFAULT_DATABASE"),
             ssl: false,
             ssl_mode: None,
+            ssl_ca: None,
+            ssl_cert: None,
+            ssl_key: None,
             ssh: None,
             last_test_result: None,
         }
@@ -152,6 +160,9 @@ impl ConnectionForm {
             database: cfg.database.clone().unwrap_or_default(),
             ssl: cfg.ssl,
             ssl_mode: cfg.ssl_mode,
+            ssl_ca: cfg.ssl_ca.clone(),
+            ssl_cert: cfg.ssl_cert.clone(),
+            ssl_key: cfg.ssl_key.clone(),
             ssh: cfg.ssh.clone(),
             last_test_result: None,
         }
@@ -169,6 +180,9 @@ impl ConnectionForm {
             socket: None,
             ssl: self.ssl,
             ssl_mode: self.ssl_mode,
+            ssl_ca: self.ssl_ca.clone(),
+            ssl_cert: self.ssl_cert.clone(),
+            ssl_key: self.ssl_key.clone(),
             ssh: self.ssh.clone(),
         }
     }

@@ -205,6 +205,33 @@ host = "bastion.example.com"
 # local_port = 15432            # optional, a free port is picked when 0/missing
 ```
 
+A connection can also use mTLS (client-certificate authentication) or a
+custom CA — set PEM file **paths** on the entry (config file only; the
+add/edit form preserves them). Only paths are stored; the key material
+itself never enters the config:
+
+| Key | Default | Description |
+|---|---|---|
+| `ssl_ca` | unset | Path to the CA certificate (PEM) used to verify the server |
+| `ssl_cert` | unset | Path to the client certificate (PEM); must be set together with `ssl_key` |
+| `ssl_key` | unset | Path to the client private key (PEM); must be set together with `ssl_cert` |
+
+```toml
+[[connections]]
+name = "prod-mysql"
+driver = "mysql"
+host = "db.example.com"
+user = "app"
+ssl_mode = "verify"
+ssl_ca = "/etc/dbx/certs/ca.pem"
+ssl_cert = "/etc/dbx/certs/client.pem"
+ssl_key = "/etc/dbx/certs/client-key.pem"
+```
+
+Supported by the MySQL and PostgreSQL drivers. SQL Server (tiberius) has no
+client-certificate API in the pinned driver version, so these fields are
+ignored there.
+
 Environment variables:
 
 | Env | Description |

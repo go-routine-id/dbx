@@ -75,6 +75,18 @@ pub struct ConnectionConfig {
     /// The legacy `ssl: true` boolean is honoured when `ssl_mode` is unset.
     #[serde(default, deserialize_with = "de_ssl_mode_opt")]
     pub ssl_mode: Option<SslMode>,
+    /// mTLS / custom-CA material as filesystem PATHS (PEM). Only paths are
+    /// stored here — the cert/key bytes are read by the driver at connect
+    /// time, never copied into the config. `ssl_cert` and `ssl_key` are a
+    /// pair: setting exactly one is rejected at connect time.
+    /// Config file only (not in the form modal); edit sessions preserve
+    /// them untouched.
+    #[serde(default)]
+    pub ssl_ca: Option<String>,
+    #[serde(default)]
+    pub ssl_cert: Option<String>,
+    #[serde(default)]
+    pub ssl_key: Option<String>,
     /// Optional SSH bastion: when present, the driver connects through a
     /// local port forwarded by a spawned `ssh -L` process instead of
     /// reaching `host` directly. Config file only (not in the form modal);
@@ -127,6 +139,22 @@ impl ConnectionConfig {
     /// `ssl: true` boolean maps to `Require`; otherwise `None` (driver default).
     pub fn effective_ssl_mode(&self) -> Option<SslMode> {
         self.ssl_mode.or_else(|| self.ssl.then_some(SslMode::Require))
+    }
+
+    /// The mTLS client identity as a `(cert_path, key_path)` pair, or `None`
+    /// when no client certificate is configured. A half-configured pair is a
+    /// config error — MySQL and PostgreSQL both need the certificate AND its
+    /// private key, and silently sending one without the other would surface
+    /// as an opaque TLS handshake failure deep in the driver.
+    pub fn ssl_client_identity(&self) -> Result<Option<(&str, &str)>> {
+        match (&self.ssl_cert, &self.ssl_key) {
+            (Some(cert), Some(key)) => Ok(Some((cert.as_str(), key.as_str()))),
+            (None, None) => Ok(None),
+            _ => Err(anyhow!(
+                "connection '{}': ssl_cert and ssl_key must be set together",
+                self.name
+            )),
+        }
     }
 }
 
@@ -400,6 +428,58 @@ impl AppConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_ssl_fields_roundtrip_toml() {
+        // Old configs without the ssl_* fields must parse unchanged.
+        let legacy = r#"
+[[connections]]
+name = "old"
+driver = "postgres"
+host = "db.local"
+"#;
+        let cfg: AppConfig = toml::from_str(legacy).unwrap();
+        let conn = &cfg.connections[0];
+        assert_eq!(conn.ssl_ca, None);
+        assert_eq!(conn.ssl_cert, None);
+        assert_eq!(conn.ssl_key, None);
+        assert!(conn.ssl_client_identity().unwrap().is_none());
+
+        // Full mTLS config parses and serializes back with the same paths.
+        let mtls = r#"
+[[connections]]
+name = "secure"
+driver = "mysql"
+host = "db.local"
+ssl_mode = "verify"
+ssl_ca = "/etc/dbx/ca.pem"
+ssl_cert = "/etc/dbx/client.pem"
+ssl_key = "/etc/dbx/client-key.pem"
+"#;
+        let cfg: AppConfig = toml::from_str(mtls).unwrap();
+        let conn = &cfg.connections[0];
+        assert_eq!(conn.ssl_ca.as_deref(), Some("/etc/dbx/ca.pem"));
+        assert_eq!(
+            conn.ssl_client_identity().unwrap(),
+            Some(("/etc/dbx/client.pem", "/etc/dbx/client-key.pem"))
+        );
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        let reparsed: AppConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.connections[0].ssl_key.as_deref(), Some("/etc/dbx/client-key.pem"));
+    }
+
+    #[test]
+    fn test_ssl_client_identity_rejects_a_half_pair() {
+        let base = r#"
+[[connections]]
+name = "broken"
+driver = "mysql"
+"#;
+        let cfg: AppConfig = toml::from_str(&format!("{base}ssl_cert = \"/only/cert.pem\"\n")).unwrap();
+        assert!(cfg.connections[0].ssl_client_identity().is_err());
+        let cfg: AppConfig = toml::from_str(&format!("{base}ssl_key = \"/only/key.pem\"\n")).unwrap();
+        assert!(cfg.connections[0].ssl_client_identity().is_err());
+    }
 
     #[test]
     fn test_push_history_dedup_and_cap() {
