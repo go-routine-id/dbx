@@ -38,7 +38,7 @@ pub const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 48] = [
+pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 49] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
@@ -63,6 +63,7 @@ pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 48] = [
     ("Space", "expand / collapse database node in tree"),
     ("Enter", "open table in workspace grid"),
     ("s", "sort data grid by active column (asc → desc → off)"),
+    ("< / > (in table tab)", "shrink / grow the focused column's width (or Alt+drag a header separator)"),
     ("/", "filter data grid rows (col op value, e.g. status = paid)"),
     ("y / c", "copy active cell value to system clipboard"),
     ("Y / Ctrl+Y", "copy active row as formatted JSON to clipboard"),

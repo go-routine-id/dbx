@@ -330,9 +330,16 @@ pub struct DataTab {
     pub read_only: bool,
     /// Grid inner area from the last draw — maps a mouse click to a cell.
     pub grid_hit_area: Option<Rect>,
-    /// X start (terminal column) of each visible column, computed at draw
-    /// time so mouse hit-testing matches the actual rendered widths exactly.
-    pub grid_col_starts: Vec<u16>,
+    /// `(x start, width)` in terminal cells of each visible column, computed
+    /// at draw time with the same Layout the Table widget uses, so mouse
+    /// hit-testing (click selection and separator drags) matches the actual
+    /// rendered widths exactly.
+    pub grid_col_rects: Vec<(u16, u16)>,
+    /// Per-column width overrides (absolute column index → terminal cells),
+    /// set by `<` / `>` or Alt+dragging a header separator. Session-only
+    /// in-memory state — nothing is written to the config file. Columns
+    /// absent here render at [`COL_WIDTH_DEFAULT`].
+    pub col_widths: std::collections::HashMap<usize, u16>,
     /// `true` while the selected row is shown expanded (one column per line),
     /// which is the only readable way to look at a very wide table.
     pub row_detail: bool,
@@ -346,6 +353,61 @@ pub struct DataTab {
     /// `true` while the user is typing a search term in the footer.
     pub search_editing: bool,
     pub search_buffer: String,
+}
+
+/// Rendered width of a grid column when the user hasn't resized it.
+pub const COL_WIDTH_DEFAULT: u16 = 16;
+/// Narrowest a column can go — below this even a short header clips away.
+pub const COL_WIDTH_MIN: u16 = 4;
+/// Widest a column can go — past this one column eats the whole pane.
+pub const COL_WIDTH_MAX: u16 = 64;
+/// Step the `<` / `>` keys grow or shrink a column by.
+pub const COL_WIDTH_STEP: u16 = 4;
+
+/// Rendered width of a grid column: the user's override when one exists.
+pub fn col_width(tab: &DataTab, col: usize) -> u16 {
+    tab.col_widths
+        .get(&col)
+        .copied()
+        .unwrap_or(COL_WIDTH_DEFAULT)
+}
+
+/// Grow (`delta` > 0) or shrink a column's rendered width, clamped to
+/// [`COL_WIDTH_MIN`]..=[`COL_WIDTH_MAX`]. Returns the new width. Landing
+/// back on the default clears the override, so the map stays small.
+pub fn resize_col_width(tab: &mut DataTab, col: usize, delta: i32) -> u16 {
+    let cur = i32::from(col_width(tab, col));
+    let new = (cur + delta).clamp(i32::from(COL_WIDTH_MIN), i32::from(COL_WIDTH_MAX)) as u16;
+    set_col_width(tab, col, new);
+    new
+}
+
+/// Set a column's width directly (mouse drag reports an absolute target).
+/// Storing the default removes the override instead.
+pub fn set_col_width(tab: &mut DataTab, col: usize, width: u16) {
+    let width = width.clamp(COL_WIDTH_MIN, COL_WIDTH_MAX);
+    if width == COL_WIDTH_DEFAULT {
+        tab.col_widths.remove(&col);
+    } else {
+        tab.col_widths.insert(col, width);
+    }
+}
+
+/// How many columns starting at `offset` fit in `inner_w` cells, given each
+/// column's width and the 1-cell gap the Table widget puts between columns.
+/// Always at least one — an over-wide first column is clipped, never dropped.
+fn fitting_columns(widths: &[u16], offset: usize, inner_w: u16) -> usize {
+    let mut used = 0u16;
+    let mut n = 0usize;
+    for w in widths.iter().skip(offset) {
+        let need = if n == 0 { *w } else { w.saturating_add(1) };
+        if n > 0 && used.saturating_add(need) > inner_w {
+            break;
+        }
+        used = used.saturating_add(need);
+        n += 1;
+    }
+    n.max(1)
 }
 
 /// Rows of `tab` as they are actually displayed: client-side filter applied,
@@ -1901,10 +1963,35 @@ fn render_workspace(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme:
                         format!(" | filter {} ({}/{} shown)", f.display(), shown, data_tab.page.records.len())
                     });
                     let ro = if data_tab.read_only { " [read-only view]" } else { "" };
-                    let sort_badge = if data_tab.sort_keys.len() > 1 {
-                        format!(" | sorted by {} columns", data_tab.sort_keys.len())
-                    } else {
+                    // Name the whole sort stack (primary first) so a
+                    // multi-column sort is readable at a glance. Truncated
+                    // to keep the footer on one line.
+                    let sort_badge = if data_tab.sort_keys.is_empty() {
                         String::new()
+                    } else {
+                        let stack = data_tab
+                            .sort_keys
+                            .iter()
+                            .map(|(c, dir)| {
+                                let name = data_tab
+                                    .page
+                                    .columns
+                                    .get(*c)
+                                    .map(String::as_str)
+                                    .unwrap_or("?");
+                                let arrow = match dir {
+                                    SortDir::Asc => "↑",
+                                    SortDir::Desc => "↓",
+                                };
+                                format!("{name}{arrow}")
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let mut badge = format!(" | sort: {stack}");
+                        if badge.chars().count() > 48 {
+                            badge = badge.chars().take(47).collect::<String>() + "…";
+                        }
+                        badge
                     };
                     let search_badge = if data_tab.search_query.is_empty() {
                         String::new()
@@ -1916,7 +2003,7 @@ fn render_workspace(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme:
                         )
                     };
                     let footer_text = format!(
-                        " Page {} (showing {} rows{}){}{}{} | [v] row  [s/S] sort/clear  [/] filter  [Ctrl+F] search  [n]/[p] page  [w] Close",
+                        " Page {} (showing {} rows{}){}{}{} | [v] row  [s/S] sort/clear  [</>] width  [/] filter  [Ctrl+F] search  [n]/[p] page  [w] Close",
                         data_tab.page.page + 1,
                         data_tab.page.records.len(),
                         total_str,
@@ -1968,29 +2055,49 @@ fn render_grid(f: &mut Frame, area: Rect, tab: &mut DataTab, is_focused: bool, t
     }
 
     let num_cols = tab.page.columns.len();
-    let col_offset = tab.scroll_offset_x.min(num_cols.saturating_sub(1));
 
-    // Horizontal scroll: columns keep a fixed minimum width (16) and only the
-    // ones that fit the pane are rendered — the rest are reached via h/l (or
-    // the col_starts the mouse handler uses). If everything fits, they still
-    // grow to fill the pane.
+    // Horizontal scroll: each column renders at its own width (default 16,
+    // overridable per column) and only the ones that fit the pane are drawn —
+    // the rest are reached via h/l (or the grid_col_rects the mouse handler
+    // uses). If everything fits, the columns still grow to fill the pane.
     let inner_w = tab.grid_hit_area.map(|r| r.width).unwrap_or(80);
-    let max_visible = (inner_w / 16).max(1) as usize;
-    let num_visible = num_cols.saturating_sub(col_offset).max(1);
-    let show_all = num_visible <= max_visible;
-    let take_n = if show_all { num_visible } else { max_visible };
+    let widths: Vec<u16> = (0..num_cols).map(|i| col_width(tab, i)).collect();
 
-    // Record the rendered x-start of each visible column so mouse clicks map
-    // to the exact same widths the Table widget computed.
+    // Keep the cursor column inside the rendered window however wide the
+    // columns got: the 16-cell estimate `step_column` scrolls by is only an
+    // estimate once widths vary, so reconcile with the real widths here.
+    let mut col_offset = tab.scroll_offset_x.min(num_cols.saturating_sub(1));
+    if tab.selected_col < col_offset {
+        col_offset = tab.selected_col;
+    } else {
+        while tab.selected_col >= col_offset + fitting_columns(&widths, col_offset, inner_w)
+            && col_offset + 1 < num_cols
+        {
+            col_offset += 1;
+        }
+    }
+    tab.scroll_offset_x = col_offset;
+
+    let take_n = fitting_columns(&widths, col_offset, inner_w).min(num_cols - col_offset);
+    let show_all = col_offset + take_n >= num_cols;
+
+    let constraints: Vec<Constraint> = widths[col_offset..col_offset + take_n]
+        .iter()
+        .map(|&w| {
+            if show_all {
+                Constraint::Min(w)
+            } else {
+                Constraint::Length(w)
+            }
+        })
+        .collect();
+
+    // Record each visible column's rendered rect so mouse clicks and
+    // separator drags map to the exact widths the Table widget computes —
+    // same Layout call (default flex, 1-cell column spacing) it makes.
     if let Some(inner) = tab.grid_hit_area {
-        let col_w = if show_all {
-            (inner.width / num_visible as u16).max(1)
-        } else {
-            16
-        };
-        tab.grid_col_starts = (0..take_n)
-            .map(|i| inner.x + (i as u16 * col_w))
-            .collect();
+        let rects = Layout::horizontal(constraints.clone()).spacing(1).split(inner);
+        tab.grid_col_rects = rects.iter().map(|r| (r.x, r.width)).collect();
     }
 
     // Column highlight: when focused, every cell in the active column gets a
@@ -2090,22 +2197,7 @@ fn render_grid(f: &mut Frame, area: Rect, tab: &mut DataTab, is_focused: bool, t
         })
         .collect();
 
-    let widths: Vec<Constraint> = tab
-        .page
-        .columns
-        .iter()
-        .skip(col_offset)
-        .take(take_n)
-        .map(|_| {
-            if show_all {
-                Constraint::Min(16)
-            } else {
-                Constraint::Length(16)
-            }
-        })
-        .collect();
-
-    let table = Table::new(rows, widths)
+    let table = Table::new(rows, constraints)
         .header(header)
         .block(block)
         .style(theme.base());
@@ -2676,7 +2768,8 @@ mod tests {
             filter_buffer: String::new(),
             read_only: false,
             grid_hit_area: None,
-            grid_col_starts: Vec::new(),
+            grid_col_rects: Vec::new(),
+            col_widths: std::collections::HashMap::new(),
             row_detail: false,
             row_detail_scroll: 0,
             search_query: String::new(),
@@ -2818,6 +2911,98 @@ mod tests {
         );
         // No keys at all leaves everything equal, i.e. natural order.
         assert_eq!(compare_by_keys(&a, &b, &[]), std::cmp::Ordering::Equal);
+    }
+
+    #[test]
+    fn test_multi_column_sort_nulls_tie_break_on_later_keys() {
+        // NULL keeps the single-column semantics (first ascending) and only
+        // ties against other NULLs, so the next key decides between them.
+        let a = record(vec![Value::Null, Value::Int(2)]);
+        let b = record(vec![Value::Null, Value::Int(1)]);
+        let c = record(vec![Value::Int(0), Value::Int(9)]);
+        assert_eq!(
+            compare_by_keys(&a, &b, &[(0, SortDir::Asc), (1, SortDir::Asc)]),
+            std::cmp::Ordering::Greater
+        );
+        // NULLs still lead the ascending sort ahead of real values.
+        assert_eq!(
+            compare_by_keys(&a, &c, &[(0, SortDir::Asc), (1, SortDir::Asc)]),
+            std::cmp::Ordering::Less
+        );
+        // Descending on the primary flips the NULL group to the end, and the
+        // NULL-vs-NULL tie still falls through to the secondary key.
+        assert_eq!(
+            compare_by_keys(&a, &c, &[(0, SortDir::Desc), (1, SortDir::Asc)]),
+            std::cmp::Ordering::Greater
+        );
+        assert_eq!(
+            compare_by_keys(&a, &b, &[(0, SortDir::Desc), (1, SortDir::Asc)]),
+            std::cmp::Ordering::Greater
+        );
+    }
+
+    #[test]
+    fn test_sort_is_stable_for_rows_equal_on_every_key() {
+        // Rows the keys can't separate must keep the order the server sent —
+        // otherwise paging a sorted grid would shuffle duplicates around.
+        let mut tab = tab_with(
+            &["k", "v"],
+            vec![
+                record(vec![Value::Int(1), Value::String("first".into())]),
+                record(vec![Value::Int(1), Value::String("second".into())]),
+                record(vec![Value::Int(1), Value::String("third".into())]),
+            ],
+        );
+        tab.sort_keys = vec![(0, SortDir::Asc)];
+        let got: Vec<String> = visible_records(&tab)
+            .iter()
+            .map(|r| r.values[1].display_str())
+            .collect();
+        assert_eq!(got, vec!["first", "second", "third"]);
+    }
+
+    #[test]
+    fn test_resize_col_width_steps_and_clamps() {
+        let mut tab = tab_with(&["a"], vec![]);
+        assert_eq!(col_width(&tab, 0), COL_WIDTH_DEFAULT);
+
+        // Grows by the step and remembers the override.
+        let w = resize_col_width(&mut tab, 0, i32::from(COL_WIDTH_STEP));
+        assert_eq!(w, COL_WIDTH_DEFAULT + COL_WIDTH_STEP);
+        assert_eq!(col_width(&tab, 0), COL_WIDTH_DEFAULT + COL_WIDTH_STEP);
+
+        // Shrinking past the floor clamps at the minimum.
+        let w = resize_col_width(&mut tab, 0, -1000);
+        assert_eq!(w, COL_WIDTH_MIN);
+        assert_eq!(col_width(&tab, 0), COL_WIDTH_MIN);
+
+        // Growing past the ceiling clamps at the maximum.
+        let w = resize_col_width(&mut tab, 0, 1000);
+        assert_eq!(w, COL_WIDTH_MAX);
+        assert_eq!(col_width(&tab, 0), COL_WIDTH_MAX);
+
+        // Returning to the default drops the override entirely.
+        set_col_width(&mut tab, 0, COL_WIDTH_DEFAULT);
+        assert!(tab.col_widths.is_empty());
+        assert_eq!(col_width(&tab, 0), COL_WIDTH_DEFAULT);
+    }
+
+    #[test]
+    fn test_fitting_columns_accounts_for_spacing_and_width() {
+        // 3 columns of 10 cells + 2 gaps = 32 fits in 32, not in 31.
+        let widths = [10, 10, 10];
+        assert_eq!(fitting_columns(&widths, 0, 32), 3);
+        assert_eq!(fitting_columns(&widths, 0, 31), 2);
+
+        // The offset window only counts the columns from `offset` on.
+        assert_eq!(fitting_columns(&widths, 1, 21), 2);
+
+        // An over-wide first column is clipped, never dropped.
+        assert_eq!(fitting_columns(&[50], 0, 10), 1);
+        assert_eq!(fitting_columns(&[50, 10], 0, 10), 1);
+
+        // Empty input still reports one so the grid never renders zero.
+        assert_eq!(fitting_columns(&[], 0, 80), 1);
     }
 
     #[test]
