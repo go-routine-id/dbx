@@ -854,6 +854,9 @@ mod tests {
             socket: None,
             ssl: false,
             ssl_mode: ssl,
+            ssl_ca: None,
+            ssl_cert: None,
+            ssl_key: None,
             ssh: None,
         }
     }

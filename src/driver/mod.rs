@@ -331,7 +331,6 @@ pub async fn connect_driver(cfg: &ConnectionConfig) -> Result<Arc<dyn Driver>> {
             let drv = redis::RedisDriver::connect(cfg).await?;
             Ok(Arc::new(drv))
         }
->>>>>>> worktree-agent-af48aaaf2f224e7fd
     }
 }
 

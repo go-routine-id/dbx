@@ -73,7 +73,6 @@ pub fn quote_style_for(driver_name: &str) -> QuoteStyle {
         // redis: keys aren't SQL identifiers; quoting them would corrupt
         // any text the user pastes into the command console.
         QuoteStyle::Raw
->>>>>>> worktree-agent-af48aaaf2f224e7fd
     } else {
         QuoteStyle::Double
     }

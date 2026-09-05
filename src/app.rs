@@ -2808,7 +2808,7 @@ impl App {
                 KeyCode::Left | KeyCode::Right | KeyCode::Char(' ') if form.focused_field == FormField::Driver => {
                     use crate::config::DriverType;
                     // Every implemented driver is offered in the cycle.
-                    const CYCLE: [DriverType; 5] = [
+                    const CYCLE: [DriverType; 7] = [
                         DriverType::MySql,
                         DriverType::Postgres,
                         DriverType::Sqlite,
