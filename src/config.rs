@@ -18,6 +18,7 @@ pub enum DriverType {
     Sqlite,
     ClickHouse, // clickhouse
     MongoDB, // mongo
+    Redis, // redis
 }
 
 impl DriverType {
@@ -30,6 +31,7 @@ impl DriverType {
             // ClickHouse's plain HTTP interface port (8443 when TLS is on).
             DriverType::ClickHouse => 8123, // clickhouse
             DriverType::MongoDB => 27017, // mongo
+            DriverType::Redis => 6379, // redis
         }
     }
 }
@@ -208,6 +210,7 @@ impl ConnectionConfig {
             DriverType::Sqlite => "sqlite",
             DriverType::ClickHouse => "clickhouse", // clickhouse
             DriverType::MongoDB => "mongodb", // mongo
+            DriverType::Redis => "redis", // redis
         }
     }
 }

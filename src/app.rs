@@ -2815,6 +2815,7 @@ impl App {
                         DriverType::SqlServer,
                         DriverType::ClickHouse, // clickhouse
                         DriverType::MongoDB, // mongo
+                        DriverType::Redis, // redis
                     ];
                     let cur = CYCLE.iter().position(|d| *d == form.driver).unwrap_or(0);
                     let delta = if key.code == KeyCode::Left {
