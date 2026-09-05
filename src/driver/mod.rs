@@ -2,6 +2,7 @@
 //! See docs/architecture.md for capability model and architectural design.
 
 pub mod clickhouse; // clickhouse
+pub mod mongo; // mongo
 pub mod mssql;
 pub mod mysql;
 pub mod postgres;
@@ -317,6 +318,11 @@ pub async fn connect_driver(cfg: &ConnectionConfig) -> Result<Arc<dyn Driver>> {
         DriverType::ClickHouse => {
             // clickhouse
             let drv = clickhouse::ClickHouseDriver::connect(cfg).await?;
+            Ok(Arc::new(drv))
+        }
+        // mongo
+        DriverType::MongoDB => {
+            let drv = mongo::MongoDriver::connect(cfg).await?;
             Ok(Arc::new(drv))
         }
     }

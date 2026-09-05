@@ -319,6 +319,7 @@ pub fn render_form_modal(
                 DriverType::SqlServer => "SQL Server",
                 DriverType::Sqlite => "SQLite",
                 DriverType::ClickHouse => "ClickHouse", // clickhouse
+                DriverType::MongoDB => "MongoDB", // mongo
             };
             if is_focused {
                 spans.push(Span::styled("◀ ", theme.accent()));
