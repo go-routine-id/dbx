@@ -379,6 +379,183 @@ pub fn generate_create_sql(
     }
 }
 
+// ---------------------------------------------------------------------------
+// CREATE TABLE / CREATE DATABASE form support
+// ---------------------------------------------------------------------------
+
+/// A column type offered by the create-table form. `sized` types take a
+/// length parameter and render as `LABEL(n)` — e.g. `VARCHAR(255)`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TypeChoice {
+    pub label: &'static str,
+    pub sized: bool,
+}
+
+const fn sized(label: &'static str) -> TypeChoice {
+    TypeChoice { label, sized: true }
+}
+const fn plain(label: &'static str) -> TypeChoice {
+    TypeChoice { label, sized: false }
+}
+
+/// Common MySQL / MariaDB column types.
+pub const MYSQL_TYPES: &[TypeChoice] = &[
+    plain("INT"),
+    plain("BIGINT"),
+    sized("VARCHAR"),
+    plain("TEXT"),
+    plain("DECIMAL"),
+    plain("DATETIME"),
+    plain("DATE"),
+    plain("JSON"),
+    plain("BOOLEAN"),
+];
+
+/// Common PostgreSQL column types.
+pub const POSTGRES_TYPES: &[TypeChoice] = &[
+    plain("integer"),
+    plain("bigint"),
+    plain("text"),
+    sized("varchar"),
+    plain("numeric"),
+    plain("timestamp"),
+    plain("date"),
+    plain("jsonb"),
+    plain("boolean"),
+    plain("uuid"),
+];
+
+/// Common SQL Server column types.
+pub const MSSQL_TYPES: &[TypeChoice] = &[
+    plain("int"),
+    plain("bigint"),
+    sized("nvarchar"),
+    sized("varchar"),
+    plain("decimal"),
+    plain("datetime2"),
+    plain("date"),
+    plain("bit"),
+    plain("uniqueidentifier"),
+];
+
+/// SQLite storage classes / affinities.
+pub const SQLITE_TYPES: &[TypeChoice] = &[
+    plain("INTEGER"),
+    plain("TEXT"),
+    plain("REAL"),
+    plain("BLOB"),
+    plain("NUMERIC"),
+];
+
+/// The type list the create-table form offers for a driver, matched on the
+/// `DriverInfo::name` the same way `quote_style_for` does. Unknown drivers
+/// get the PostgreSQL list (the most standard-SQL of the set).
+pub fn type_choices_for(driver_name: &str) -> &'static [TypeChoice] {
+    let lower = driver_name.to_lowercase();
+    if lower.contains("mysql") || lower.contains("maria") {
+        MYSQL_TYPES
+    } else if lower.contains("sql server") || lower.contains("mssql") {
+        MSSQL_TYPES
+    } else if lower.contains("sqlite") {
+        SQLITE_TYPES
+    } else {
+        POSTGRES_TYPES
+    }
+}
+
+/// Render a type choice with its length buffer as SQL. Sized types render
+/// `LABEL(n)`; a blank/non-numeric length falls back to 255 rather than
+/// emitting the invalid bare `VARCHAR` (MySQL/MSSQL reject it).
+pub fn render_type_sql(choice: &TypeChoice, len: &str) -> String {
+    if choice.sized {
+        let digits: String = len.chars().filter(|c| c.is_ascii_digit()).collect();
+        let n = if digits.is_empty() { "255".to_string() } else { digits };
+        format!("{}({})", choice.label, n)
+    } else {
+        choice.label.to_string()
+    }
+}
+
+/// One column of the create-table form, with the type already resolved to
+/// SQL (via `render_type_sql`).
+#[derive(Clone, Debug)]
+pub struct NewColumn {
+    pub name: String,
+    pub type_sql: String,
+    pub nullable: bool,
+    pub primary_key: bool,
+    /// Raw DEFAULT expression as typed (`0`, `'x'`, `CURRENT_TIMESTAMP`);
+    /// empty means no DEFAULT clause.
+    pub default: String,
+}
+
+/// Build a `CREATE TABLE ns.tbl (...)` from the create-table form. Quoting
+/// follows the driver dialect. A single primary-key column gets an inline
+/// `PRIMARY KEY`; several get a table-level constraint so composite keys
+/// work. Returns `None` when the form is not submittable (no table name, no
+/// columns, or an unnamed column) so the caller can warn instead of running
+/// a statement the server would reject.
+pub fn build_create_table_sql(
+    ns: &crate::driver::Namespace,
+    table: &str,
+    columns: &[NewColumn],
+    driver_name: &str,
+) -> Option<String> {
+    let table = table.trim();
+    if table.is_empty() || columns.is_empty() {
+        return None;
+    }
+    if columns.iter().any(|c| c.name.trim().is_empty()) {
+        return None;
+    }
+    let pk_cols: Vec<&NewColumn> = columns.iter().filter(|c| c.primary_key).collect();
+    let multi_pk = pk_cols.len() > 1;
+    let mut defs: Vec<String> = Vec::with_capacity(columns.len() + 1);
+    for col in columns {
+        let mut def = format!(
+            "{} {}",
+            quote_ident(col.name.trim(), driver_name),
+            col.type_sql
+        );
+        if !col.nullable {
+            def.push_str(" NOT NULL");
+        }
+        if col.primary_key && !multi_pk {
+            def.push_str(" PRIMARY KEY");
+        }
+        let d = col.default.trim();
+        if !d.is_empty() {
+            def.push_str(&format!(" DEFAULT {d}"));
+        }
+        defs.push(def);
+    }
+    if multi_pk {
+        let cols = pk_cols
+            .iter()
+            .map(|c| quote_ident(c.name.trim(), driver_name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        defs.push(format!("PRIMARY KEY ({cols})"));
+    }
+    let q_ns = quote_ident(&ns.0, driver_name);
+    let q_tbl = quote_ident(table, driver_name);
+    Some(format!("CREATE TABLE {q_ns}.{q_tbl} ({});", defs.join(", ")))
+}
+
+/// Build a `CREATE DATABASE <quoted>;`. Returns `None` for an empty name.
+/// Callers must gate out drivers without the concept (SQLite: a database is
+/// a file) before offering the form at all.
+pub fn build_create_database_sql(name: &str, driver_name: &str) -> Option<String> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "CREATE DATABASE {};",
+        quote_ident(name, driver_name)
+    ))
+}
+
 /// Roadmap M2.10: detect statements that can destroy data before the query
 /// console runs them, so the user gets an explicit confirm dialog.
 ///
@@ -718,6 +895,131 @@ mod tests {
             my,
             "INSERT INTO `users` (`id`, `name`, `note`) VALUES ('7', 'O''Brien', NULL);"
         );
+    }
+
+    // ---- CREATE TABLE / CREATE DATABASE form generators ----
+
+    fn col(name: &str, type_sql: &str, nullable: bool, pk: bool, default: &str) -> NewColumn {
+        NewColumn {
+            name: name.to_string(),
+            type_sql: type_sql.to_string(),
+            nullable,
+            primary_key: pk,
+            default: default.to_string(),
+        }
+    }
+
+    #[test]
+    fn test_type_choices_per_driver() {
+        assert!(type_choices_for("MySQL 8.0").iter().any(|t| t.label == "VARCHAR" && t.sized));
+        assert!(type_choices_for("PostgreSQL 15").iter().any(|t| t.label == "jsonb"));
+        assert!(type_choices_for("Microsoft SQL Server 2019").iter().any(|t| t.label == "nvarchar" && t.sized));
+        assert_eq!(type_choices_for("SQLite 3.45")[0].label, "INTEGER");
+        // Unknown drivers fall back to the PostgreSQL list.
+        assert_eq!(type_choices_for("MongoDB"), POSTGRES_TYPES);
+    }
+
+    #[test]
+    fn test_render_type_sql_sized_and_plain() {
+        let varchar = sized("VARCHAR");
+        assert_eq!(render_type_sql(&varchar, "64"), "VARCHAR(64)");
+        // A blank length falls back to 255 — bare `VARCHAR` is rejected by
+        // MySQL and SQL Server.
+        assert_eq!(render_type_sql(&varchar, ""), "VARCHAR(255)");
+        // Non-digits are stripped rather than landing in the SQL.
+        assert_eq!(render_type_sql(&varchar, "12a"), "VARCHAR(12)");
+        assert_eq!(render_type_sql(&plain("TEXT"), "999"), "TEXT");
+    }
+
+    #[test]
+    fn test_build_create_table_sql_postgres() {
+        let cols = vec![
+            col("id", "bigint", false, true, ""),
+            col("display name", "varchar(255)", true, false, ""),
+            col("score", "numeric", false, false, "0"),
+        ];
+        let sql = build_create_table_sql(&Namespace("public".to_string()), "players", &cols, "PostgreSQL 15")
+            .unwrap();
+        // Single PK → inline; nullable column gets no NOT NULL; default raw.
+        // "display name" contains a space → must be quoted.
+        assert_eq!(
+            sql,
+            "CREATE TABLE \"public\".\"players\" (\"id\" bigint NOT NULL PRIMARY KEY, \"display name\" varchar(255), \"score\" numeric NOT NULL DEFAULT 0);"
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_mysql_backticks() {
+        let cols = vec![col("id", "INT", false, true, ""), col("bio", "TEXT", true, false, "")];
+        let sql = build_create_table_sql(&Namespace("shop".to_string()), "users", &cols, "MySQL 8.0").unwrap();
+        assert_eq!(
+            sql,
+            "CREATE TABLE `shop`.`users` (`id` INT NOT NULL PRIMARY KEY, `bio` TEXT);"
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_mssql_brackets() {
+        let cols = vec![col("id", "uniqueidentifier", false, true, "")];
+        let sql = build_create_table_sql(&Namespace("dbo".to_string()), "t", &cols, "Microsoft SQL Server 2019").unwrap();
+        assert_eq!(
+            sql,
+            "CREATE TABLE [dbo].[t] ([id] uniqueidentifier NOT NULL PRIMARY KEY);"
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_composite_pk_is_table_level() {
+        let cols = vec![
+            col("a", "integer", false, true, ""),
+            col("b", "integer", false, true, ""),
+        ];
+        let sql = build_create_table_sql(&Namespace("public".to_string()), "pair", &cols, "postgres").unwrap();
+        assert_eq!(
+            sql,
+            "CREATE TABLE \"public\".\"pair\" (\"a\" integer NOT NULL, \"b\" integer NOT NULL, PRIMARY KEY (\"a\", \"b\"));"
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_quotes_dangerous_names() {
+        // A table/column name containing the quote char must be escaped.
+        let cols = vec![col("weird`col", "TEXT", true, false, "")];
+        let sql = build_create_table_sql(&Namespace("shop".to_string()), "order items", &cols, "mysql").unwrap();
+        assert_eq!(
+            sql,
+            "CREATE TABLE `shop`.`order items` (`weird``col` TEXT);"
+        );
+    }
+
+    #[test]
+    fn test_build_create_table_sql_incomplete_forms_return_none() {
+        let cols = vec![col("id", "INT", false, true, "")];
+        // No table name.
+        assert!(build_create_table_sql(&Namespace("s".to_string()), "  ", &cols, "mysql").is_none());
+        // No columns.
+        assert!(build_create_table_sql(&Namespace("s".to_string()), "t", &[], "mysql").is_none());
+        // An unnamed column.
+        let bad = vec![col("id", "INT", false, true, ""), col(" ", "TEXT", true, false, "")];
+        assert!(build_create_table_sql(&Namespace("s".to_string()), "t", &bad, "mysql").is_none());
+    }
+
+    #[test]
+    fn test_build_create_database_sql_by_dialect() {
+        assert_eq!(
+            build_create_database_sql("analytics", "MySQL 8.0").as_deref(),
+            Some("CREATE DATABASE `analytics`;")
+        );
+        assert_eq!(
+            build_create_database_sql("analytics", "PostgreSQL 15").as_deref(),
+            Some("CREATE DATABASE \"analytics\";")
+        );
+        assert_eq!(
+            build_create_database_sql("my db", "Microsoft SQL Server 2019").as_deref(),
+            Some("CREATE DATABASE [my db];")
+        );
+        // Empty / whitespace-only names are rejected.
+        assert_eq!(build_create_database_sql("  ", "mysql"), None);
     }
 
     #[test]

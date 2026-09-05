@@ -38,7 +38,7 @@ pub const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 48] = [
+pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 49] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
@@ -69,7 +69,8 @@ pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 48] = [
     ("Ctrl+E", "open export dialog (CSV, JSON, SQL INSERT, SQL dump, xlsx)"),
     ("e / Enter", "edit active cell value (shows safe SQL confirmation)"),
     ("e (on tree table)", "edit table schema (ALTER: drop/add column, rename)"),
-    ("a (in tree)", "create schema / table / view / type / function"),
+    ("a (in tree)", "create schema / view / type / function — table opens a column form"),
+    ("N (on a database node)", "create a new database (with SQL preview)"),
     ("Ctrl+O (on tree table)", "context menu: view DDL / open rows / edit schema / delete table"),
     ("x", "delete selected row (shows safe SQL confirmation)"),
     ("v (in table tab)", "expand the selected row vertically (wide tables)"),

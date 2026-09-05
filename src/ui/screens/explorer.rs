@@ -186,12 +186,271 @@ impl CreateKind {
 
 /// State for the create-object modal (`a` in the tree). Pick a kind and type
 /// a name; Enter generates a CREATE statement shown in the SQL-confirm modal.
+/// The `Table` kind is the exception: Enter opens the richer create-table
+/// form (`CreateTableModalState`) instead of a one-column stub.
 #[derive(Clone, Debug)]
 pub struct CreateObjectModalState {
     /// Schema context for the new object (empty for CREATE SCHEMA).
     pub namespace: Namespace,
     pub kind: CreateKind,
     pub name: String,
+}
+
+/// State for the create-database modal (`N` on a database node in the tree).
+/// Just a name field plus a live SQL preview; Enter executes directly.
+#[derive(Clone, Debug)]
+pub struct CreateDatabaseModalState {
+    pub name: String,
+    /// `DriverInfo::name` captured at open time — drives identifier quoting
+    /// in the preview and the executed statement.
+    pub driver_name: String,
+}
+
+impl CreateDatabaseModalState {
+    /// The statement as it would execute right now, `None` while the name is
+    /// blank (the preview shows a placeholder instead).
+    pub fn sql_preview(&self) -> Option<String> {
+        crate::sql::build_create_database_sql(&self.name, &self.driver_name)
+    }
+}
+
+/// One editable column row in the create-table form.
+#[derive(Clone, Debug)]
+pub struct CreateTableColumn {
+    pub name: String,
+    /// Index into `crate::sql::type_choices_for(driver_name)`.
+    pub type_idx: usize,
+    /// Length buffer — only rendered for sized types (VARCHAR, nvarchar, ...).
+    pub len: String,
+    pub nullable: bool,
+    pub primary_key: bool,
+    /// Raw DEFAULT expression; empty means no DEFAULT clause.
+    pub default: String,
+}
+
+/// State for the create-table form modal. A flat grid of cells: row 0 is the
+/// table-name field, rows 1..=columns.len() are column rows with cells
+/// name / type / length / nullable / pk / default (length only exists for
+/// sized types).
+#[derive(Clone, Debug)]
+pub struct CreateTableModalState {
+    pub namespace: Namespace,
+    /// `DriverInfo::name` captured at open time — drives the type list and
+    /// identifier quoting.
+    pub driver_name: String,
+    pub table_name: String,
+    pub columns: Vec<CreateTableColumn>,
+    /// 0 = table name field; 1..=columns.len() = that column row.
+    pub focus_row: usize,
+    /// Cell within a column row: 0 name, 1 type, 2 length, 3 nullable,
+    /// 4 primary key, 5 default. Always 0 on the table-name row.
+    pub focus_col: usize,
+}
+
+impl CreateTableModalState {
+    pub fn new(namespace: Namespace, driver_name: String, table_name: String) -> Self {
+        Self {
+            namespace,
+            driver_name,
+            table_name,
+            columns: vec![CreateTableColumn {
+                name: String::new(),
+                type_idx: 0,
+                len: "255".to_string(),
+                nullable: true,
+                primary_key: false,
+                default: String::new(),
+            }],
+            focus_row: 0,
+            focus_col: 0,
+        }
+    }
+
+    /// Type list for this driver (constant per driver name).
+    pub fn types(&self) -> &'static [crate::sql::TypeChoice] {
+        crate::sql::type_choices_for(&self.driver_name)
+    }
+
+    /// Cell order of a row, skipping the length cell for unsized types.
+    fn cell_order(&self, row: usize) -> &'static [usize] {
+        const NAME_ONLY: &[usize] = &[0];
+        const UNSIZED: &[usize] = &[0, 1, 3, 4, 5];
+        const SIZED: &[usize] = &[0, 1, 2, 3, 4, 5];
+        if row == 0 {
+            return NAME_ONLY;
+        }
+        let sized = self
+            .columns
+            .get(row - 1)
+            .map(|c| self.types()[c.type_idx].sized)
+            .unwrap_or(false);
+        if sized { SIZED } else { UNSIZED }
+    }
+
+    /// Clamp `focus_col` onto the current row's cell order (used after row
+    /// moves / type cycles that add or remove the length cell). Falls back to
+    /// the nearest earlier cell so landing on a now-hidden length cell moves
+    /// to the type cell, not somewhere random.
+    fn clamp_focus_col(&mut self) {
+        let order = self.cell_order(self.focus_row);
+        if !order.contains(&self.focus_col) {
+            self.focus_col = order
+                .iter()
+                .copied()
+                .filter(|c| *c < self.focus_col)
+                .last()
+                .unwrap_or(0);
+        }
+    }
+
+    /// Tab: advance through every editable cell, wrapping around.
+    pub fn next_cell(&mut self) {
+        let order = self.cell_order(self.focus_row);
+        let pos = order.iter().position(|c| *c == self.focus_col).unwrap_or(0);
+        if pos + 1 < order.len() {
+            self.focus_col = order[pos + 1];
+        } else if self.focus_row < self.columns.len() {
+            self.focus_row += 1;
+            self.focus_col = 0;
+        } else {
+            self.focus_row = 0;
+            self.focus_col = 0;
+        }
+    }
+
+    /// Shift+Tab: the reverse of `next_cell`.
+    pub fn prev_cell(&mut self) {
+        let order = self.cell_order(self.focus_row);
+        let pos = order.iter().position(|c| *c == self.focus_col).unwrap_or(0);
+        if pos > 0 {
+            self.focus_col = order[pos - 1];
+        } else if self.focus_row > 0 {
+            self.focus_row -= 1;
+            let order = self.cell_order(self.focus_row);
+            self.focus_col = *order.last().unwrap_or(&0);
+        } else {
+            self.focus_row = self.columns.len();
+            self.focus_col = 0;
+        }
+    }
+
+    /// ↑/↓: move a whole row, keeping the cell column where possible.
+    pub fn move_row(&mut self, dir: isize) {
+        let next = (self.focus_row as isize + dir).clamp(0, self.columns.len() as isize);
+        self.focus_row = next as usize;
+        self.clamp_focus_col();
+    }
+
+    /// ←/→ on the type cell cycles the column's type.
+    pub fn cycle_type(&mut self, dir: isize) {
+        if self.focus_row == 0 || self.focus_col != 1 {
+            return;
+        }
+        let n = self.types().len() as isize;
+        let col = &mut self.columns[self.focus_row - 1];
+        col.type_idx = ((col.type_idx as isize + dir + n) % n) as usize;
+    }
+
+    /// Ctrl+A: insert a fresh column after the focused row (or at the end
+    /// when the table-name field is focused) and move to it.
+    pub fn add_column(&mut self) {
+        let at = if self.focus_row == 0 {
+            self.columns.len()
+        } else {
+            self.focus_row.min(self.columns.len())
+        };
+        self.columns.insert(
+            at,
+            CreateTableColumn {
+                name: String::new(),
+                type_idx: 0,
+                len: "255".to_string(),
+                nullable: true,
+                primary_key: false,
+                default: String::new(),
+            },
+        );
+        self.focus_row = at + 1;
+        self.focus_col = 0;
+    }
+
+    /// Ctrl+D: drop the focused column row. The last remaining row stays —
+    /// a table without columns is not submittable anyway.
+    pub fn remove_column(&mut self) {
+        if self.focus_row == 0 || self.columns.len() <= 1 {
+            return;
+        }
+        self.columns.remove(self.focus_row - 1);
+        if self.focus_row > self.columns.len() {
+            self.focus_row = self.columns.len();
+        }
+        self.clamp_focus_col();
+    }
+
+    /// Alt+↑/↓: reorder the focused column row.
+    pub fn reorder_column(&mut self, dir: isize) {
+        if self.focus_row == 0 {
+            return;
+        }
+        let idx = self.focus_row - 1;
+        let target = idx as isize + dir;
+        if target < 0 || target as usize >= self.columns.len() {
+            return;
+        }
+        self.columns.swap(idx, target as usize);
+        self.focus_row = target as usize + 1;
+    }
+
+    /// Space on the nullable / pk cells flips them.
+    pub fn toggle_flag_cell(&mut self) {
+        if self.focus_row == 0 {
+            return;
+        }
+        let col = &mut self.columns[self.focus_row - 1];
+        match self.focus_col {
+            3 => col.nullable = !col.nullable,
+            4 => col.primary_key = !col.primary_key,
+            _ => {}
+        }
+    }
+
+    /// The text buffer of the focused cell, if it is a free-text cell
+    /// (table name, column name, length, default).
+    pub fn focused_buffer_mut(&mut self) -> Option<&mut String> {
+        if self.focus_row == 0 {
+            return Some(&mut self.table_name);
+        }
+        let col = self.columns.get_mut(self.focus_row - 1)?;
+        match self.focus_col {
+            0 => Some(&mut col.name),
+            2 => Some(&mut col.len),
+            5 => Some(&mut col.default),
+            _ => None,
+        }
+    }
+
+    /// The CREATE statement as it would execute right now — `None` while the
+    /// form is incomplete (the preview shows a placeholder instead).
+    pub fn sql_preview(&self) -> Option<String> {
+        let types = self.types();
+        let cols: Vec<crate::sql::NewColumn> = self
+            .columns
+            .iter()
+            .map(|c| crate::sql::NewColumn {
+                name: c.name.clone(),
+                type_sql: crate::sql::render_type_sql(&types[c.type_idx], &c.len),
+                nullable: c.nullable,
+                primary_key: c.primary_key,
+                default: c.default.clone(),
+            })
+            .collect();
+        crate::sql::build_create_table_sql(
+            &self.namespace,
+            &self.table_name,
+            &cols,
+            &self.driver_name,
+        )
+    }
 }
 
 /// A schema-edit text input in progress.
@@ -553,6 +812,10 @@ pub struct ExplorerState {
     pub import_csv_modal: Option<ImportCsvModalState>,
     pub schema_edit_modal: Option<SchemaEditModalState>,
     pub create_object_modal: Option<CreateObjectModalState>,
+    /// Create-database modal (`N` on a database node in the tree).
+    pub create_db_modal: Option<CreateDatabaseModalState>,
+    /// Create-table form modal (from the create-object modal's Table kind).
+    pub create_table_modal: Option<CreateTableModalState>,
     /// Explorer tree folded away to give the workspace the full width.
     pub tree_collapsed: bool,
     pub erd_menu: Option<ErdMenuState>,
@@ -614,6 +877,8 @@ impl ExplorerState {
             import_csv_modal: None,
             schema_edit_modal: None,
             create_object_modal: None,
+            create_db_modal: None,
+            create_table_modal: None,
             tree_collapsed: false,
             erd_menu: None,
             tree_menu: None,
@@ -834,6 +1099,14 @@ pub fn render_explorer(
 
     if let Some(create) = &state.create_object_modal {
         render_create_object_modal(f, area, create, theme);
+    }
+
+    if let Some(create_db) = &state.create_db_modal {
+        render_create_database_modal(f, area, create_db, theme);
+    }
+
+    if let Some(create_table) = &state.create_table_modal {
+        render_create_table_modal(f, area, create_table, theme);
     }
 
     // Cloned so the popup rect can be recorded back into `state` (the hit
@@ -1411,6 +1684,237 @@ fn render_create_object_modal(
         theme.dim(),
     ));
     f.render_widget(Paragraph::new(hint).alignment(Alignment::Center), chunks[2]);
+}
+
+/// Small overlay for creating a database: a name field with a live preview
+/// of the `CREATE DATABASE` statement it will run.
+fn render_create_database_modal(
+    f: &mut Frame,
+    area: Rect,
+    modal: &CreateDatabaseModalState,
+    theme: &Theme,
+) {
+    let width = 56.min(area.width.saturating_sub(4));
+    let height = 9.min(area.height.saturating_sub(2));
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent())
+        .style(theme.panel())
+        .title(" Create Database ");
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(1), // name input
+            Constraint::Length(3), // SQL preview box
+            Constraint::Length(1), // hints
+        ])
+        .split(inner);
+
+    let name_line = Line::from(vec![
+        Span::styled(
+            "name> ",
+            theme.accent().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("{}█", modal.name), theme.base()),
+    ]);
+    f.render_widget(Paragraph::new(name_line), chunks[0]);
+
+    let preview = modal
+        .sql_preview()
+        .unwrap_or_else(|| "-- enter a database name".to_string());
+    let preview_style = if modal.sql_preview().is_some() {
+        theme.base()
+    } else {
+        theme.dim()
+    };
+    let sql_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.border());
+    let sql_inner = sql_block.inner(chunks[1]);
+    f.render_widget(sql_block, chunks[1]);
+    f.render_widget(Paragraph::new(preview).style(preview_style), sql_inner);
+
+    let hint = Line::from(Span::styled(
+        " type name · Enter create · Esc cancel",
+        theme.dim(),
+    ));
+    f.render_widget(Paragraph::new(hint).alignment(Alignment::Center), chunks[2]);
+}
+
+/// Form overlay for creating a table: table-name field, one editable row per
+/// column (name / type / length / nullable / pk / default) and a live SQL
+/// preview. Key routing lives in `app.rs`; Enter executes in the event loop.
+fn render_create_table_modal(
+    f: &mut Frame,
+    area: Rect,
+    modal: &CreateTableModalState,
+    theme: &Theme,
+) {
+    let width = 84.min(area.width.saturating_sub(4));
+    // name + header + up to 12 column rows + preview (4) + 2 hint lines.
+    let visible_cols: usize = modal.columns.len().min(12);
+    let body_height: u16 = 1 + 1 + visible_cols as u16 + 4 + 2;
+    let height = (body_height + 2).min(area.height.saturating_sub(2));
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent())
+        .style(theme.panel())
+        .title(format!(" Create Table in {} ", modal.namespace.0));
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .margin(1)
+        .constraints([
+            Constraint::Length(1),               // table name
+            Constraint::Length(1),               // column header
+            Constraint::Min(1),                  // column rows
+            Constraint::Length(4),               // SQL preview box
+            Constraint::Length(2),               // hints
+        ])
+        .split(inner);
+
+    // Table name field.
+    let name_style = if modal.focus_row == 0 {
+        theme.base().add_modifier(Modifier::BOLD)
+    } else {
+        theme.base()
+    };
+    let mut name_spans = vec![
+        Span::styled(
+            "table> ",
+            theme.accent().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(modal.table_name.clone(), name_style),
+    ];
+    if modal.focus_row == 0 {
+        name_spans.push(Span::styled("█", theme.accent()));
+    }
+    f.render_widget(Paragraph::new(Line::from(name_spans)), chunks[0]);
+
+    let header = Line::from(Span::styled(
+        format!(
+            "  {:<18}{:<20}{:<11}{:<8}{}",
+            "column", "type", "nullable", "pk", "default"
+        ),
+        theme.dim(),
+    ));
+    f.render_widget(Paragraph::new(header), chunks[1]);
+
+    // Follow-scroll so the focused row stays visible (same approach as the
+    // schema-edit modal).
+    let visible = (chunks[2].height as usize).max(1);
+    let focused_idx = modal.focus_row.saturating_sub(1);
+    let start = focused_idx.saturating_sub(visible / 2);
+    let end = (start + visible).min(modal.columns.len());
+    let start = end.saturating_sub(visible);
+
+    let types = modal.types();
+    let mut lines = Vec::new();
+    for i in start..end {
+        let row = i + 1;
+        let col = &modal.columns[i];
+        let on_row = modal.focus_row == row;
+        let cell = |idx: usize, text: String, active: Style| -> Span {
+            if on_row && modal.focus_col == idx {
+                Span::styled(text, active.add_modifier(Modifier::BOLD | Modifier::UNDERLINED))
+            } else {
+                Span::styled(text, theme.base())
+            }
+        };
+        let marker = if on_row { "▶" } else { " " };
+        let name_txt = if on_row && modal.focus_col == 0 {
+            format!("{:<18}", format!("{}█", col.name))
+        } else {
+            format!("{:<18}", col.name)
+        };
+        let type_sql = crate::sql::render_type_sql(&types[col.type_idx], &col.len);
+        let type_txt = if on_row && modal.focus_col == 1 {
+            format!("{:<20}", format!("‹{type_sql}›"))
+        } else if on_row && modal.focus_col == 2 {
+            format!("{:<20}", format!("{}({}█)", types[col.type_idx].label, col.len))
+        } else {
+            format!("{:<20}", type_sql)
+        };
+        let nullable_txt = format!("{:<11}", if col.nullable { "[x] null" } else { "[ ] not null" });
+        let pk_txt = format!("{:<8}", if col.primary_key { "[x] pk" } else { "[ ] pk" });
+        let default_txt = if on_row && modal.focus_col == 5 {
+            format!("{}█", col.default)
+        } else {
+            col.default.clone()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{marker} "), theme.accent()),
+            cell(0, name_txt, theme.accent()),
+            cell(1, type_txt, theme.accent()),
+            cell(3, nullable_txt, theme.warning()),
+            cell(4, pk_txt, theme.warning()),
+            cell(5, default_txt, theme.accent()),
+        ]));
+    }
+    f.render_widget(Paragraph::new(lines), chunks[2]);
+
+    let preview = modal
+        .sql_preview()
+        .unwrap_or_else(|| "-- table name + every column needs a name".to_string());
+    let preview_style = if modal.sql_preview().is_some() {
+        theme.base()
+    } else {
+        theme.dim()
+    };
+    let sql_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.border())
+        .title(" SQL ");
+    let sql_inner = sql_block.inner(chunks[3]);
+    f.render_widget(sql_block, chunks[3]);
+    f.render_widget(
+        Paragraph::new(preview)
+            .style(preview_style)
+            .wrap(ratatui::widgets::Wrap { trim: false }),
+        sql_inner,
+    );
+
+    let hint1 = Line::from(Span::styled(
+        " Tab/Shift+Tab cell · ↑/↓ row · ←/→ cycle type · Space toggle null/pk",
+        theme.dim(),
+    ));
+    let hint2 = Line::from(vec![
+        Span::styled(" Ctrl+A add · Ctrl+D drop · Alt+↑/↓ move · ", theme.dim()),
+        Span::styled("Enter create", theme.accent().add_modifier(Modifier::BOLD)),
+        Span::styled(" · Esc cancel", theme.dim()),
+    ]);
+    let hint_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(chunks[4]);
+    f.render_widget(Paragraph::new(hint1).alignment(Alignment::Center), hint_chunks[0]);
+    f.render_widget(Paragraph::new(hint2).alignment(Alignment::Center), hint_chunks[1]);
 }
 
 /// Overlay for editing a table's schema (build an ALTER TABLE).
@@ -3044,5 +3548,103 @@ mod tests {
         // Contains (case-sensitive, like a LIKE without wildcards).
         let cont = parse_filter("name ~ lovelace", &cols).unwrap();
         assert!(record_matches_filter(&rec, &cont));
+    }
+
+    // ---- Create-table form state ----
+
+    fn table_form() -> CreateTableModalState {
+        CreateTableModalState::new(
+            Namespace("public".to_string()),
+            "PostgreSQL 15".to_string(),
+            String::new(),
+        )
+    }
+
+    #[test]
+    fn test_create_table_form_cell_walk_skips_len_for_unsized_types() {
+        let mut m = table_form();
+        // From the table-name field, Tab lands on the first column's name.
+        m.next_cell();
+        assert_eq!((m.focus_row, m.focus_col), (1, 0));
+        // Default type (integer, unsized): type cell → nullable, skipping len.
+        m.next_cell();
+        assert_eq!((m.focus_row, m.focus_col), (1, 1));
+        m.next_cell();
+        assert_eq!((m.focus_row, m.focus_col), (1, 3));
+        // Walk off the last cell of the last row → wrap to the table name.
+        while !(m.focus_row == 0 && m.focus_col == 0) {
+            m.next_cell();
+        }
+        // Shift+Tab from the table name wraps to the last row's first cell...
+        m.prev_cell();
+        assert_eq!((m.focus_row, m.focus_col), (m.columns.len(), 0));
+    }
+
+    #[test]
+    fn test_create_table_form_sized_type_gains_len_cell() {
+        let mut m = table_form();
+        m.focus_row = 1;
+        m.focus_col = 1;
+        // Cycle to `varchar` (sized) → the length cell appears in the walk.
+        let types = m.types();
+        let varchar_idx = types.iter().position(|t| t.sized).unwrap();
+        m.columns[0].type_idx = varchar_idx;
+        m.next_cell();
+        assert_eq!((m.focus_row, m.focus_col), (1, 2));
+    }
+
+    #[test]
+    fn test_create_table_form_add_remove_reorder() {
+        let mut m = table_form();
+        m.add_column();
+        assert_eq!(m.columns.len(), 2);
+        m.add_column();
+        assert_eq!(m.columns.len(), 3);
+        // Focus is on the freshly added (last) row; move it up twice.
+        m.columns[2].name = "c".to_string();
+        m.reorder_column(-1);
+        m.reorder_column(-1);
+        assert_eq!(m.columns[0].name, "c");
+        assert_eq!(m.focus_row, 1);
+        // Reorder past the top is a no-op.
+        m.reorder_column(-1);
+        assert_eq!(m.columns[0].name, "c");
+        // Drop the focused row; the last row can never be dropped.
+        m.remove_column();
+        assert_eq!(m.columns.len(), 2);
+        m.remove_column();
+        assert_eq!(m.columns.len(), 1);
+        m.remove_column();
+        assert_eq!(m.columns.len(), 1);
+    }
+
+    #[test]
+    fn test_create_table_form_preview_flows_into_generator() {
+        let mut m = table_form();
+        // Incomplete form → no SQL.
+        assert!(m.sql_preview().is_none());
+        m.table_name = "t".to_string();
+        m.columns[0].name = "id".to_string();
+        m.columns[0].nullable = false;
+        m.columns[0].primary_key = true;
+        let sql = m.sql_preview().unwrap();
+        assert_eq!(
+            sql,
+            "CREATE TABLE \"public\".\"t\" (\"id\" integer NOT NULL PRIMARY KEY);"
+        );
+    }
+
+    #[test]
+    fn test_create_database_preview() {
+        let mut m = CreateDatabaseModalState {
+            name: String::new(),
+            driver_name: "MySQL 8.0".to_string(),
+        };
+        assert!(m.sql_preview().is_none());
+        m.name = "analytics".to_string();
+        assert_eq!(
+            m.sql_preview().as_deref(),
+            Some("CREATE DATABASE `analytics`;")
+        );
     }
 }
