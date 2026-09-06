@@ -90,7 +90,7 @@ binary lives in a root-owned directory, re-run it with `sudo`. Your config
 | ✅ | In-place data editing: `Enter` to edit cell, `i` to insert row, `Backspace` to delete (with SQL preview) |
 | ✅ | `NULL` assignment via `Ctrl+N` on nullable columns |
 | ✅ | Confirm-before-delete for saved connections |
-| ✅ | Contextual autocomplete (tables, columns, keywords) with `Tab` to accept |
+| ✅ | Contextual autocomplete (tables, columns, keywords) with `Enter` / `Tab` to accept |
 | ✅ | Saved query collections + per-connection query history |
 | ✅ | SQLite support — point a connection at a `.db` file, no server needed |
 | ✅ | Startup update check + in-place `dbx --self-update` |
