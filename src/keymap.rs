@@ -48,7 +48,7 @@ pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 51] = [
     ("s / S (in table tab)", "add a sort column (asc/desc/off) / clear all sorting"),
     ("Ctrl+B", "collapse / restore the explorer tree"),
     ("Ctrl+Space (in editor)", "ask for autocomplete suggestions"),
-    ("Tab / Esc (suggestions open)", "accept the highlighted suggestion / dismiss the list"),
+    ("Enter / Tab / Esc (suggestions open)", "accept the highlighted suggestion / dismiss the list"),
     ("Esc (while running)", "cancel the query in flight"),
     ("Ctrl+R", "reconnect after a dropped connection"),
     ("Ctrl+Shift+I", "import rows from a CSV file into the active table"),

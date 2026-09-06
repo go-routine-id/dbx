@@ -2546,6 +2546,13 @@ impl App {
                                         KeyCode::Enter
                                             if key.modifiers.contains(KeyModifiers::CONTROL)
                                                 || key.modifiers.contains(KeyModifiers::ALT) => {}
+                                        // While the list is up, Enter picks the
+                                        // highlighted suggestion the way every
+                                        // editor does — breaking the line here
+                                        // would throw the choice away.
+                                        KeyCode::Enter if !c.autocomplete.is_empty() => {
+                                            c.accept_autocomplete();
+                                        }
                                         KeyCode::Enter => {
                                             c.insert_newline();
                                             c.autocomplete.clear();
