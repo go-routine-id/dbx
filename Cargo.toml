@@ -23,9 +23,16 @@ toml = "1.1.4"
 dirs = "6.0.0"
 arboard = "3.6.1"
 ureq = { version = "2", default-features = false, features = ["tls"] }
+# ClickHouse speaks HTTP(S) through ureq; a hand-built rustls config is what
+# makes ssl_mode "require" (encrypt, skip verification) differ from "verify",
+# and what carries ssl_ca / ssl_cert / ssl_key. Same feature set as ureq's own
+# rustls dependency, so the crate is shared rather than duplicated.
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+webpki-roots = "0.26"
 rust_xlsxwriter = "0.99.0"
 tokio-util = { version = "0.7.19", features = ["compat"] }
 tiberius = { version = "0.12.3", features = ["chrono"] }
 # mongo — default features: rustls TLS (no OpenSSL system dep), DNS resolver, bson 2.x re-exported as mongodb::bson
 mongodb = "3.9"
-redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager"] }
+redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tokio-rustls-comp", "tls-rustls-insecure"] }

@@ -28,9 +28,33 @@ use super::{
     Capabilities, Collection, CollectionMeta, CollectionRef, ColumnMeta, Driver, DriverInfo,
     Namespace, Page, QueryResult, Record, RecordPage, Value,
 };
-use crate::config::ConnectionConfig;
+use crate::config::{ConnectionConfig, SslMode};
 
 type ConnManager = ::redis::aio::ConnectionManager;
+
+/// Read the PEM files named by the connection's SSL fields. Returns `None`
+/// when nothing custom is configured, so the system trust store is used.
+fn read_tls_pem(cfg: &ConnectionConfig) -> Result<Option<TlsPem>> {
+    let read = |path: &str, what: &str| -> Result<Vec<u8>> {
+        std::fs::read(path).with_context(|| format!("failed to read {what} '{path}'"))
+    };
+    let root_cert = cfg
+        .ssl_ca
+        .as_deref()
+        .filter(|p| !p.trim().is_empty())
+        .map(|p| read(p, "ssl_ca"))
+        .transpose()?;
+    // `ssl_cert` and `ssl_key` are validated as a pair by the config layer;
+    // re-check here so a driver-level caller can't skip that.
+    let client = match (cfg.ssl_cert.as_deref(), cfg.ssl_key.as_deref()) {
+        (Some(cert), Some(key)) if !cert.trim().is_empty() && !key.trim().is_empty() => {
+            Some((read(cert, "ssl_cert")?, read(key, "ssl_key")?))
+        }
+        (None, None) => None,
+        _ => anyhow::bail!("ssl_cert and ssl_key must be set together"),
+    };
+    Ok((root_cert.is_some() || client.is_some()).then_some(TlsPem { root_cert, client }))
+}
 
 /// Name of the synthetic collection holding keys with no `:` prefix.
 pub(crate) const ROOT_COLLECTION: &str = "(root)";
@@ -241,9 +265,22 @@ pub struct RedisDriver {
     /// Connection parameters with the db index zeroed; each cached manager
     /// gets a copy with its own db filled in.
     base: ::redis::ConnectionInfo,
+    /// PEM material for a TLS connection, read once at connect time. `None`
+    /// means "use the system trust store" (or plaintext, per `base.addr`).
+    tls_certs: Option<TlsPem>,
     /// One manager per logical database, created on first touch.
     managers: tokio::sync::Mutex<HashMap<i64, ConnManager>>,
     info: DriverInfo,
+}
+
+/// Custom PEM material for a TLS connection. Kept as bytes rather than a
+/// built client because `redis::Client` is created per logical database.
+#[derive(Clone, Debug)]
+struct TlsPem {
+    /// CA to trust instead of the system store.
+    root_cert: Option<Vec<u8>>,
+    /// Client certificate + key for mTLS.
+    client: Option<(Vec<u8>, Vec<u8>)>,
 }
 
 impl RedisDriver {
@@ -257,11 +294,35 @@ impl RedisDriver {
             .parse()
             .context("Redis 'database' field must be a numeric db index (e.g. \"0\")")?;
 
+        let port = cfg.port.unwrap_or_else(|| cfg.driver.default_port());
+        // `rediss://` in config terms: ssl_mode decides the transport.
+        // Require = encrypted but the certificate is not checked (self-signed
+        // servers); Verify = encrypted AND the certificate must validate.
+        let addr = match cfg.effective_ssl_mode() {
+            None | Some(SslMode::Disable) => ::redis::ConnectionAddr::Tcp(cfg.host.clone(), port),
+            Some(mode) => ::redis::ConnectionAddr::TcpTls {
+                host: cfg.host.clone(),
+                port,
+                insecure: mode == SslMode::Require,
+                tls_params: None,
+            },
+        };
+        let tls_certs = if matches!(addr, ::redis::ConnectionAddr::TcpTls { .. }) {
+            read_tls_pem(cfg)?
+        } else {
+            // Certificate paths on a plaintext connection are a config
+            // mistake worth surfacing, not silently ignoring.
+            if cfg.ssl_ca.is_some() || cfg.ssl_cert.is_some() {
+                anyhow::bail!(
+                    "ssl_ca / ssl_cert are set but ssl_mode is not 'require' or 'verify' — \
+                     Redis would connect in plaintext"
+                );
+            }
+            None
+        };
+
         let base = ::redis::ConnectionInfo {
-            addr: ::redis::ConnectionAddr::Tcp(
-                cfg.host.clone(),
-                cfg.port.unwrap_or_else(|| cfg.driver.default_port()),
-            ),
+            addr,
             redis: ::redis::RedisConnectionInfo {
                 db,
                 // `user` doubles as the ACL username (Redis 6+); empty means
@@ -274,7 +335,7 @@ impl RedisDriver {
             },
         };
 
-        let manager = Self::open_manager(&base, db).await?;
+        let manager = Self::open_manager(&base, tls_certs.as_ref(), db).await?;
 
         // Server version for the header; unknown is fine (INFO may be
         // renamed away on hardened servers).
@@ -296,6 +357,7 @@ impl RedisDriver {
 
         Ok(Self {
             base,
+            tls_certs,
             managers: tokio::sync::Mutex::new(managers),
             info: DriverInfo {
                 name: "Redis".to_string(),
@@ -305,11 +367,32 @@ impl RedisDriver {
         })
     }
 
-    async fn open_manager(base: &::redis::ConnectionInfo, db: i64) -> Result<ConnManager> {
+    async fn open_manager(
+        base: &::redis::ConnectionInfo,
+        tls_certs: Option<&TlsPem>,
+        db: i64,
+    ) -> Result<ConnManager> {
         let mut info = base.clone();
         info.redis.db = db;
-        let client = ::redis::Client::open(info)
-            .context("invalid Redis connection parameters")?;
+        let client = match tls_certs {
+            // A custom CA or client certificate needs the TLS-aware builder;
+            // `Client::open` would fall back to the system trust store and
+            // send no client certificate at all.
+            Some(pem) => ::redis::Client::build_with_tls(
+                info,
+                ::redis::TlsCertificates {
+                    client_tls: pem.client.as_ref().map(|(cert, key)| {
+                        ::redis::ClientTlsConfig {
+                            client_cert: cert.clone(),
+                            client_key: key.clone(),
+                        }
+                    }),
+                    root_cert: pem.root_cert.clone(),
+                },
+            )
+            .context("invalid Redis TLS material (ssl_ca / ssl_cert / ssl_key)")?,
+            None => ::redis::Client::open(info).context("invalid Redis connection parameters")?,
+        };
         ConnManager::new(client)
             .await
             .with_context(|| format!("failed to connect to Redis (db{db})"))
@@ -321,7 +404,7 @@ impl RedisDriver {
         if let Some(m) = guard.get(&db) {
             return Ok(m.clone());
         }
-        let m = Self::open_manager(&self.base, db).await?;
+        let m = Self::open_manager(&self.base, self.tls_certs.as_ref(), db).await?;
         guard.insert(db, m.clone());
         Ok(m)
     }
@@ -488,6 +571,10 @@ impl Driver for RedisDriver {
         // No EDIT_DATA / DDL / ERD: writing is done through the command
         // console (execute), and key prefixes have no schema to diagram.
         Capabilities::BROWSE | Capabilities::QUERY_TEXT | Capabilities::PROCESS_LIST
+    }
+
+    fn console_dialect(&self) -> crate::driver::ConsoleDialect {
+        crate::driver::ConsoleDialect::RedisCommand
     }
 
     async fn ping(&self) -> Result<Duration> {
@@ -1062,5 +1149,93 @@ mod tests {
         assert_eq!(parse_db(&Namespace("db0".into())).unwrap(), 0);
         assert_eq!(parse_db(&Namespace("7".into())).unwrap(), 7);
         assert!(parse_db(&Namespace("main".into())).is_err());
+    }
+    // --- TLS material -------------------------------------------------
+
+    fn tls_cfg(
+        mode: Option<SslMode>,
+        ca: Option<&str>,
+        cert: Option<&str>,
+        key: Option<&str>,
+    ) -> ConnectionConfig {
+        ConnectionConfig {
+            name: "t".to_string(),
+            driver: crate::config::DriverType::Redis,
+            host: "redis.local".to_string(),
+            port: None,
+            user: None,
+            password: None,
+            database: None,
+            socket: None,
+            ssl: false,
+            ssl_mode: mode,
+            ssl_ca: ca.map(str::to_string),
+            ssl_cert: cert.map(str::to_string),
+            ssl_key: key.map(str::to_string),
+            ssh: None,
+        }
+    }
+
+    #[test]
+    fn test_no_tls_fields_means_system_trust() {
+        assert!(
+            read_tls_pem(&tls_cfg(Some(SslMode::Verify), None, None, None))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_tls_pem_is_read_from_disk() {
+        let dir = std::env::temp_dir();
+        let ca = dir.join("dbx-redis-test-ca.pem");
+        let cert = dir.join("dbx-redis-test-cert.pem");
+        let key = dir.join("dbx-redis-test-key.pem");
+        std::fs::write(&ca, b"-- ca --").unwrap();
+        std::fs::write(&cert, b"-- cert --").unwrap();
+        std::fs::write(&key, b"-- key --").unwrap();
+
+        let pem = read_tls_pem(&tls_cfg(
+            Some(SslMode::Verify),
+            ca.to_str(),
+            cert.to_str(),
+            key.to_str(),
+        ))
+        .unwrap()
+        .expect("configured certificates must be loaded");
+        assert_eq!(pem.root_cert.as_deref(), Some(&b"-- ca --"[..]));
+        let (c, k) = pem.client.unwrap();
+        assert_eq!(c, b"-- cert --");
+        assert_eq!(k, b"-- key --");
+
+        for p in [ca, cert, key] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn test_client_certificate_needs_both_halves() {
+        let err = read_tls_pem(&tls_cfg(
+            Some(SslMode::Verify),
+            None,
+            Some("/only/cert.pem"),
+            None,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("must be set together"), "got {err}");
+    }
+
+    #[test]
+    fn test_missing_certificate_file_is_reported() {
+        let err = read_tls_pem(&tls_cfg(
+            Some(SslMode::Verify),
+            Some("/no/such/ca.pem"),
+            None,
+            None,
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ssl_ca"), "got {err}");
     }
 }

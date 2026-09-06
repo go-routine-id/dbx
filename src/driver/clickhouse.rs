@@ -27,10 +27,146 @@ use super::{
 use crate::config::{ConnectionConfig, SslMode};
 
 /// ClickHouse's plain HTTP port. 8443 is the conventional HTTPS port; the
-/// scheme is inferred from `ssl`/`ssl_mode`, falling back to TLS when the
-/// port is 8443 and nothing explicit is configured.
+/// scheme comes from `ssl`/`ssl_mode`, falling back to TLS (verified) when
+/// the port is 8443 and nothing explicit is configured.
 const DEFAULT_PORT: u16 = 8123;
 const TLS_PORT: u16 = 8443;
+
+/// Build the rustls config behind the HTTPS agent.
+///
+/// This is what makes the two encrypted modes actually differ: `Verify`
+/// validates the server certificate against the system roots (or `ssl_ca`),
+/// while `Require` encrypts but accepts any certificate — the mode you need
+/// for a self-signed internal ClickHouse. `ssl_cert` + `ssl_key` add mTLS in
+/// both. ureq's stock agent always verified, so `Require` silently behaved
+/// like `Verify` and refused those servers.
+fn build_tls_config(cfg: &ConnectionConfig, mode: SslMode) -> Result<rustls::ClientConfig> {
+    let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
+        .with_safe_default_protocol_versions()
+        .context("rustls: no usable TLS protocol versions")?;
+
+    let client_auth = read_client_identity(cfg)?;
+
+    let builder = match mode {
+        SslMode::Verify => {
+            let mut roots = rustls::RootCertStore::empty();
+            match cfg.ssl_ca.as_deref().filter(|p| !p.trim().is_empty()) {
+                Some(path) => {
+                    for cert in read_certs(path, "ssl_ca")? {
+                        roots
+                            .add(cert)
+                            .with_context(|| format!("ssl_ca '{path}' is not a valid CA"))?;
+                    }
+                }
+                None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+            }
+            builder.with_root_certificates(roots)
+        }
+        // `Require` = encrypt, don't judge the certificate.
+        SslMode::Require => builder
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(AcceptAnyServerCert(provider))),
+        SslMode::Disable => unreachable!("build_tls_config is only called with TLS on"),
+    };
+
+    match client_auth {
+        Some((chain, key)) => builder
+            .with_client_auth_cert(chain, key)
+            .context("invalid client certificate / key (ssl_cert, ssl_key)"),
+        None => Ok(builder.with_no_client_auth()),
+    }
+}
+
+/// Read `ssl_cert` + `ssl_key` as an mTLS identity. They are a pair: one
+/// without the other is a config error, not a half-configured connection.
+#[allow(clippy::type_complexity)]
+fn read_client_identity(
+    cfg: &ConnectionConfig,
+) -> Result<
+    Option<(
+        Vec<rustls::pki_types::CertificateDer<'static>>,
+        rustls::pki_types::PrivateKeyDer<'static>,
+    )>,
+> {
+    let cert = cfg.ssl_cert.as_deref().filter(|p| !p.trim().is_empty());
+    let key = cfg.ssl_key.as_deref().filter(|p| !p.trim().is_empty());
+    let (cert, key) = match (cert, key) {
+        (Some(c), Some(k)) => (c, k),
+        (None, None) => return Ok(None),
+        _ => anyhow::bail!("ssl_cert and ssl_key must be set together"),
+    };
+    let chain = read_certs(cert, "ssl_cert")?;
+    if chain.is_empty() {
+        anyhow::bail!("ssl_cert '{cert}' holds no certificate");
+    }
+    let key_der = rustls_pemfile::private_key(&mut std::io::BufReader::new(
+        std::fs::File::open(key).with_context(|| format!("failed to read ssl_key '{key}'"))?,
+    ))
+    .with_context(|| format!("failed to parse ssl_key '{key}'"))?
+    .ok_or_else(|| anyhow!("ssl_key '{key}' holds no private key"))?;
+    Ok(Some((chain, key_der)))
+}
+
+/// Read every certificate in a PEM file.
+fn read_certs(path: &str, what: &str) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>> {
+    let file = std::fs::File::open(path)
+        .with_context(|| format!("failed to read {what} '{path}'"))?;
+    rustls_pemfile::certs(&mut std::io::BufReader::new(file))
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to parse {what} '{path}'"))
+}
+
+/// Certificate verifier for `ssl_mode = "require"`: the connection is still
+/// encrypted, but the server's identity is not checked. Signature checking
+/// stays real — only the chain/name validation is skipped.
+#[derive(Debug)]
+struct AcceptAnyServerCert(std::sync::Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCert {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> std::result::Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> std::result::Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.0.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
 
 /// The built-in account ClickHouse ships with; used when the config leaves
 /// `user` empty (mirrors the CLI's own default).
@@ -213,19 +349,31 @@ impl ClickHouseDriver {
         // TLS when explicitly required/verified; when unset, the 8443
         // convention decides. ureq always verifies certificates when TLS is
         // on (rustls + webpki roots), so Require and Verify behave alike.
-        let use_tls = match cfg.effective_ssl_mode() {
-            Some(SslMode::Disable) => false,
-            Some(_) => true,
-            None => port == TLS_PORT,
+        let mode = match cfg.effective_ssl_mode() {
+            Some(m) => m,
+            // Unset: the 8443 convention decides, and an unconfigured TLS
+            // connection verifies (the safe default).
+            None if port == TLS_PORT => SslMode::Verify,
+            None => SslMode::Disable,
         };
+        let use_tls = mode != SslMode::Disable;
         let scheme = if use_tls { "https" } else { "http" };
         let base_url = format!("{scheme}://{}:{port}", cfg.host);
 
-        let agent = ureq::AgentBuilder::new()
-            .timeout_connect(Duration::from_secs(10))
-            // No overall timeout: analytics queries legitimately run for
-            // minutes and ureq's `timeout` would abort them mid-flight.
-            .build();
+        let mut builder = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10));
+        // No overall timeout: analytics queries legitimately run for
+        // minutes and ureq's `timeout` would abort them mid-flight.
+        if use_tls {
+            builder = builder.tls_config(std::sync::Arc::new(build_tls_config(cfg, mode)?));
+        } else if cfg.ssl_ca.is_some() || cfg.ssl_cert.is_some() {
+            // Certificates with TLS off is a config mistake worth surfacing.
+            anyhow::bail!(
+                "ssl_ca / ssl_cert are set but ssl_mode is 'disable' — \
+                 ClickHouse would connect over plain HTTP"
+            );
+        }
+        let agent = builder.build();
 
         let mut driver = Self {
             agent,
@@ -785,5 +933,76 @@ mod tests {
         assert_eq!(escape_ident("a`b"), "`a``b`");
         assert_eq!(escape_literal("o'clock"), "'o\\'clock'");
         assert_eq!(escape_literal("a\\b"), "'a\\\\b'");
+    }
+    /// A minimal ClickHouse config; only the TLS fields matter here.
+    fn tls_cfg(
+        ca: Option<&str>,
+        cert: Option<&str>,
+        key: Option<&str>,
+    ) -> crate::config::ConnectionConfig {
+        crate::config::ConnectionConfig {
+            name: "t".to_string(),
+            driver: crate::config::DriverType::ClickHouse,
+            host: "ch.local".to_string(),
+            port: None,
+            user: None,
+            password: None,
+            database: None,
+            socket: None,
+            ssl: false,
+            ssl_mode: None,
+            ssl_ca: ca.map(str::to_string),
+            ssl_cert: cert.map(str::to_string),
+            ssl_key: key.map(str::to_string),
+            ssh: None,
+        }
+    }
+
+    #[test]
+    fn test_require_and_verify_are_not_the_same_mode() {
+        // The whole point of the split: `verify` consults a trust anchor (so a
+        // missing CA file is fatal), `require` never looks at one.
+        let missing = std::env::temp_dir().join("dbx-clickhouse-no-such-ca.pem");
+        let cfg = tls_cfg(Some(missing.to_str().unwrap()), None, None);
+
+        let err = build_tls_config(&cfg, SslMode::Require)
+            .err()
+            .map(|e| e.to_string());
+        assert!(
+            err.is_none(),
+            "require must not read the CA at all, got {err:?}"
+        );
+        assert!(
+            build_tls_config(&cfg, SslMode::Verify).is_err(),
+            "verify must fail on an unreadable ssl_ca"
+        );
+    }
+
+    #[test]
+    fn test_verify_without_ca_uses_the_system_roots() {
+        assert!(build_tls_config(&tls_cfg(None, None, None), SslMode::Verify).is_ok());
+    }
+
+    #[test]
+    fn test_client_certificate_needs_both_halves() {
+        let err = build_tls_config(&tls_cfg(None, Some("/only/cert.pem"), None), SslMode::Verify)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be set together"), "got {err}");
+        let err = build_tls_config(&tls_cfg(None, None, Some("/only/key.pem")), SslMode::Verify)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("must be set together"), "got {err}");
+    }
+
+    #[test]
+    fn test_unreadable_client_certificate_is_reported() {
+        let err = build_tls_config(
+            &tls_cfg(None, Some("/no/such/cert.pem"), Some("/no/such/key.pem")),
+            SslMode::Require,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("ssl_cert"), "got {err}");
     }
 }

@@ -592,6 +592,43 @@ pub fn is_destructive_statement(query: &str) -> bool {
         .any(|s| is_destructive_stmt(strip_leading_comments(s)))
 }
 
+/// The destructive guard for a console, in the dialect its driver speaks.
+///
+/// Redis has no SQL keywords: `FLUSHALL` / `FLUSHDB` wipe a whole keyspace
+/// in one word, and ran straight through the SQL-shaped guard. MongoDB's
+/// console is read-only (find/aggregate), so nothing there can destroy data.
+pub fn is_destructive_for(dialect: crate::driver::ConsoleDialect, query: &str) -> bool {
+    use crate::driver::ConsoleDialect;
+    match dialect {
+        ConsoleDialect::Sql => is_destructive_statement(query),
+        ConsoleDialect::RedisCommand => {
+            crate::ui::screens::query::split_statements_for(dialect, query)
+                .iter()
+                .any(|s| is_destructive_redis_command(s))
+        }
+        ConsoleDialect::MongoJson => false,
+    }
+}
+
+/// Does a Redis command line wipe data wholesale? Only the keyspace-clearing
+/// verbs count — `DEL k` is targeted, the same way `DELETE … WHERE` is.
+pub fn is_destructive_redis_command(cmd: &str) -> bool {
+    let mut words = cmd.split_whitespace();
+    let verb = words.next().unwrap_or("").to_uppercase();
+    match verb.as_str() {
+        // Wipes the selected db / every db.
+        "FLUSHDB" | "FLUSHALL" => true,
+        // Stops the server; `NOSAVE` also throws away unsaved writes.
+        "SHUTDOWN" => true,
+        // `SCRIPT FLUSH` / `FUNCTION FLUSH` drop every stored script.
+        "SCRIPT" | "FUNCTION" => words
+            .next()
+            .map(|sub| sub.eq_ignore_ascii_case("FLUSH"))
+            .unwrap_or(false),
+        _ => false,
+    }
+}
+
 /// Is a single statement destructive (DROP / TRUNCATE / DELETE without WHERE
 /// / ALTER that drops something)?
 pub fn is_destructive_stmt(stmt: &str) -> bool {
@@ -1067,5 +1104,36 @@ mod tests {
         // Empty / whitespace → safe.
         assert!(!is_destructive_statement(""));
         assert!(!is_destructive_statement("   "));
+    }
+    #[test]
+    fn test_destructive_guard_is_dialect_aware() {
+        use crate::driver::ConsoleDialect::{MongoJson, RedisCommand, Sql};
+
+        // Redis wipes a keyspace in one word — the SQL guard never saw these.
+        assert!(is_destructive_for(RedisCommand, "FLUSHALL"));
+        assert!(is_destructive_for(RedisCommand, "flushdb"));
+        assert!(is_destructive_for(RedisCommand, "FLUSHDB ASYNC"));
+        assert!(is_destructive_for(RedisCommand, "SHUTDOWN NOSAVE"));
+        assert!(is_destructive_for(RedisCommand, "SCRIPT FLUSH"));
+        assert!(is_destructive_for(RedisCommand, "FUNCTION FLUSH"));
+        // A wipe anywhere in a multi-command script still trips the guard.
+        assert!(is_destructive_for(RedisCommand, "GET a\nFLUSHALL\nGET b"));
+
+        // Targeted commands stay unconfirmed, like `DELETE … WHERE`.
+        assert!(!is_destructive_for(RedisCommand, "DEL user:1"));
+        assert!(!is_destructive_for(RedisCommand, "SCRIPT LOAD 'return 1'"));
+        assert!(!is_destructive_for(RedisCommand, "GET flushall"));
+        assert!(!is_destructive_for(RedisCommand, ""));
+
+        // SQL keywords mean nothing to Redis and vice versa.
+        assert!(!is_destructive_for(RedisCommand, "DROP TABLE users"));
+        assert!(!is_destructive_for(Sql, "FLUSHALL"));
+        assert!(is_destructive_for(Sql, "DROP TABLE users"));
+
+        // The Mongo console is read-only (find/aggregate only).
+        assert!(!is_destructive_for(
+            MongoJson,
+            r#"{"collection": "users", "find": {}}"#
+        ));
     }
 }

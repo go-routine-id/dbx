@@ -149,6 +149,10 @@ impl Driver for MongoDriver {
         Capabilities::BROWSE | Capabilities::QUERY_TEXT
     }
 
+    fn console_dialect(&self) -> crate::driver::ConsoleDialect {
+        crate::driver::ConsoleDialect::MongoJson
+    }
+
     async fn ping(&self) -> Result<Duration> {
         let start = Instant::now();
         self.client

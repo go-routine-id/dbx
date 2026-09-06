@@ -191,12 +191,31 @@ impl Default for Page {
     }
 }
 
+/// What the console's text means, so the shared console can split it into
+/// statements and judge "destructive" the way the target server would.
+/// SQL is the default; the key-value and document drivers speak their own
+/// language and a `;` means nothing to them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsoleDialect {
+    /// `;`-separated statements (string/comment aware).
+    Sql,
+    /// One command per line, shell-quoted (`SET k "a;b"`).
+    RedisCommand,
+    /// One JSON object per command, whitespace-separated.
+    MongoJson,
+}
+
 /// Asynchronous, dyn-safe database driver trait.
 #[async_trait]
 pub trait Driver: Send + Sync {
     /// Identity and capabilities
     fn info(&self) -> DriverInfo;
     fn capabilities(&self) -> Capabilities;
+
+    /// How to read this driver's console text. SQL drivers keep the default.
+    fn console_dialect(&self) -> ConsoleDialect {
+        ConsoleDialect::Sql
+    }
 
     /// Health check
     async fn ping(&self) -> Result<Duration>;

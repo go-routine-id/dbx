@@ -3723,7 +3723,10 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             app.toasts.push(ToastKind::Info, "executing confirmed statement...".to_string());
                             // Execute each split statement (same as the console),
                             // so a confirmed destructive script runs all of it.
-                            let statements = crate::ui::screens::query::split_statements(&sql);
+                            let statements = crate::ui::screens::query::split_statements_for(
+                                drv_clone.console_dialect(),
+                                &sql,
+                            );
                             let mut affected = 0u64;
                             let mut exec_err: Option<String> = None;
                             for stmt in &statements {
@@ -5420,11 +5423,17 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                         // runs are retried: re-running a script would re-apply
                         // the statements that already committed before the
                         // connection dropped.
-                        let single_statement = crate::ui::screens::query::split_statements(&text)
-                            .into_iter()
-                            .filter(|s| !crate::ui::screens::query::is_comment_only(s))
-                            .count()
-                            == 1;
+                        let dialect = app
+                            .active_driver
+                            .as_ref()
+                            .map(|d| d.console_dialect())
+                            .unwrap_or(crate::driver::ConsoleDialect::Sql);
+                        let single_statement =
+                            crate::ui::screens::query::split_statements_for(dialect, &text)
+                                .into_iter()
+                                .filter(|s| !crate::ui::screens::query::is_comment_only(s))
+                                .count()
+                                == 1;
                         let retried = match &outcome {
                             Err(err) if !is_retry && single_statement && app.try_reconnect(err).await => {
                                 if let (Some(exp), Some(drv)) =

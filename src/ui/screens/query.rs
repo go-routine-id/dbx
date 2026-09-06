@@ -9,7 +9,7 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, Paragraph, Row as TableRow, Table, TableState,
 };
 
-use crate::driver::QueryResult;
+use crate::driver::{ConsoleDialect, QueryResult};
 use crate::theme::Theme;
 
 /// Smallest useful editor: borders plus a few lines of SQL.
@@ -642,6 +642,83 @@ pub fn split_statements(sql: &str) -> Vec<String> {
         }
         cur.push(c);
         i += c.len_utf8();
+    }
+    let tail = cur.trim();
+    if !tail.is_empty() {
+        stmts.push(tail.to_string());
+    }
+    stmts
+}
+
+/// Split console text into statements the way the target server reads it.
+///
+/// Only SQL uses `;`. Redis takes one command per line, and MongoDB one JSON
+/// object per command — feeding either through the SQL splitter merged a
+/// whole script into a single unparseable statement.
+pub fn split_statements_for(dialect: ConsoleDialect, text: &str) -> Vec<String> {
+    match dialect {
+        ConsoleDialect::Sql => split_statements(text),
+        ConsoleDialect::RedisCommand => split_command_lines(text),
+        ConsoleDialect::MongoJson => split_json_objects(text),
+    }
+}
+
+/// One Redis command per line. Blank lines and `#` comment lines are dropped;
+/// a trailing `;` (SQL muscle memory) is trimmed so `GET k;` still works.
+fn split_command_lines(text: &str) -> Vec<String> {
+    text.lines()
+        .map(|l| l.trim().trim_end_matches(';').trim())
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect()
+}
+
+/// Split a run of JSON objects into one statement each, tracking brace depth
+/// outside strings so `{"a": {"b": 1}}` stays whole and `{...} {...}` splits.
+/// Text outside any object (a stray token) is kept as its own statement so
+/// the driver reports the JSON error instead of it vanishing silently.
+fn split_json_objects(text: &str) -> Vec<String> {
+    let mut stmts = Vec::new();
+    let mut cur = String::new();
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for c in text.chars() {
+        if in_string {
+            cur.push(c);
+            if escaped {
+                escaped = false;
+            } else if c == '\\' {
+                escaped = true;
+            } else if c == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_string = true;
+                cur.push(c);
+            }
+            '{' => {
+                depth += 1;
+                cur.push(c);
+            }
+            '}' => {
+                depth = depth.saturating_sub(1);
+                cur.push(c);
+                if depth == 0 {
+                    let s = cur.trim();
+                    if !s.is_empty() {
+                        stmts.push(s.to_string());
+                    }
+                    cur.clear();
+                }
+            }
+            // A separator between two objects is noise, not content.
+            ';' if depth == 0 => {}
+            _ => cur.push(c),
+        }
     }
     let tail = cur.trim();
     if !tail.is_empty() {
@@ -1615,5 +1692,55 @@ mod tests {
         assert!(is_comment_only("/* just a note */"));
         assert!(!is_comment_only("/* note */ SELECT 1"));
     }
-}
+    #[test]
+    fn test_split_statements_for_redis_is_line_based() {
+        let out = split_statements_for(
+            ConsoleDialect::RedisCommand,
+            "# warm up\nSCAN 0 MATCH user:*\n\nGET user:1;\nSET k \"a;b\"",
+        );
+        assert_eq!(
+            out,
+            vec![
+                "SCAN 0 MATCH user:*".to_string(),
+                "GET user:1".to_string(),
+                // A `;` inside a value is data, not a separator.
+                "SET k \"a;b\"".to_string(),
+            ]
+        );
+    }
 
+    #[test]
+    fn test_split_statements_for_mongo_splits_json_objects() {
+        let out = split_statements_for(
+            ConsoleDialect::MongoJson,
+            "{\"collection\": \"users\", \"find\": {\"filter\": {\"age\": {\"$gte\": 18}}}}\n             {\"collection\": \"logs\", \"aggregate\": []}",
+        );
+        assert_eq!(out.len(), 2, "two commands, got {out:?}");
+        assert!(out[0].ends_with("}}}}"), "nested braces broken: {out:?}");
+        assert!(out[1].contains("\"logs\""));
+    }
+
+    #[test]
+    fn test_split_statements_for_mongo_keeps_braces_inside_strings() {
+        // A `}` or `;` inside a JSON string must not end the object.
+        let src = r#"{"collection": "u", "find": {"filter": {"note": "a} b; c"}}}"#;
+        assert_eq!(
+            split_statements_for(ConsoleDialect::MongoJson, src),
+            vec![src.to_string()]
+        );
+        // An escaped quote does not reopen the string either.
+        let esc = r#"{"collection": "u", "find": {"filter": {"q": "say \"hi\"}"}}}"#;
+        assert_eq!(
+            split_statements_for(ConsoleDialect::MongoJson, esc),
+            vec![esc.to_string()]
+        );
+    }
+
+    #[test]
+    fn test_split_statements_for_sql_is_unchanged() {
+        assert_eq!(
+            split_statements_for(ConsoleDialect::Sql, "SELECT 1; SELECT 2;"),
+            vec!["SELECT 1".to_string(), "SELECT 2".to_string()]
+        );
+    }
+}

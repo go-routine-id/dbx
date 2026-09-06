@@ -9,7 +9,7 @@ use std::time::Instant;
 
 use crate::config::AppConfig;
 use crate::driver::Page;
-use crate::sql::{is_destructive_statement, quote_ident};
+use crate::sql::{is_destructive_for, quote_ident};
 use ratatui::layout::Rect;
 
 use crate::ui::screens::explorer::{FocusedPane, TreeNodeKind, WorkspaceTab};
@@ -146,7 +146,8 @@ pub fn start_console_query(
     // Destructive statement guard: DROP / TRUNCATE / DELETE-without-WHERE must
     // be confirmed first. Reuses the SQL-confirm modal with a placeholder
     // collection — that path only needs the namespace.
-    if is_destructive_statement(&query_text) {
+    let dialect = drv.console_dialect();
+    if is_destructive_for(dialect, &query_text) {
         toasts.push(
             ToastKind::Warning,
             "destructive statement detected — confirm to execute".to_string(),
@@ -164,10 +165,11 @@ pub fn start_console_query(
 
     // Split on `;` and drop pure comments, so a script of only comments is
     // reported as empty rather than "succeeding" with nothing.
-    let statements: Vec<String> = crate::ui::screens::query::split_statements(&query_text)
-        .into_iter()
-        .filter(|s| !crate::ui::screens::query::is_comment_only(s))
-        .collect();
+    let statements: Vec<String> =
+        crate::ui::screens::query::split_statements_for(dialect, &query_text)
+            .into_iter()
+            .filter(|s| !crate::ui::screens::query::is_comment_only(s))
+            .collect();
 
     let tab = exp.active_tab_index;
     let Some(WorkspaceTab::Console(console)) = exp.active_tab_mut() else {
@@ -258,10 +260,11 @@ pub fn retry_console_query(
     active_ns: crate::driver::Namespace,
     use_tx: bool,
 ) {
-    let statements: Vec<String> = crate::ui::screens::query::split_statements(query_text)
-        .into_iter()
-        .filter(|s| !crate::ui::screens::query::is_comment_only(s))
-        .collect();
+    let statements: Vec<String> =
+        crate::ui::screens::query::split_statements_for(drv.console_dialect(), query_text)
+            .into_iter()
+            .filter(|s| !crate::ui::screens::query::is_comment_only(s))
+            .collect();
     if statements.is_empty() {
         return;
     }

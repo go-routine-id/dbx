@@ -110,7 +110,7 @@ binary lives in a root-owned directory, re-run it with `sudo`. Your config
 | ✅ | Per-node context menu in the explorer tree (`Ctrl+O`) |
 | ✅ | Create Table / Create Database forms with live SQL preview — type-aware per driver |
 | ✅ | Grid column resize (`<` / `>`, or Alt+drag the header separator) + multi-column sort stack |
-| ✅ | mTLS client certificates for MySQL / PostgreSQL (`ssl_ca` / `ssl_cert` / `ssl_key`) |
+| ✅ | mTLS client certificates for MySQL / PostgreSQL / Redis / ClickHouse (`ssl_ca` / `ssl_cert` / `ssl_key`) |
 | ✅ | ClickHouse, MongoDB and Redis drivers (see driver table below) |
 | ✅ | Create table (column form with live SQL preview, `a` → table) and create database (`N` on a database node) |
 
@@ -152,13 +152,18 @@ run against the selected database:
 
 Extended values: `{"$oid": "<24-hex>"}` for ObjectId, `{"$date": "<rfc3339>"}`
 for BSON dates. v1 is read-only (find/aggregate, hard cap 1000 rows).
+Commands are separated by object boundaries, not `;` — several objects in one
+console run as several commands.
 
 ### Redis console
 
 The console on a Redis connection accepts raw commands (`SCAN 0 MATCH user:*`,
 `HGETALL user:1`, `INFO`, `SLOWLOG GET 10`) with shell-style quoting; replies
-render in the result grid. The explorer groups keys into collections by their
-first `:` prefix.
+render in the result grid. **One command per line** — a `;` is data, not a
+separator — and `#` starts a comment line. Keyspace-clearing commands
+(`FLUSHDB`, `FLUSHALL`, `SCRIPT FLUSH`, `FUNCTION FLUSH`, `SHUTDOWN`) go
+through the same confirm dialog as `DROP` / `TRUNCATE` do in SQL. The explorer
+groups keys into collections by their first `:` prefix.
 
 All SQL is built through a generic helper layer (`quote_ident`,
 `single_row_suffix`, `render_*`, `build_where_for_row`, `build_insert_sql`)
@@ -256,9 +261,21 @@ ssl_cert = "/etc/dbx/certs/client.pem"
 ssl_key = "/etc/dbx/certs/client-key.pem"
 ```
 
-Supported by the MySQL and PostgreSQL drivers. SQL Server (tiberius) has no
-client-certificate API in the pinned driver version, so these fields are
-ignored there.
+Supported by the MySQL, PostgreSQL, Redis and ClickHouse drivers. SQL Server
+(tiberius) has no client-certificate API in the pinned driver version, so
+these fields are ignored there.
+
+`ssl_mode` decides the transport for every driver that reads it:
+
+| `ssl_mode` | Meaning |
+|---|---|
+| `disable` | Plaintext. Setting `ssl_ca` / `ssl_cert` alongside it is rejected rather than silently ignored |
+| `require` | Encrypted, server certificate **not** verified — for self-signed internal servers |
+| `verify` | Encrypted and the server certificate must validate against `ssl_ca` (or the system trust store) |
+
+Redis connects over TLS (`rediss://` in URL terms) as soon as `ssl_mode` is
+`require` or `verify`. ClickHouse defaults to `verify` when the port is 8443
+and nothing is configured.
 
 Environment variables:
 
