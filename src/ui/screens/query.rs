@@ -663,14 +663,51 @@ pub fn split_statements_for(dialect: ConsoleDialect, text: &str) -> Vec<String> 
     }
 }
 
-/// One Redis command per line. Blank lines and `#` comment lines are dropped;
-/// a trailing `;` (SQL muscle memory) is trimmed so `GET k;` still works.
+/// One Redis command per line, quote-aware: a newline inside an open quote
+/// belongs to the argument, so a multi-line `EVAL "…lua…" 1 k` stays one
+/// command. Blank lines and `#` comment lines are dropped.
+///
+/// Nothing is trimmed off the ends of a command: a `;` is part of the value
+/// (`SET k a;b;c;` stores the trailing delimiter), matching the quoting rules
+/// `parse_command_line` applies next.
 fn split_command_lines(text: &str) -> Vec<String> {
-    text.lines()
-        .map(|l| l.trim().trim_end_matches(';').trim())
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .map(str::to_string)
-        .collect()
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut quote: Option<char> = None;
+    let mut chars = text.chars().peekable();
+
+    let push = |cur: &mut String, out: &mut Vec<String>| {
+        let line = cur.trim();
+        if !line.is_empty() && !line.starts_with('#') {
+            out.push(line.to_string());
+        }
+        cur.clear();
+    };
+
+    while let Some(c) = chars.next() {
+        match c {
+            // A backslash escapes the next character (including a newline)
+            // wherever `parse_command_line` would honour it.
+            '\\' if quote != Some('\'') => {
+                cur.push(c);
+                if let Some(next) = chars.next() {
+                    cur.push(next);
+                }
+            }
+            '\'' | '"' if quote.is_none() => {
+                quote = Some(c);
+                cur.push(c);
+            }
+            _ if Some(c) == quote => {
+                quote = None;
+                cur.push(c);
+            }
+            '\n' if quote.is_none() => push(&mut cur, &mut out),
+            _ => cur.push(c),
+        }
+    }
+    push(&mut cur, &mut out);
+    out
 }
 
 /// Split a run of JSON objects into one statement each, tracking brace depth
@@ -1696,17 +1733,39 @@ mod tests {
     fn test_split_statements_for_redis_is_line_based() {
         let out = split_statements_for(
             ConsoleDialect::RedisCommand,
-            "# warm up\nSCAN 0 MATCH user:*\n\nGET user:1;\nSET k \"a;b\"",
+            "# warm up\nSCAN 0 MATCH user:*\n\nSET k \"a;b\"\nSET csv a;b;c;",
         );
         assert_eq!(
             out,
             vec![
                 "SCAN 0 MATCH user:*".to_string(),
-                "GET user:1".to_string(),
-                // A `;` inside a value is data, not a separator.
+                // A `;` is data, not a separator — quoted or not, and a
+                // trailing one is part of the value.
                 "SET k \"a;b\"".to_string(),
+                "SET csv a;b;c;".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn test_split_statements_for_redis_keeps_multiline_quoted_arguments() {
+        // A Lua script spans lines; cutting on the raw newline would hand
+        // `EVAL "` to the driver and abort the whole run.
+        let script = "EVAL \"\n  return redis.call('GET', KEYS[1])\n\" 1 mykey\nGET other";
+        let out = split_statements_for(ConsoleDialect::RedisCommand, script);
+        assert_eq!(out.len(), 2, "got {out:?}");
+        assert!(out[0].starts_with("EVAL \""), "got {out:?}");
+        assert!(out[0].ends_with("1 mykey"), "got {out:?}");
+        assert_eq!(out[1], "GET other");
+    }
+
+    #[test]
+    fn test_split_statements_for_redis_honours_escapes() {
+        // A backslash-escaped newline keeps the command together, and an
+        // escaped quote does not open a quoted run.
+        let out = split_statements_for(ConsoleDialect::RedisCommand, "SET k a\\\nb\nGET k");
+        assert_eq!(out.len(), 2, "got {out:?}");
+        assert_eq!(out[1], "GET k");
     }
 
     #[test]

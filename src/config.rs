@@ -144,8 +144,25 @@ fn default_ssh_port() -> u16 {
 impl ConnectionConfig {
     /// Effective SSL mode: an explicit `ssl_mode` wins; otherwise the legacy
     /// `ssl: true` boolean maps to `Require`; otherwise `None` (driver default).
+    ///
+    /// Only for drivers where `Require` still validates the server (sqlx's
+    /// MySQL/PostgreSQL, which have read the boolean this way since v0.1).
+    /// A driver whose `Require` turns verification OFF must use
+    /// [`Self::effective_ssl_mode_with_legacy`] instead.
     pub fn effective_ssl_mode(&self) -> Option<SslMode> {
-        self.ssl_mode.or_else(|| self.ssl.then_some(SslMode::Require))
+        self.effective_ssl_mode_with_legacy(SslMode::Require)
+    }
+
+    /// Effective SSL mode, choosing what the legacy `ssl: true` boolean means
+    /// for this driver.
+    ///
+    /// The boolean predates the require/verify split and says only "use TLS",
+    /// so a driver that reads `Require` as "encrypt but accept any
+    /// certificate" must pass `SslMode::Verify` here: silently downgrading an
+    /// existing `ssl = true` config to accept-any is a security regression the
+    /// user never asked for. An explicit `ssl_mode` always wins.
+    pub fn effective_ssl_mode_with_legacy(&self, legacy_bool: SslMode) -> Option<SslMode> {
+        self.ssl_mode.or_else(|| self.ssl.then_some(legacy_bool))
     }
 
     /// The mTLS client identity as a `(cert_path, key_path)` pair, or `None`

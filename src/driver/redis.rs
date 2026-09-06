@@ -35,25 +35,66 @@ type ConnManager = ::redis::aio::ConnectionManager;
 /// Read the PEM files named by the connection's SSL fields. Returns `None`
 /// when nothing custom is configured, so the system trust store is used.
 fn read_tls_pem(cfg: &ConnectionConfig) -> Result<Option<TlsPem>> {
-    let read = |path: &str, what: &str| -> Result<Vec<u8>> {
-        std::fs::read(path).with_context(|| format!("failed to read {what} '{path}'"))
-    };
-    let root_cert = cfg
-        .ssl_ca
-        .as_deref()
-        .filter(|p| !p.trim().is_empty())
-        .map(|p| read(p, "ssl_ca"))
+    let root_cert = path_of(&cfg.ssl_ca)
+        .map(|p| read_pem_certs(p, "ssl_ca"))
         .transpose()?;
     // `ssl_cert` and `ssl_key` are validated as a pair by the config layer;
-    // re-check here so a driver-level caller can't skip that.
-    let client = match (cfg.ssl_cert.as_deref(), cfg.ssl_key.as_deref()) {
-        (Some(cert), Some(key)) if !cert.trim().is_empty() && !key.trim().is_empty() => {
-            Some((read(cert, "ssl_cert")?, read(key, "ssl_key")?))
-        }
+    // re-check here so a driver-level caller can't skip that. Empty strings
+    // are unset, so a templated `ssl_cert = ""` is not a half-configured pair.
+    let client = match (path_of(&cfg.ssl_cert), path_of(&cfg.ssl_key)) {
+        (Some(cert), Some(key)) => Some((
+            read_pem_certs(cert, "ssl_cert")?,
+            read_pem_key(key, "ssl_key")?,
+        )),
         (None, None) => None,
         _ => anyhow::bail!("ssl_cert and ssl_key must be set together"),
     };
     Ok((root_cert.is_some() || client.is_some()).then_some(TlsPem { root_cert, client }))
+}
+
+/// A configured path, treating an empty/whitespace string as unset.
+fn path_of(field: &Option<String>) -> Option<&str> {
+    field.as_deref().map(str::trim).filter(|p| !p.is_empty())
+}
+
+/// Is any TLS PEM path configured?
+fn has_tls_material(cfg: &ConnectionConfig) -> bool {
+    path_of(&cfg.ssl_ca).is_some()
+        || path_of(&cfg.ssl_cert).is_some()
+        || path_of(&cfg.ssl_key).is_some()
+}
+
+/// Read a PEM file and check it really holds certificates before handing the
+/// bytes to redis-rs.
+///
+/// redis-rs turns an unparseable CA into an EMPTY root store that *replaces*
+/// the OS trust store, so a DER `.crt` or a truncated download would fail
+/// every handshake with a generic "UnknownIssuer" that names neither the
+/// setting nor the file.
+fn read_pem_certs(path: &str, what: &str) -> Result<Vec<u8>> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {what} '{path}'"))?;
+    let count = rustls_pemfile::certs(&mut bytes.as_slice())
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed to parse {what} '{path}'"))?
+        .len();
+    if count == 0 {
+        anyhow::bail!(
+            "{what} '{path}' holds no PEM certificate — a DER (.crt) or key-only file \
+             will not work"
+        );
+    }
+    Ok(bytes)
+}
+
+/// Read a PEM private key, checking it parses for the same reason.
+fn read_pem_key(path: &str, what: &str) -> Result<Vec<u8>> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("failed to read {what} '{path}'"))?;
+    rustls_pemfile::private_key(&mut bytes.as_slice())
+        .with_context(|| format!("failed to parse {what} '{path}'"))?
+        .ok_or_else(|| anyhow!("{what} '{path}' holds no PEM private key"))?;
+    Ok(bytes)
 }
 
 /// Name of the synthetic collection holding keys with no `:` prefix.
@@ -298,7 +339,10 @@ impl RedisDriver {
         // `rediss://` in config terms: ssl_mode decides the transport.
         // Require = encrypted but the certificate is not checked (self-signed
         // servers); Verify = encrypted AND the certificate must validate.
-        let addr = match cfg.effective_ssl_mode() {
+        // `Require` skips certificate verification, so the legacy `ssl = true`
+        // boolean (which predates the require/verify split) is read as
+        // `Verify` — never silently downgraded to accept-any.
+        let addr = match cfg.effective_ssl_mode_with_legacy(SslMode::Verify) {
             None | Some(SslMode::Disable) => ::redis::ConnectionAddr::Tcp(cfg.host.clone(), port),
             Some(mode) => ::redis::ConnectionAddr::TcpTls {
                 host: cfg.host.clone(),
@@ -312,10 +356,11 @@ impl RedisDriver {
         } else {
             // Certificate paths on a plaintext connection are a config
             // mistake worth surfacing, not silently ignoring.
-            if cfg.ssl_ca.is_some() || cfg.ssl_cert.is_some() {
+            if has_tls_material(cfg) {
                 anyhow::bail!(
-                    "ssl_ca / ssl_cert are set but ssl_mode is not 'require' or 'verify' — \
-                     Redis would connect in plaintext"
+                    "ssl_ca / ssl_cert / ssl_key are set but TLS is off for this connection — \
+                     set ssl_mode = \"verify\" (or \"require\"), or remove them; \
+                     Redis would otherwise connect in plaintext"
                 );
             }
             None
@@ -393,9 +438,19 @@ impl RedisDriver {
             .context("invalid Redis TLS material (ssl_ca / ssl_cert / ssl_key)")?,
             None => ::redis::Client::open(info).context("invalid Redis connection parameters")?,
         };
-        ConnManager::new(client)
-            .await
-            .with_context(|| format!("failed to connect to Redis (db{db})"))
+        let tls = matches!(base.addr, ::redis::ConnectionAddr::TcpTls { .. });
+        ConnManager::new(client).await.map_err(|e| {
+            let hint = if tls {
+                // Redis ignored `ssl` / `ssl_mode` before 0.5.2, so an entry
+                // that carried them has just started speaking TLS. Say so:
+                // the raw rustls error looks like a server fault.
+                "\nthis connection uses TLS (ssl_mode / ssl = true); \
+                 remove those fields if the server speaks plain Redis"
+            } else {
+                ""
+            };
+            anyhow!("failed to connect to Redis (db{db}): {e}{hint}")
+        })
     }
 
     /// Manager for a logical database, opening and caching it on demand.
@@ -1185,15 +1240,34 @@ mod tests {
         );
     }
 
+    /// Minimal but genuinely parseable PEM: rustls-pemfile base64-decodes the
+    /// body without parsing X.509, which is exactly the layer we validate.
+    const PEM_CERT: &str = "-----BEGIN CERTIFICATE-----\nAQID\n-----END CERTIFICATE-----\n";
+    const PEM_KEY: &str = "-----BEGIN PRIVATE KEY-----\nAQID\n-----END PRIVATE KEY-----\n";
+
+    /// A private scratch directory, so parallel runs (this repo is worked in
+    /// several worktrees sharing one $TMPDIR) can't collide on file names.
+    fn scratch(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "dbx-redis-tls-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn test_tls_pem_is_read_from_disk() {
-        let dir = std::env::temp_dir();
-        let ca = dir.join("dbx-redis-test-ca.pem");
-        let cert = dir.join("dbx-redis-test-cert.pem");
-        let key = dir.join("dbx-redis-test-key.pem");
-        std::fs::write(&ca, b"-- ca --").unwrap();
-        std::fs::write(&cert, b"-- cert --").unwrap();
-        std::fs::write(&key, b"-- key --").unwrap();
+        let dir = scratch("read");
+        let (ca, cert, key) = (
+            dir.join("ca.pem"),
+            dir.join("cert.pem"),
+            dir.join("key.pem"),
+        );
+        std::fs::write(&ca, PEM_CERT).unwrap();
+        std::fs::write(&cert, PEM_CERT).unwrap();
+        std::fs::write(&key, PEM_KEY).unwrap();
 
         let pem = read_tls_pem(&tls_cfg(
             Some(SslMode::Verify),
@@ -1203,14 +1277,61 @@ mod tests {
         ))
         .unwrap()
         .expect("configured certificates must be loaded");
-        assert_eq!(pem.root_cert.as_deref(), Some(&b"-- ca --"[..]));
+        assert_eq!(pem.root_cert.as_deref(), Some(PEM_CERT.as_bytes()));
         let (c, k) = pem.client.unwrap();
-        assert_eq!(c, b"-- cert --");
-        assert_eq!(k, b"-- key --");
+        assert_eq!(c, PEM_CERT.as_bytes());
+        assert_eq!(k, PEM_KEY.as_bytes());
 
-        for p in [ca, cert, key] {
-            let _ = std::fs::remove_file(p);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_unparseable_ca_is_rejected_rather_than_emptying_the_trust_store() {
+        // redis-rs turns a CA it cannot parse into an EMPTY root store that
+        // REPLACES the OS trust store, failing every handshake with a generic
+        // "UnknownIssuer". Catch it here, where the file name can be named.
+        let dir = scratch("badca");
+        for (name, body) in [("der.crt", "\x30\x0dnot-pem-at-all"), ("keyonly.pem", PEM_KEY)] {
+            let path = dir.join(name);
+            std::fs::write(&path, body).unwrap();
+            let err = read_tls_pem(&tls_cfg(Some(SslMode::Verify), path.to_str(), None, None))
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("no PEM certificate"), "{name}: got {err}");
+            assert!(err.contains(name), "error must name the file: {err}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_key_file_holding_no_key_is_rejected() {
+        let dir = scratch("badkey");
+        let (cert, key) = (dir.join("cert.pem"), dir.join("key.pem"));
+        std::fs::write(&cert, PEM_CERT).unwrap();
+        std::fs::write(&key, PEM_CERT).unwrap(); // a certificate, not a key
+        let err = read_tls_pem(&tls_cfg(
+            Some(SslMode::Verify),
+            None,
+            cert.to_str(),
+            key.to_str(),
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("no PEM private key"), "got {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_empty_strings_count_as_unset() {
+        // A templated config renders an absent value as "". Treating it as
+        // "set" turned working connections into hard failures.
+        assert!(
+            read_tls_pem(&tls_cfg(Some(SslMode::Verify), Some(""), Some("  "), Some("")))
+                .unwrap()
+                .is_none()
+        );
+        assert!(!has_tls_material(&tls_cfg(None, Some(""), None, Some(" "))));
+        assert!(has_tls_material(&tls_cfg(None, None, None, Some("/k.pem"))));
     }
 
     #[test]

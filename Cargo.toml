@@ -29,6 +29,9 @@ ureq = { version = "2", default-features = false, features = ["tls"] }
 # rustls dependency, so the crate is shared rather than duplicated.
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-pemfile = "2"
+# The OS trust store, so `ssl_mode = "verify"` means the same thing on the
+# ClickHouse driver as it does on Redis; webpki-roots is the fallback.
+rustls-native-certs = "0.7"
 webpki-roots = "0.26"
 rust_xlsxwriter = "0.99.0"
 tokio-util = { version = "0.7.19", features = ["compat"] }

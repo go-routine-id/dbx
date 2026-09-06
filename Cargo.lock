@@ -798,6 +798,7 @@ dependencies = [
  "redis",
  "rust_xlsxwriter",
  "rustls",
+ "rustls-native-certs",
  "rustls-pemfile",
  "serde",
  "serde_json",

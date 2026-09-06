@@ -612,19 +612,45 @@ pub fn is_destructive_for(dialect: crate::driver::ConsoleDialect, query: &str) -
 
 /// Does a Redis command line wipe data wholesale? Only the keyspace-clearing
 /// verbs count — `DEL k` is targeted, the same way `DELETE … WHERE` is.
+///
+/// Tokenised with the SAME parser the driver executes with, not
+/// `split_whitespace`: `"FLUSHALL"` in quotes is one token to the executor
+/// and would otherwise sail past a whitespace-only guard and still run.
 pub fn is_destructive_redis_command(cmd: &str) -> bool {
-    let mut words = cmd.split_whitespace();
-    let verb = words.next().unwrap_or("").to_uppercase();
+    // A line that doesn't tokenise (unterminated quote) will be rejected by
+    // the driver anyway; fall back to whitespace so a malformed line can't be
+    // used to hide a wipe from the guard.
+    let argv = crate::driver::redis::parse_command_line(cmd).unwrap_or_else(|_| {
+        cmd.split_whitespace()
+            .map(|w| w.trim_matches(['"', '\'']).to_string())
+            .collect()
+    });
+    let verb = argv.first().map(|v| v.to_uppercase()).unwrap_or_default();
+    let sub = argv.get(1).map(|v| v.to_uppercase()).unwrap_or_default();
     match verb.as_str() {
         // Wipes the selected db / every db.
         "FLUSHDB" | "FLUSHALL" => true,
         // Stops the server; `NOSAVE` also throws away unsaved writes.
         "SHUTDOWN" => true,
+        // Turning this instance into a replica discards its whole keyspace on
+        // the next full resync — a bigger loss than FLUSHALL, and no undo.
+        // `REPLICAOF NO ONE` is the opposite: it promotes back to primary.
+        "REPLICAOF" | "SLAVEOF" => sub != "NO",
+        // Swaps the contents of two databases under the running session.
+        "SWAPDB" => true,
         // `SCRIPT FLUSH` / `FUNCTION FLUSH` drop every stored script.
-        "SCRIPT" | "FUNCTION" => words
-            .next()
-            .map(|sub| sub.eq_ignore_ascii_case("FLUSH"))
-            .unwrap_or(false),
+        "SCRIPT" | "FUNCTION" => sub == "FLUSH",
+        // `CLUSTER RESET` / `FLUSHSLOTS` throw away this node's slot data.
+        "CLUSTER" => sub == "RESET" || sub == "FLUSHSLOTS",
+        // A Lua script can call anything; the verb alone says nothing, so
+        // look for a wipe inside the script body.
+        "EVAL" | "EVALSHA" | "EVAL_RO" | "EVALSHA_RO" | "FCALL" => argv
+            .iter()
+            .skip(1)
+            .any(|a| {
+                let a = a.to_uppercase();
+                a.contains("FLUSHALL") || a.contains("FLUSHDB")
+            }),
         _ => false,
     }
 }
@@ -1118,6 +1144,32 @@ mod tests {
         assert!(is_destructive_for(RedisCommand, "FUNCTION FLUSH"));
         // A wipe anywhere in a multi-command script still trips the guard.
         assert!(is_destructive_for(RedisCommand, "GET a\nFLUSHALL\nGET b"));
+
+        // Quoting is how the executor tokenises, so the guard must too —
+        // `"FLUSHALL"` used to sail past a whitespace-only guard and run.
+        assert!(is_destructive_for(RedisCommand, "\"FLUSHALL\""));
+        assert!(is_destructive_for(RedisCommand, "'flushdb'"));
+        assert!(is_destructive_for(RedisCommand, "SCRIPT \"FLUSH\""));
+        assert!(is_destructive_for(RedisCommand, "\"SHUTDOWN\" NOSAVE"));
+
+        // Commands that discard the keyspace without saying "flush".
+        assert!(is_destructive_for(RedisCommand, "REPLICAOF 10.0.0.5 6379"));
+        assert!(is_destructive_for(RedisCommand, "SLAVEOF host 6379"));
+        assert!(is_destructive_for(RedisCommand, "SWAPDB 0 1"));
+        assert!(is_destructive_for(RedisCommand, "CLUSTER RESET HARD"));
+        assert!(is_destructive_for(RedisCommand, "CLUSTER FLUSHSLOTS"));
+        // A wipe hidden inside a Lua body.
+        assert!(is_destructive_for(
+            RedisCommand,
+            "EVAL \"redis.call('flushall')\" 0"
+        ));
+        // …but an ordinary script is not.
+        assert!(!is_destructive_for(
+            RedisCommand,
+            "EVAL \"return redis.call('GET', KEYS[1])\" 1 k"
+        ));
+        assert!(!is_destructive_for(RedisCommand, "CLUSTER INFO"));
+        assert!(!is_destructive_for(RedisCommand, "REPLICAOF NO ONE"));
 
         // Targeted commands stay unconfirmed, like `DELETE … WHERE`.
         assert!(!is_destructive_for(RedisCommand, "DEL user:1"));

@@ -32,6 +32,14 @@ use crate::config::{ConnectionConfig, SslMode};
 const DEFAULT_PORT: u16 = 8123;
 const TLS_PORT: u16 = 8443;
 
+/// Is any TLS PEM path configured? Empty strings count as unset — templated
+/// configs render an absent value that way.
+fn has_tls_material(cfg: &ConnectionConfig) -> bool {
+    [&cfg.ssl_ca, &cfg.ssl_cert, &cfg.ssl_key]
+        .iter()
+        .any(|p| p.as_deref().is_some_and(|p| !p.trim().is_empty()))
+}
+
 /// Build the rustls config behind the HTTPS agent.
 ///
 /// This is what makes the two encrypted modes actually differ: `Verify`
@@ -40,6 +48,9 @@ const TLS_PORT: u16 = 8443;
 /// for a self-signed internal ClickHouse. `ssl_cert` + `ssl_key` add mTLS in
 /// both. ureq's stock agent always verified, so `Require` silently behaved
 /// like `Verify` and refused those servers.
+///
+/// `Require` deliberately ignores `ssl_ca`: pinning a CA and then not
+/// checking it would be theatre. Pin with `Verify` + `ssl_ca`.
 fn build_tls_config(cfg: &ConnectionConfig, mode: SslMode) -> Result<rustls::ClientConfig> {
     let provider = std::sync::Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
@@ -53,13 +64,37 @@ fn build_tls_config(cfg: &ConnectionConfig, mode: SslMode) -> Result<rustls::Cli
             let mut roots = rustls::RootCertStore::empty();
             match cfg.ssl_ca.as_deref().filter(|p| !p.trim().is_empty()) {
                 Some(path) => {
-                    for cert in read_certs(path, "ssl_ca")? {
+                    let certs = read_certs(path, "ssl_ca")?;
+                    // An empty anchor set REPLACES the default trust store and
+                    // fails every handshake with a generic "UnknownIssuer".
+                    // A file that parses to nothing is a config error.
+                    if certs.is_empty() {
+                        anyhow::bail!(
+                            "ssl_ca '{path}' holds no PEM certificate — a DER (.crt) or \
+                             key-only file will not work"
+                        );
+                    }
+                    for cert in certs {
                         roots
                             .add(cert)
                             .with_context(|| format!("ssl_ca '{path}' is not a valid CA"))?;
                     }
                 }
-                None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+                // The OS trust store, so `verify` means the same thing here as
+                // it does on the Redis driver (which goes through
+                // rustls-native-certs). Mozilla's bundled roots are the
+                // fallback when the platform store can't be read.
+                None => match rustls_native_certs::load_native_certs() {
+                    Ok(certs) if !certs.is_empty() => {
+                        for cert in certs {
+                            // A platform store can carry a certificate rustls
+                            // rejects; skipping it is better than failing the
+                            // whole connection over one bad entry.
+                            let _ = roots.add(cert);
+                        }
+                    }
+                    _ => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+                },
             }
             builder.with_root_certificates(roots)
         }
@@ -347,9 +382,10 @@ impl ClickHouseDriver {
     pub async fn connect(cfg: &ConnectionConfig) -> Result<Self> {
         let port = cfg.port.unwrap_or(DEFAULT_PORT);
         // TLS when explicitly required/verified; when unset, the 8443
-        // convention decides. ureq always verifies certificates when TLS is
-        // on (rustls + webpki roots), so Require and Verify behave alike.
-        let mode = match cfg.effective_ssl_mode() {
+        // convention decides. `Require` skips certificate verification here
+        // (see `build_tls_config`), so the legacy `ssl = true` boolean — which
+        // predates that distinction — is read as `Verify`, never as Require.
+        let mode = match cfg.effective_ssl_mode_with_legacy(SslMode::Verify) {
             Some(m) => m,
             // Unset: the 8443 convention decides, and an unconfigured TLS
             // connection verifies (the safe default).
@@ -366,11 +402,14 @@ impl ClickHouseDriver {
         // minutes and ureq's `timeout` would abort them mid-flight.
         if use_tls {
             builder = builder.tls_config(std::sync::Arc::new(build_tls_config(cfg, mode)?));
-        } else if cfg.ssl_ca.is_some() || cfg.ssl_cert.is_some() {
+        } else if has_tls_material(cfg) {
             // Certificates with TLS off is a config mistake worth surfacing.
+            // Empty strings are "unset" (templated configs render them), and
+            // ssl_key counts too — it was silently ignored before.
             anyhow::bail!(
-                "ssl_ca / ssl_cert are set but ssl_mode is 'disable' — \
-                 ClickHouse would connect over plain HTTP"
+                "ssl_ca / ssl_cert / ssl_key are set but TLS is off for this connection — \
+                 set ssl_mode = \"verify\" (or \"require\"), or remove them; \
+                 ClickHouse would otherwise connect over plain HTTP"
             );
         }
         let agent = builder.build();
@@ -993,6 +1032,47 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("must be set together"), "got {err}");
+    }
+
+    #[test]
+    fn test_verify_rejects_a_ca_file_with_no_certificates() {
+        // An empty anchor set REPLACES the trust store, so every handshake
+        // would fail with a generic "UnknownIssuer" naming neither the
+        // setting nor the file.
+        let dir = std::env::temp_dir().join(format!(
+            "dbx-clickhouse-tls-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ca = dir.join("ca.pem");
+        std::fs::write(&ca, "not a pem file at all").unwrap();
+
+        let err = build_tls_config(&tls_cfg(ca.to_str(), None, None), SslMode::Verify)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no PEM certificate"), "got {err}");
+        assert!(err.contains("ca.pem"), "error must name the file: {err}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_legacy_ssl_boolean_never_means_accept_any_certificate() {
+        // `ssl = true` predates the require/verify split; reading it as
+        // Require would silently downgrade existing configs to accept-any.
+        let mut cfg = tls_cfg(None, None, None);
+        cfg.ssl = true;
+        assert_eq!(
+            cfg.effective_ssl_mode_with_legacy(SslMode::Verify),
+            Some(SslMode::Verify)
+        );
+        // An explicit mode still wins.
+        cfg.ssl_mode = Some(SslMode::Require);
+        assert_eq!(
+            cfg.effective_ssl_mode_with_legacy(SslMode::Verify),
+            Some(SslMode::Require)
+        );
     }
 
     #[test]

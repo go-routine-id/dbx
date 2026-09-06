@@ -161,8 +161,10 @@ The console on a Redis connection accepts raw commands (`SCAN 0 MATCH user:*`,
 `HGETALL user:1`, `INFO`, `SLOWLOG GET 10`) with shell-style quoting; replies
 render in the result grid. **One command per line** — a `;` is data, not a
 separator — and `#` starts a comment line. Keyspace-clearing commands
-(`FLUSHDB`, `FLUSHALL`, `SCRIPT FLUSH`, `FUNCTION FLUSH`, `SHUTDOWN`) go
-through the same confirm dialog as `DROP` / `TRUNCATE` do in SQL. The explorer
+(`FLUSHDB`, `FLUSHALL`, `SCRIPT`/`FUNCTION FLUSH`, `SHUTDOWN`, `SWAPDB`,
+`REPLICAOF`/`SLAVEOF`, `CLUSTER RESET`/`FLUSHSLOTS`, and an `EVAL` whose
+script calls a flush) go through the same confirm dialog as `DROP` /
+`TRUNCATE` do in SQL. The explorer
 groups keys into collections by their first `:` prefix.
 
 All SQL is built through a generic helper layer (`quote_ident`,
@@ -261,21 +263,33 @@ ssl_cert = "/etc/dbx/certs/client.pem"
 ssl_key = "/etc/dbx/certs/client-key.pem"
 ```
 
-Supported by the MySQL, PostgreSQL, Redis and ClickHouse drivers. SQL Server
-(tiberius) has no client-certificate API in the pinned driver version, so
-these fields are ignored there.
+Client certificates are read by the MySQL, PostgreSQL, Redis and ClickHouse
+drivers. SQL Server (tiberius) has no client-certificate API in the pinned
+driver version, and the MongoDB driver builds its URI without them — the
+fields are ignored there.
 
-`ssl_mode` decides the transport for every driver that reads it:
+`ssl_mode` takes `require` (encrypt) or `verify` (encrypt **and** validate the
+server certificate). What `require` means in practice differs per driver,
+because each one delegates to its own TLS stack:
 
-| `ssl_mode` | Meaning |
-|---|---|
-| `disable` | Plaintext. Setting `ssl_ca` / `ssl_cert` alongside it is rejected rather than silently ignored |
-| `require` | Encrypted, server certificate **not** verified — for self-signed internal servers |
-| `verify` | Encrypted and the server certificate must validate against `ssl_ca` (or the system trust store) |
+| Driver | `require` | `verify` |
+|---|---|---|
+| Redis | Encrypted, certificate **not** checked | Validated against `ssl_ca`, else the OS trust store |
+| ClickHouse | Encrypted, certificate **not** checked (`ssl_ca` is ignored — pin with `verify`) | Validated against `ssl_ca`, else the OS trust store |
+| MySQL | Encrypted; sqlx verifies when `ssl_ca` is set | Validated against `ssl_ca` |
+| PostgreSQL | sqlx upgrades to verification when `ssl_ca` is set | Validated against `ssl_ca` |
+| MongoDB | Encrypted **and** verified — the rustls backend always verifies | Same as `require` |
+| SQL Server | Encrypted; trust settings come from tiberius | Validated |
 
 Redis connects over TLS (`rediss://` in URL terms) as soon as `ssl_mode` is
-`require` or `verify`. ClickHouse defaults to `verify` when the port is 8443
-and nothing is configured.
+set — before v0.5.2 the field was accepted but ignored on Redis, so an
+existing entry carrying `ssl` / `ssl_mode` against a plaintext server now
+fails to connect and needs the field removed. ClickHouse defaults to `verify`
+when the port is 8443 and nothing is configured. The legacy `ssl = true`
+boolean means `verify` (never accept-any) on Redis and ClickHouse.
+
+On Redis and ClickHouse, setting a certificate path while TLS is off is
+rejected at connect time rather than silently ignored.
 
 Environment variables:
 
