@@ -30,6 +30,9 @@ const AC_TITLE: &str = " Complete (Tab) ";
 /// "▶ " selection marker, and one trailing space so text never touches the
 /// right border.
 const AC_CHROME_W: u16 = 5;
+/// Columns the kind marker takes on a row: one separating space plus the
+/// widest marker (`tbl` / `col`).
+const AC_KIND_W: u16 = 4;
 
 /// SQL keywords to highlight in the editor.
 const SQL_KEYWORDS: &[&str] = &[
@@ -42,6 +45,52 @@ const SQL_KEYWORDS: &[&str] = &[
     "AND", "OR", "IN", "IS", "LIKE", "BETWEEN", "EXISTS", "CASE", "WHEN",
     "THEN", "ELSE", "END", "AS", "DISTINCT", "COUNT", "SUM", "AVG", "MIN", "MAX",
 ];
+
+/// What a suggestion came from. A keyword, a table and a column are otherwise
+/// indistinguishable strings in the popup.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SuggestionKind {
+    Keyword,
+    Table,
+    Column,
+}
+
+impl SuggestionKind {
+    /// Short marker drawn beside the entry.
+    pub fn marker(self) -> &'static str {
+        match self {
+            SuggestionKind::Keyword => "kw",
+            SuggestionKind::Table => "tbl",
+            SuggestionKind::Column => "col",
+        }
+    }
+
+    /// A prefix matching both a column of a queried table and a keyword almost
+    /// always means the column.
+    fn rank(self) -> u8 {
+        match self {
+            SuggestionKind::Column => 0,
+            SuggestionKind::Table => 1,
+            SuggestionKind::Keyword => 2,
+        }
+    }
+}
+
+/// One entry of the completion list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Suggestion {
+    pub text: String,
+    pub kind: SuggestionKind,
+}
+
+impl Suggestion {
+    fn new(text: impl Into<String>, kind: SuggestionKind) -> Self {
+        Self {
+            text: text.into(),
+            kind,
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct QueryConsole {
@@ -70,7 +119,7 @@ pub struct QueryConsole {
     pub popup: Option<ConsolePopup>,
     /// Live autocomplete suggestions for the current editor position.
     /// Empty = nothing to offer.
-    pub autocomplete: Vec<String>,
+    pub autocomplete: Vec<Suggestion>,
     pub autocomplete_selected: usize,
     /// Result-pane inner area from the last draw — maps a mouse click to a cell.
     pub result_hit_area: Option<Rect>,
@@ -233,10 +282,18 @@ impl QueryConsole {
         self.lines.join("\n")
     }
 
-    /// Replace the current completion token (after the last whitespace or
-    /// `.`) with the highlighted suggestion.
+    /// Replace the current completion token with the highlighted suggestion.
+    ///
+    /// The token boundary is the one the suggestion engine used: any non-word
+    /// character, plus `.` so `users.na` completes the column and keeps the
+    /// table. Breaking on whitespace alone turned `count(us` into `count(users`
+    /// only by luck — it replaced `count(us` whole.
     pub fn accept_autocomplete(&mut self) {
-        let Some(s) = self.autocomplete.get(self.autocomplete_selected).cloned() else {
+        let Some(s) = self
+            .autocomplete
+            .get(self.autocomplete_selected)
+            .map(|s| s.text.clone())
+        else {
             return;
         };
         self.autocomplete.clear();
@@ -246,7 +303,7 @@ impl QueryConsole {
         let mut start = self.cursor_col;
         while start > 0 {
             let c = chars[start - 1];
-            if c.is_whitespace() || c == '.' {
+            if !is_token_char(c) || c == '.' {
                 break;
             }
             start -= 1;
@@ -531,31 +588,35 @@ fn flush_sql_token(token: &mut String, out: &mut String, clauses: &[&str]) {
 }
 
 /// Tier-1 autocomplete for the text before the cursor:
-/// - after FROM/JOIN/INTO/UPDATE → table names
-/// - `table.` prefix → column names (from `column_cache` keyed `ns.table`)
-/// - otherwise → SQL keywords
+/// - in a FROM/JOIN/INTO/UPDATE table list → table names
+/// - `table.` / `alias.` prefix → that table's columns (from `column_cache`
+///   keyed `ns.table`)
+/// - otherwise → columns of the tables the query already names, then SQL
+///   keywords
+///
+/// Matching ignores case throughout; the inserted text keeps the identifier's
+/// own case.
 pub fn suggest(
     line_before_cursor: &str,
     tables: &[String],
     column_cache: &std::collections::HashMap<String, Vec<String>>,
-) -> Vec<String> {
+) -> Vec<Suggestion> {
     suggest_inner(line_before_cursor, tables, column_cache, MIN_KEYWORD_PREFIX)
 }
 
 /// Suggestions for an explicit request (Ctrl+Space): the two-character
 /// threshold drops to one, so a single letter is answered.
 ///
-/// It does NOT drop to zero. With no token at all, `starts_with("")` matches
-/// every keyword and the cap keeps the first twenty in declaration order —
-/// `select`, `from`, `where`… — which can never offer the `AND` / `OR` /
-/// `LIKE` a bare `WHERE ` actually wants. Table and column context (after
-/// `FROM`, after `table.`) is handled before this point and still answers on
-/// an empty prefix.
+/// It does NOT drop to zero. With no token at all every keyword matches, and
+/// twenty of them ranked by length — `as`, `by`, `in`, `is`, `on`… — is a dump
+/// of the keyword list, not an answer to where the cursor is. Table and column
+/// context (a FROM list, after `table.`) is handled before this point and still
+/// answers on an empty prefix.
 pub fn suggest_forced(
     line_before_cursor: &str,
     tables: &[String],
     column_cache: &std::collections::HashMap<String, Vec<String>>,
-) -> Vec<String> {
+) -> Vec<Suggestion> {
     suggest_inner(line_before_cursor, tables, column_cache, 1)
 }
 
@@ -564,87 +625,253 @@ fn suggest_inner(
     tables: &[String],
     column_cache: &std::collections::HashMap<String, Vec<String>>,
     min_keyword_prefix: usize,
-) -> Vec<String> {
-    let trimmed_end = line_before_cursor.trim_end();
-    let words: Vec<&str> = trimmed_end.split_whitespace().collect();
-    // A trailing space means the current token is empty but the previous one
-    // is the context (e.g. "FROM " should suggest all tables).
-    let has_trailing_ws = line_before_cursor.len() > trimmed_end.len();
-    let current = if has_trailing_ws {
-        String::new()
-    } else {
-        words.last().map(|w| w.to_string()).unwrap_or_default()
-    };
-    let prev = if has_trailing_ws {
-        words.last().copied().unwrap_or("").to_uppercase()
-    } else {
-        words.iter().rev().nth(1).copied().unwrap_or("").to_uppercase()
-    };
+) -> Vec<Suggestion> {
+    let (head, current) = split_token(line_before_cursor);
+    let toks = tokenize(head);
 
-    // After FROM/JOIN/INTO/UPDATE → table names.
-    if matches!(prev.as_str(), "FROM" | "JOIN" | "INTO" | "UPDATE") {
-        let mut t: Vec<String> = tables
+    // Inside a FROM/JOIN/INTO/UPDATE table list → table names.
+    if in_table_list(&toks) {
+        let hits = tables
             .iter()
-            .filter(|t| t.starts_with(&current))
-            .cloned()
+            .filter(|t| starts_ci(t, current))
+            .map(|t| Suggestion::new(t.clone(), SuggestionKind::Table))
             .collect();
-        t.sort();
-        t.truncate(20);
-        return drop_noop(t, &current);
+        return drop_noop(rank(hits, current), current);
     }
 
-    // `table.col` → columns of that table (matched by bare name or ns.table).
-    if current.contains('.') {
-        let (table_part, col_prefix) = match current.rfind('.') {
-            Some(i) => (&current[..i], &current[i + 1..]),
-            None => return Vec::new(),
-        };
-        let mut cols: Vec<String> = column_cache
+    // `table.col` / `alias.col` → columns of that table.
+    if let Some(dot) = current.rfind('.') {
+        let (qualifier, col_prefix) = (&current[..dot], &current[dot + 1..]);
+        let refs = table_refs(&toks);
+        let table = refs
             .iter()
-            .filter(|(key, _)| {
-                key.ends_with(&format!(".{table_part}")) || key.as_str() == table_part
+            .find(|(_, alias)| {
+                alias
+                    .as_deref()
+                    .is_some_and(|a| a.eq_ignore_ascii_case(qualifier))
             })
-            .flat_map(|(_, v)| v.iter().cloned())
+            .map(|(name, _)| name.as_str())
+            .unwrap_or(qualifier);
+        let hits = columns_of(table, column_cache)
+            .into_iter()
+            .filter(|c| starts_ci(c, col_prefix))
+            .map(|c| Suggestion::new(c, SuggestionKind::Column))
             .collect();
-        cols.sort();
-        cols.dedup();
-        cols.retain(|c| c.starts_with(col_prefix));
-        cols.truncate(20);
-        return drop_noop(cols, col_prefix);
+        return drop_noop(rank(hits, col_prefix), col_prefix);
     }
 
-    // Otherwise keywords — but only past a prefix long enough to mean
-    // something. One letter matched up to eight keywords, so the popup was
-    // open almost permanently while typing.
+    // Otherwise columns and keywords — but only past a prefix long enough to
+    // mean something. One letter matched up to eight keywords, so the popup
+    // was open almost permanently while typing.
     if current.chars().count() < min_keyword_prefix {
         return Vec::new();
     }
-    let upper = current.to_uppercase();
     // Follow the case the user is typing in: completing `select` into
-    // `SELECT` silently rewrites their style.
+    // `SELECT` silently rewrites their style. Identifiers keep their own case
+    // instead — a table named `Users` is not addressable as `users` everywhere.
     let shout = current.chars().any(|c| c.is_uppercase());
-    let hits: Vec<String> = SQL_KEYWORDS
+    let mut hits: Vec<Suggestion> = SQL_KEYWORDS
         .iter()
-        .filter(|k| k.starts_with(&upper))
+        .filter(|k| starts_ci(k, current))
         .map(|k| {
-            if shout {
-                k.to_string()
-            } else {
-                k.to_lowercase()
-            }
+            let text = if shout { k.to_string() } else { k.to_lowercase() };
+            Suggestion::new(text, SuggestionKind::Keyword)
         })
-        .take(20)
         .collect();
-    drop_noop(hits, &current)
+    // An unqualified word in a query that already names its tables is far more
+    // often one of their columns than a keyword.
+    for (table, _) in table_refs(&toks) {
+        hits.extend(
+            columns_of(&table, column_cache)
+                .into_iter()
+                .filter(|c| starts_ci(c, current))
+                .map(|c| Suggestion::new(c, SuggestionKind::Column)),
+        );
+    }
+    drop_noop(rank(hits, current), current)
 }
 
 /// Drop a suggestion list that only offers what is already typed — otherwise
 /// the popup sits open on every finished word (`SELECT` suggests `SELECT`).
-fn drop_noop(hits: Vec<String>, current: &str) -> Vec<String> {
-    if hits.len() == 1 && hits[0].eq_ignore_ascii_case(current) {
+fn drop_noop(hits: Vec<Suggestion>, current: &str) -> Vec<Suggestion> {
+    if hits.len() == 1 && hits[0].text.eq_ignore_ascii_case(current) {
         return Vec::new();
     }
     hits
+}
+
+/// Order a list the way an editor does: the exact match first, then the
+/// shortest, then alphabetically. Declaration order buried the answer — `in`
+/// offered `INSERT`, `INTO`, `INNER`, `INDEX` and only then `IN`.
+fn rank(mut hits: Vec<Suggestion>, current: &str) -> Vec<Suggestion> {
+    let key = |s: &Suggestion| {
+        (
+            !s.text.eq_ignore_ascii_case(current),
+            s.kind.rank(),
+            s.text.chars().count(),
+            s.text.to_lowercase(),
+        )
+    };
+    hits.sort_by_key(key);
+    // The same column name comes back once per table that has it.
+    hits.dedup_by(|a, b| a.kind == b.kind && a.text.eq_ignore_ascii_case(&b.text));
+    hits.truncate(20);
+    hits
+}
+
+/// Prefix match ignoring case, so `US` finds `users`.
+fn starts_ci(hay: &str, prefix: &str) -> bool {
+    hay.to_lowercase().starts_with(&prefix.to_lowercase())
+}
+
+/// Characters an identifier is made of. `.` counts: `users.name` is one token
+/// to complete, not two.
+fn is_token_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_' || c == '.'
+}
+
+/// Split the text before the cursor into everything preceding the token being
+/// typed, and that token. Splitting on whitespace instead left `count(us` as
+/// one token, which matches nothing at all.
+fn split_token(line: &str) -> (&str, &str) {
+    let start = line
+        .char_indices()
+        .rev()
+        .find(|(_, c)| !is_token_char(*c))
+        .map(|(i, c)| i + c.len_utf8())
+        .unwrap_or(0);
+    (&line[..start], &line[start..])
+}
+
+/// A word, or a single significant punctuation character; whitespace is
+/// dropped. Just enough structure to tell `FROM a, ` from `SELECT a, `.
+enum Tok<'a> {
+    Word(&'a str),
+    Punct(char),
+}
+
+fn tokenize(s: &str) -> Vec<Tok<'_>> {
+    let mut out = Vec::new();
+    let mut word_start = None;
+    for (i, c) in s.char_indices() {
+        if is_token_char(c) {
+            word_start.get_or_insert(i);
+            continue;
+        }
+        if let Some(start) = word_start.take() {
+            out.push(Tok::Word(&s[start..i]));
+        }
+        if !c.is_whitespace() {
+            out.push(Tok::Punct(c));
+        }
+    }
+    if let Some(start) = word_start {
+        out.push(Tok::Word(&s[start..]));
+    }
+    out
+}
+
+/// Clauses that introduce table names.
+const TABLE_CLAUSES: [&str; 4] = ["FROM", "JOIN", "INTO", "UPDATE"];
+
+fn is_table_clause(w: &str) -> bool {
+    TABLE_CLAUSES.iter().any(|k| k.eq_ignore_ascii_case(w))
+}
+
+fn is_keyword(w: &str) -> bool {
+    SQL_KEYWORDS.iter().any(|k| k.eq_ignore_ascii_case(w))
+}
+
+/// Whether the token being typed is a table name: right after a table clause,
+/// or further along the comma-separated list one opens. Reading only the
+/// previous word stopped offering tables the moment a comma appeared.
+fn in_table_list(toks: &[Tok<'_>]) -> bool {
+    match toks.last() {
+        Some(Tok::Word(w)) => return is_table_clause(w),
+        Some(Tok::Punct(',')) => {}
+        _ => return false,
+    }
+    // Walk back over `<table> [AS] [alias]` entries; it is a table list only
+    // if the chain of commas reaches a table clause.
+    let mut i = toks.len() - 1;
+    loop {
+        let mut words = 0;
+        while i > 0 && words < 3 {
+            match &toks[i - 1] {
+                Tok::Word(w) if is_table_clause(w) => return words > 0,
+                Tok::Word(_) => {
+                    words += 1;
+                    i -= 1;
+                }
+                Tok::Punct(_) => break,
+            }
+        }
+        if words == 0 || i == 0 || !matches!(toks[i - 1], Tok::Punct(',')) {
+            return false;
+        }
+        i -= 1;
+    }
+}
+
+/// Every `(table, alias)` the text names in a FROM/JOIN/INTO/UPDATE clause.
+/// `FROM users u` means the rest of the query writes `u.`, so the alias has to
+/// resolve to the same columns as the table.
+fn table_refs(toks: &[Tok<'_>]) -> Vec<(String, Option<String>)> {
+    let mut refs = Vec::new();
+    let mut i = 0;
+    while i < toks.len() {
+        let clause = matches!(&toks[i], Tok::Word(w) if is_table_clause(w));
+        i += 1;
+        if !clause {
+            continue;
+        }
+        while let Some(Tok::Word(name)) = toks.get(i) {
+            if is_keyword(name) {
+                break;
+            }
+            i += 1;
+            let mut alias = None;
+            if matches!(toks.get(i), Some(Tok::Word(w)) if w.eq_ignore_ascii_case("AS")) {
+                i += 1;
+                if let Some(Tok::Word(a)) = toks.get(i) {
+                    alias = Some((*a).to_string());
+                    i += 1;
+                }
+            } else if let Some(Tok::Word(a)) = toks.get(i)
+                // `FROM users WHERE` — the clause that ends the table list is
+                // not an alias for it.
+                && !is_keyword(a)
+            {
+                alias = Some((*a).to_string());
+                i += 1;
+            }
+            refs.push(((*name).to_string(), alias));
+            if matches!(toks.get(i), Some(Tok::Punct(','))) {
+                i += 1;
+            } else {
+                break;
+            }
+        }
+    }
+    refs
+}
+
+/// Columns of `table`, whose cache keys are `ns.table`, so a bare name matches
+/// by suffix.
+fn columns_of(
+    table: &str,
+    column_cache: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    let want = table.to_lowercase();
+    let qualified = format!(".{want}");
+    column_cache
+        .iter()
+        .filter(|(key, _)| {
+            let key = key.to_lowercase();
+            key == want || key.ends_with(&qualified)
+        })
+        .flat_map(|(_, cols)| cols.iter().cloned())
+        .collect()
 }
 
 /// Tokenizes a single SQL line and returns highlighted Spans (owned Strings).
@@ -817,7 +1044,7 @@ fn render_autocomplete(
     let widest = console
         .autocomplete
         .iter()
-        .map(|s| UnicodeWidthStr::width(s.as_str()))
+        .map(|s| UnicodeWidthStr::width(s.text.as_str()))
         .max()
         .unwrap_or(0) as u16;
     let Some(popup_area) = autocomplete_rect(
@@ -825,7 +1052,7 @@ fn render_autocomplete(
         editor,
         caret_x,
         console.autocomplete.len() as u16,
-        widest,
+        widest + AC_KIND_W,
     ) else {
         console.autocomplete_hit = None;
         return;
@@ -847,14 +1074,29 @@ fn render_autocomplete(
         .enumerate()
     {
         let is_sel = start + i == sel;
-        lines.push(Line::from(Span::styled(
-            if is_sel { format!("▶ {s}") } else { format!("  {s}") },
-            if is_sel {
-                theme.selected()
-            } else {
-                theme.base()
-            },
-        )));
+        // Markers line up in their own column, so the eye can scan kinds
+        // without reading the names.
+        let text_w = UnicodeWidthStr::width(s.text.as_str());
+        let pad = " ".repeat((widest as usize).saturating_sub(text_w));
+        let caret = if is_sel { "▶" } else { " " };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{caret} {}{pad} ", s.text),
+                if is_sel {
+                    theme.selected()
+                } else {
+                    theme.base()
+                },
+            ),
+            Span::styled(
+                format!("{:>3}", s.kind.marker()),
+                if is_sel {
+                    theme.dim().bg(theme.panel)
+                } else {
+                    theme.dim()
+                },
+            ),
+        ]));
     }
     f.render_widget(Paragraph::new(lines), inner);
     console.autocomplete_hit = Some((inner, start));
@@ -1411,6 +1653,33 @@ mod tests {
         assert!(f.starts_with("SELECT $x$ FROM $x$\nFROM t"));
     }
 
+    /// Suggestion texts, for assertions that do not care about the kind.
+    fn texts(hits: &[Suggestion]) -> Vec<String> {
+        hits.iter().map(|s| s.text.clone()).collect()
+    }
+
+    /// `shop.users` / `shop.orders` plus a table whose name is not all
+    /// lowercase, to pin down the case rules.
+    fn fixture() -> (Vec<String>, std::collections::HashMap<String, Vec<String>>) {
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(
+            "shop.users".to_string(),
+            vec!["id".to_string(), "name".to_string(), "email".to_string()],
+        );
+        cache.insert(
+            "shop.orders".to_string(),
+            vec!["id".to_string(), "user_id".to_string(), "total".to_string()],
+        );
+        (
+            vec![
+                "users".to_string(),
+                "orders".to_string(),
+                "Accounts".to_string(),
+            ],
+            cache,
+        )
+    }
+
     #[test]
     fn test_suggest() {
         let mut cache = std::collections::HashMap::new();
@@ -1421,28 +1690,188 @@ mod tests {
         let tables = vec!["users".to_string(), "orders".to_string()];
 
         // After FROM → table names.
-        let s = suggest("SELECT * FROM us", &tables, &cache);
+        let s = texts(&suggest("SELECT * FROM us", &tables, &cache));
         assert!(s.contains(&"users".to_string()));
 
         // `table.col` → column names of that table.
-        let s = suggest("SELECT users.na", &tables, &cache);
+        let s = texts(&suggest("SELECT users.na", &tables, &cache));
         assert!(s.contains(&"name".to_string()));
         assert!(!s.contains(&"id".to_string()));
 
         // Otherwise keywords — matching the case the user is typing in.
-        let s = suggest("SEL", &tables, &cache);
+        let s = texts(&suggest("SEL", &tables, &cache));
         assert!(s.contains(&"SELECT".to_string()));
-        let s = suggest("sel", &tables, &cache);
+        let s = texts(&suggest("sel", &tables, &cache));
         assert!(s.contains(&"select".to_string()), "got {s:?}");
         assert!(!s.contains(&"SELECT".to_string()), "case was rewritten");
 
         // Trailing space after FROM → suggest all tables.
-        let s = suggest("SELECT * FROM ", &tables, &cache);
+        let s = texts(&suggest("SELECT * FROM ", &tables, &cache));
         assert!(s.contains(&"users".to_string()));
         assert!(s.contains(&"orders".to_string()));
 
         // Keyword context with empty prefix → no keyword noise.
         assert!(suggest("SELECT ", &tables, &cache).is_empty());
+    }
+
+    #[test]
+    fn test_suggest_token_ends_at_the_last_non_word_character() {
+        // The token used to be `split_whitespace().last()`, so anything glued
+        // to a paren, comma or operator — `count(us`, `(us`, `id=us` — became
+        // part of the word being matched and found nothing at all.
+        let (tables, cache) = fixture();
+
+        let s = texts(&suggest("SELECT count(us", &tables, &cache));
+        assert!(s.contains(&"use".to_string()), "got {s:?}");
+
+        let s = texts(&suggest("SELECT * FROM users WHERE (na", &tables, &cache));
+        assert!(s.contains(&"name".to_string()), "got {s:?}");
+
+        let s = texts(&suggest("SELECT * FROM users WHERE id=na", &tables, &cache));
+        assert!(s.contains(&"name".to_string()), "got {s:?}");
+
+        // The dot stays inside the token — it is member access, not a break.
+        let s = texts(&suggest("SELECT count(users.na", &tables, &cache));
+        assert_eq!(s, vec!["name".to_string()]);
+    }
+
+    #[test]
+    fn test_suggest_matches_regardless_of_case() {
+        // `starts_with` was case-sensitive for tables and columns, so `US`
+        // never found `users` and a table named `Accounts` needed its capital.
+        let (tables, cache) = fixture();
+
+        let s = texts(&suggest("SELECT * FROM US", &tables, &cache));
+        assert_eq!(s, vec!["users".to_string()], "identifier case rewritten");
+
+        let s = texts(&suggest("SELECT * FROM acc", &tables, &cache));
+        assert_eq!(s, vec!["Accounts".to_string()]);
+
+        let s = texts(&suggest("SELECT users.NA", &tables, &cache));
+        assert_eq!(s, vec!["name".to_string()]);
+
+        let s = texts(&suggest("SELECT USERS.na", &tables, &cache));
+        assert_eq!(s, vec!["name".to_string()]);
+    }
+
+    #[test]
+    fn test_suggest_ranks_the_exact_match_first() {
+        // Declaration order answered `in` with INSERT, INTO, INNER, INDEX and
+        // put IN — the word actually typed — last.
+        let (tables, cache) = fixture();
+
+        assert_eq!(
+            texts(&suggest("in", &tables, &cache)),
+            vec!["in", "into", "index", "inner", "insert"]
+        );
+        assert_eq!(texts(&suggest("or", &tables, &cache))[0], "or");
+        assert_eq!(texts(&suggest("as", &tables, &cache))[0], "as");
+
+        // Tables and columns follow the same rule.
+        let tables = vec!["user_roles".to_string(), "user".to_string()];
+        assert_eq!(
+            texts(&suggest("SELECT * FROM user", &tables, &cache)),
+            vec!["user", "user_roles"]
+        );
+    }
+
+    #[test]
+    fn test_suggest_resolves_table_aliases() {
+        // `FROM users u WHERE u.` offered nothing: only a bare table name was
+        // ever resolved to columns.
+        let (tables, cache) = fixture();
+
+        let s = texts(&suggest("SELECT * FROM users u WHERE u.", &tables, &cache));
+        assert_eq!(s, vec!["id", "name", "email"]);
+
+        let s = texts(&suggest(
+            "SELECT * FROM users AS u JOIN orders o ON u.id = o.us",
+            &tables,
+            &cache,
+        ));
+        assert_eq!(s, vec!["user_id".to_string()]);
+
+        // An unknown qualifier resolves to nothing rather than to some table.
+        assert!(suggest("SELECT * FROM users WHERE x.na", &tables, &cache).is_empty());
+    }
+
+    #[test]
+    fn test_suggest_keeps_offering_tables_after_a_comma() {
+        // The previous word read as `users,`, which matched no clause keyword,
+        // so the second table of a comma-separated list was never completed.
+        let (tables, cache) = fixture();
+
+        let s = texts(&suggest("SELECT * FROM users, ", &tables, &cache));
+        assert!(s.contains(&"orders".to_string()), "got {s:?}");
+
+        let s = texts(&suggest("SELECT * FROM users u, or", &tables, &cache));
+        assert_eq!(s, vec!["orders".to_string()]);
+
+        // A comma in a select list is not a table list.
+        let s = texts(&suggest("SELECT id, or", &tables, &cache));
+        assert!(!s.contains(&"orders".to_string()), "got {s:?}");
+    }
+
+    #[test]
+    fn test_suggest_offers_columns_without_a_table_prefix() {
+        // A bare word only ever matched keywords, so the columns of the table
+        // the query already names had to be typed out in full.
+        let (tables, cache) = fixture();
+
+        let s = suggest("SELECT * FROM users WHERE em", &tables, &cache);
+        assert_eq!(texts(&s), vec!["email".to_string()]);
+        assert_eq!(s[0].kind, SuggestionKind::Column);
+
+        // Columns outrank keywords that share the prefix.
+        let s = suggest("SELECT * FROM orders WHERE us", &tables, &cache);
+        assert_eq!(s[0].text, "user_id");
+        assert_eq!(s[0].kind, SuggestionKind::Column);
+        assert!(texts(&s).contains(&"use".to_string()), "got {s:?}");
+
+        // Columns of tables the query never names stay out of it.
+        assert!(!texts(&suggest("SELECT * FROM orders WHERE em", &tables, &cache))
+            .contains(&"email".to_string()));
+    }
+
+    #[test]
+    fn test_suggest_labels_each_entry_with_its_kind() {
+        // Bare strings made a keyword, a table and a column that share a
+        // prefix indistinguishable in the popup.
+        let (tables, cache) = fixture();
+
+        assert_eq!(
+            suggest("SELECT * FROM us", &tables, &cache)[0].kind,
+            SuggestionKind::Table
+        );
+        assert_eq!(
+            suggest("SELECT users.na", &tables, &cache)[0].kind,
+            SuggestionKind::Column
+        );
+        assert_eq!(
+            suggest("sel", &tables, &cache)[0].kind,
+            SuggestionKind::Keyword
+        );
+
+        assert_eq!(SuggestionKind::Keyword.marker(), "kw");
+        assert_eq!(SuggestionKind::Table.marker(), "tbl");
+        assert_eq!(SuggestionKind::Column.marker(), "col");
+    }
+
+    #[test]
+    fn test_accept_replaces_only_the_token_under_the_cursor() {
+        // Scanning back to the last whitespace swallowed the function name:
+        // accepting `users` in `count(us` left `users` alone on the line.
+        let mut c = QueryConsole::new("t".to_string(), Some("SELECT count(us"));
+        c.autocomplete = vec![Suggestion::new("users", SuggestionKind::Table)];
+        c.accept_autocomplete();
+        assert_eq!(c.text(), "SELECT count(users");
+        assert_eq!(c.cursor_col, "SELECT count(users".chars().count());
+
+        // The qualifier of a member access is not part of the token.
+        let mut c = QueryConsole::new("t".to_string(), Some("SELECT users.na"));
+        c.autocomplete = vec![Suggestion::new("name", SuggestionKind::Column)];
+        c.accept_autocomplete();
+        assert_eq!(c.text(), "SELECT users.name");
     }
 
     #[test]
@@ -1482,10 +1911,12 @@ mod tests {
 
         // Table context is real context, so it still answers on an empty word.
         assert_eq!(
-            suggest_forced("SELECT * FROM ", &tables, &cache),
+            texts(&suggest_forced("SELECT * FROM ", &tables, &cache)),
             vec!["users".to_string()]
         );
-    }    #[test]
+    }
+
+    #[test]
     fn test_autocomplete_box_never_covers_editor_text() {
         // Console pane rows 0..24, editor occupying its first 6 (the minimum,
         // i.e. the case the old placement got wrong).
