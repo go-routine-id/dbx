@@ -18,6 +18,10 @@ const MIN_EDITOR_H: u16 = 6;
 
 /// Width of the editor's line-number gutter (`"  1 │ "`).
 const GUTTER_W: usize = 6;
+/// Keywords are only suggested from this many typed characters on.
+const MIN_KEYWORD_PREFIX: usize = 2;
+/// Total popup height, borders included — four suggestions at a time.
+const AC_POPUP_H: u16 = 6;
 
 /// SQL keywords to highlight in the editor.
 const SQL_KEYWORDS: &[&str] = &[
@@ -517,6 +521,25 @@ pub fn suggest(
     tables: &[String],
     column_cache: &std::collections::HashMap<String, Vec<String>>,
 ) -> Vec<String> {
+    suggest_inner(line_before_cursor, tables, column_cache, MIN_KEYWORD_PREFIX)
+}
+
+/// Suggestions for an explicit request (Ctrl+Space), where the typed-prefix
+/// threshold does not apply — the user asked, so answer even on a bare word.
+pub fn suggest_forced(
+    line_before_cursor: &str,
+    tables: &[String],
+    column_cache: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<String> {
+    suggest_inner(line_before_cursor, tables, column_cache, 0)
+}
+
+fn suggest_inner(
+    line_before_cursor: &str,
+    tables: &[String],
+    column_cache: &std::collections::HashMap<String, Vec<String>>,
+    min_keyword_prefix: usize,
+) -> Vec<String> {
     let trimmed_end = line_before_cursor.trim_end();
     let words: Vec<&str> = trimmed_end.split_whitespace().collect();
     // A trailing space means the current token is empty but the previous one
@@ -542,7 +565,7 @@ pub fn suggest(
             .collect();
         t.sort();
         t.truncate(20);
-        return t;
+        return drop_noop(t, &current);
     }
 
     // `table.col` → columns of that table (matched by bare name or ns.table).
@@ -562,20 +585,41 @@ pub fn suggest(
         cols.dedup();
         cols.retain(|c| c.starts_with(col_prefix));
         cols.truncate(20);
-        return cols;
+        return drop_noop(cols, col_prefix);
     }
 
-    // Otherwise keywords, but only once something is typed (avoids noise).
-    if current.is_empty() {
+    // Otherwise keywords — but only past a prefix long enough to mean
+    // something. One letter matched up to eight keywords, so the popup was
+    // open almost permanently while typing.
+    if current.chars().count() < min_keyword_prefix {
         return Vec::new();
     }
     let upper = current.to_uppercase();
-    SQL_KEYWORDS
+    // Follow the case the user is typing in: completing `select` into
+    // `SELECT` silently rewrites their style.
+    let shout = current.chars().any(|c| c.is_uppercase());
+    let hits: Vec<String> = SQL_KEYWORDS
         .iter()
         .filter(|k| k.starts_with(&upper))
-        .map(|k| k.to_string())
+        .map(|k| {
+            if shout {
+                k.to_string()
+            } else {
+                k.to_lowercase()
+            }
+        })
         .take(20)
-        .collect()
+        .collect();
+    drop_noop(hits, &current)
+}
+
+/// Drop a suggestion list that only offers what is already typed — otherwise
+/// the popup sits open on every finished word (`SELECT` suggests `SELECT`).
+fn drop_noop(hits: Vec<String>, current: &str) -> Vec<String> {
+    if hits.len() == 1 && hits[0].eq_ignore_ascii_case(current) {
+        return Vec::new();
+    }
+    hits
 }
 
 /// Tokenizes a single SQL line and returns highlighted Spans (owned Strings).
@@ -684,24 +728,92 @@ pub fn render_query_console(
 
     if let Some(popup) = &console.popup {
         render_console_popup(f, area, popup, theme);
-    } else if !console.autocomplete.is_empty() {
-        render_autocomplete(f, chunks[0], console, theme);
+    } else if is_tab_focused
+        && console.focused_subpane == ConsoleSubpane::Editor
+        && !console.autocomplete.is_empty()
+    {
+        // Anchored to the caret, not to the editor's bottom edge: the old
+        // placement covered every text row of a short editor, hiding the very
+        // line being typed. `render_editor` has just refreshed the scroll
+        // offsets, so this maps cursor → screen exactly.
+        let inner = Rect {
+            x: chunks[0].x + 1,
+            y: chunks[0].y + 1,
+            width: chunks[0].width.saturating_sub(2),
+            height: chunks[0].height.saturating_sub(2),
+        };
+        let cursor_row =
+            inner.y + (console.cursor_row.saturating_sub(console.editor_scroll)) as u16;
+        let cursor_col = inner.x
+            + GUTTER_W as u16
+            + (console.cursor_col.saturating_sub(console.editor_scroll_x)) as u16;
+        render_autocomplete(f, area, (cursor_col, cursor_row), console, theme);
     }
 }
 
-/// Small overlay at the bottom of the editor showing live autocomplete
-/// suggestions. Tab inserts the highlighted one.
-fn render_autocomplete(f: &mut Frame, area: Rect, console: &QueryConsole, theme: &Theme) {
-    let height = 6.min(area.height.saturating_sub(1));
-    let popup_area = Rect {
-        x: area.x + 1,
-        y: area.y + area.height.saturating_sub(height),
-        width: area.width.saturating_sub(2),
-        height,
-    };
-    if popup_area.height < 3 {
-        return;
+/// Where the suggestion box goes: just under the caret when it fits, just
+/// above it when the pane's bottom is too close, and never on the caret's own
+/// row. `None` when the pane is too short to hold a box at all.
+///
+/// Split out of the renderer so the placement rules are testable.
+fn autocomplete_rect(
+    area: Rect,
+    cursor: (u16, u16),
+    items: u16,
+    widest: u16,
+) -> Option<Rect> {
+    let (cur_x, cur_y) = cursor;
+    let height = (items + 2).min(AC_POPUP_H).min(area.height);
+    if height < 3 {
+        return None;
     }
+    // Width follows the longest suggestion, not the pane: a list of short
+    // keywords should not draw a box across the whole screen.
+    let title_w = " Complete (Tab) ".len() as u16 + 2;
+    let width = (widest + 6).max(title_w).min(area.width);
+
+    let below = cur_y.saturating_add(1);
+    let y = if below + height <= area.y + area.height {
+        below
+    } else {
+        // Above the caret; if even that does not fit, sit at the top of the
+        // pane — still clear of the caret row whenever the pane allows.
+        cur_y.saturating_sub(height).max(area.y)
+    };
+    let x = cur_x.min((area.x + area.width).saturating_sub(width));
+    Some(Rect {
+        x,
+        y,
+        width,
+        height,
+    })
+}
+
+/// Suggestion list, floating just under the caret (or above it when the
+/// bottom of the pane is closer). It may overlap the result grid — a
+/// transient popup over results is far cheaper than one over the query being
+/// written.
+///
+/// `cursor` is the caret's screen position; `area` is the whole console pane,
+/// which bounds the popup.
+fn render_autocomplete(
+    f: &mut Frame,
+    area: Rect,
+    cursor: (u16, u16),
+    console: &QueryConsole,
+    theme: &Theme,
+) {
+    let widest = console
+        .autocomplete
+        .iter()
+        .map(|s| s.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+    let Some(popup_area) =
+        autocomplete_rect(area, cursor, console.autocomplete.len() as u16, widest)
+    else {
+        return;
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -716,7 +828,8 @@ fn render_autocomplete(f: &mut Frame, area: Rect, console: &QueryConsole, theme:
     let sel = console
         .autocomplete_selected
         .min(console.autocomplete.len().saturating_sub(1));
-    let start = sel.saturating_sub(visible / 2);
+    // Keep the highlighted entry in view when the list is longer than the box.
+    let start = sel.saturating_sub(visible.saturating_sub(1));
     let mut lines = Vec::new();
     for (i, s) in console
         .autocomplete
@@ -1296,9 +1409,12 @@ mod tests {
         assert!(s.contains(&"name".to_string()));
         assert!(!s.contains(&"id".to_string()));
 
-        // Otherwise keywords.
+        // Otherwise keywords — matching the case the user is typing in.
         let s = suggest("SEL", &tables, &cache);
         assert!(s.contains(&"SELECT".to_string()));
+        let s = suggest("sel", &tables, &cache);
+        assert!(s.contains(&"select".to_string()), "got {s:?}");
+        assert!(!s.contains(&"SELECT".to_string()), "case was rewritten");
 
         // Trailing space after FROM → suggest all tables.
         let s = suggest("SELECT * FROM ", &tables, &cache);
@@ -1307,4 +1423,74 @@ mod tests {
 
         // Keyword context with empty prefix → no keyword noise.
         assert!(suggest("SELECT ", &tables, &cache).is_empty());
-    }}
+    }
+
+    #[test]
+    fn test_suggest_stays_quiet_until_it_has_something_to_say() {
+        let cache = std::collections::HashMap::new();
+        let tables = vec!["users".to_string(), "orders".to_string()];
+
+        // One typed character matched up to eight keywords; the popup was
+        // open from the first keystroke of nearly every word.
+        assert!(suggest("s", &tables, &cache).is_empty());
+        assert!(suggest("SELECT * FROM users WHERE a", &tables, &cache).is_empty());
+        assert!(!suggest("se", &tables, &cache).is_empty());
+
+        // A finished word suggests only itself — that is not a suggestion.
+        assert!(suggest("select", &tables, &cache).is_empty());
+        assert!(suggest("SELECT", &tables, &cache).is_empty());
+        // …but a word that is still a prefix of others keeps suggesting.
+        assert!(!suggest("in", &tables, &cache).is_empty());
+
+        // Same rule for tables and columns.
+        assert!(suggest("SELECT * FROM users", &tables, &cache).is_empty());
+        assert!(!suggest("SELECT * FROM o", &tables, &cache).is_empty());
+    }
+
+    #[test]
+    fn test_ctrl_space_ignores_the_prefix_threshold() {
+        let cache = std::collections::HashMap::new();
+        let tables = vec!["users".to_string()];
+        // Typing `s` stays quiet, but asking explicitly answers.
+        assert!(suggest("s", &tables, &cache).is_empty());
+        assert!(!suggest_forced("s", &tables, &cache).is_empty());
+    }    #[test]
+    fn test_autocomplete_box_never_covers_the_caret() {
+        // A 24-row console pane, caret near the top: the box hangs below.
+        let area = Rect::new(0, 0, 80, 24);
+        let r = autocomplete_rect(area, (10, 3), 4, 6).expect("fits");
+        assert!(r.y > 3, "box must start below the caret row, got {r:?}");
+        assert_eq!(r.x, 10, "box aligns with the caret column");
+
+        // Caret near the bottom: the box flips above it rather than
+        // overlapping the line being typed.
+        let r = autocomplete_rect(area, (10, 22), 4, 6).expect("fits");
+        assert!(
+            r.y + r.height <= 22,
+            "box must end above the caret row, got {r:?}"
+        );
+
+        // Width follows the content, not the pane.
+        let r = autocomplete_rect(area, (0, 3), 2, 6).expect("fits");
+        assert!(r.width < area.width, "box spans the pane: {r:?}");
+
+        // A caret at the right edge pulls the box back inside the pane.
+        let r = autocomplete_rect(area, (79, 3), 4, 20).expect("fits");
+        assert!(r.x + r.width <= 80, "box runs off the right edge: {r:?}");
+
+        // Too short a pane: no box at all rather than a broken one.
+        assert!(autocomplete_rect(Rect::new(0, 0, 80, 2), (10, 0), 4, 6).is_none());
+    }
+
+    #[test]
+    fn test_autocomplete_box_height_follows_the_list() {
+        let area = Rect::new(0, 0, 80, 24);
+        // One suggestion → borders + one row.
+        assert_eq!(autocomplete_rect(area, (0, 0), 1, 6).unwrap().height, 3);
+        // A long list is capped instead of filling the pane.
+        assert_eq!(
+            autocomplete_rect(area, (0, 0), 40, 6).unwrap().height,
+            AC_POPUP_H
+        );
+    }
+}

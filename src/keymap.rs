@@ -38,7 +38,7 @@ pub const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 50] = [
+pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 51] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
@@ -48,6 +48,7 @@ pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 50] = [
     ("s / S (in table tab)", "add a sort column (asc/desc/off) / clear all sorting"),
     ("Ctrl+B", "collapse / restore the explorer tree"),
     ("Ctrl+Space (in editor)", "ask for autocomplete suggestions"),
+    ("Tab / Esc (suggestions open)", "accept the highlighted suggestion / dismiss the list"),
     ("Esc (while running)", "cancel the query in flight"),
     ("Ctrl+R", "reconnect after a dropped connection"),
     ("Ctrl+Shift+I", "import rows from a CSV file into the active table"),

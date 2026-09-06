@@ -136,15 +136,26 @@ fn switch_tab(exp: &mut crate::ui::screens::explorer::ExplorerState, delta: isiz
 /// before the cursor.
 fn refresh_autocomplete(
     c: &mut crate::ui::screens::query::QueryConsole,
+    enabled: bool,
+    forced: bool,
     tables: &[String],
     columns: &std::collections::HashMap<String, Vec<String>>,
 ) {
+    if !enabled {
+        c.autocomplete.clear();
+        c.autocomplete_selected = 0;
+        return;
+    }
     let before = c
         .lines
         .get(c.cursor_row)
         .map(|l| l.chars().take(c.cursor_col).collect::<String>())
         .unwrap_or_default();
-    c.autocomplete = crate::ui::screens::query::suggest(&before, tables, columns);
+    c.autocomplete = if forced {
+        crate::ui::screens::query::suggest_forced(&before, tables, columns)
+    } else {
+        crate::ui::screens::query::suggest(&before, tables, columns)
+    };
     c.autocomplete_selected = 0;
 }
 
@@ -1737,6 +1748,14 @@ impl App {
                                     c.popup = None;
                                     return;
                                 }
+                                // Suggestions are an overlay too: Esc should
+                                // dismiss them, not throw focus to the tree
+                                // and leave them hanging.
+                                WorkspaceTab::Console(c) if !c.autocomplete.is_empty() => {
+                                    c.autocomplete.clear();
+                                    c.autocomplete_selected = 0;
+                                    return;
+                                }
                                 _ => {}
                             }
                         }
@@ -1891,24 +1910,33 @@ impl App {
                     },
                     FocusedPane::Workspace => {
                         let can_edit = exp.driver_capabilities.contains(crate::driver::Capabilities::EDIT_DATA);
-                        // Snapshot for console autocomplete (borrowed before
-                        // `active_tab_mut` takes &mut on `exp`).
-                        let (ac_tables, ac_columns) = (
-                            exp.tables
-                                .values()
-                                .flatten()
-                                .map(|c| c.name.clone())
-                                .collect::<Vec<String>>(),
-                            exp.column_cache.clone(),
-                        );
                         // Console text is only SQL for the SQL drivers; the
-                        // formatter and other SQL-shaped helpers must not run
-                        // on a Redis or Mongo console.
+                        // formatter, the suggestion engine and other
+                        // SQL-shaped helpers must not run on a Redis or Mongo
+                        // console (`SET` there is a command, not a keyword).
                         let sql_console = self
                             .active_driver
                             .as_ref()
                             .map(|d| d.console_dialect() == crate::driver::ConsoleDialect::Sql)
                             .unwrap_or(true);
+                        // Snapshot for console autocomplete (borrowed before
+                        // `active_tab_mut` takes &mut on `exp`). Built only
+                        // for a SQL console: cloning the whole column cache on
+                        // every keystroke of every pane is pure waste.
+                        let needs_ac =
+                            sql_console && matches!(exp.active_tab(), Some(WorkspaceTab::Console(_)));
+                        let (ac_tables, ac_columns) = if needs_ac {
+                            (
+                                exp.tables
+                                    .values()
+                                    .flatten()
+                                    .map(|c| c.name.clone())
+                                    .collect::<Vec<String>>(),
+                                exp.column_cache.clone(),
+                            )
+                        } else {
+                            (Vec::new(), std::collections::HashMap::new())
+                        };
                         if let Some(tab) = exp.active_tab_mut() {
                             match tab {
                                 WorkspaceTab::Table(t) => {
@@ -2423,7 +2451,7 @@ impl App {
                                         KeyCode::Char(' ')
                                             if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                         {
-                                            refresh_autocomplete(c, &ac_tables, &ac_columns);
+                                            refresh_autocomplete(c, needs_ac, true, &ac_tables, &ac_columns);
                                             if c.autocomplete.is_empty() {
                                                 self.toasts.push(
                                                     ToastKind::Info,
@@ -2433,11 +2461,11 @@ impl App {
                                         }
                                         KeyCode::Backspace => {
                                             c.backspace();
-                                            refresh_autocomplete(c, &ac_tables, &ac_columns);
+                                            refresh_autocomplete(c, needs_ac, false, &ac_tables, &ac_columns);
                                         }
                                         KeyCode::Delete => {
                                             c.delete_forward();
-                                            refresh_autocomplete(c, &ac_tables, &ac_columns);
+                                            refresh_autocomplete(c, needs_ac, false, &ac_tables, &ac_columns);
                                         }
                                         // Home/End and their emacs equivalents,
                                         // which terminals deliver more reliably.
@@ -2603,7 +2631,7 @@ impl App {
                                         KeyCode::Char(ch) => {
                                             if !key.modifiers.contains(KeyModifiers::CONTROL) {
                                                 c.insert_char(ch);
-                                                refresh_autocomplete(c, &ac_tables, &ac_columns);
+                                                refresh_autocomplete(c, needs_ac, false, &ac_tables, &ac_columns);
                                             }
                                         }
                                         _ => {}
