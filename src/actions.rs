@@ -166,9 +166,9 @@ pub fn start_console_query(
     // Split on `;` and drop pure comments, so a script of only comments is
     // reported as empty rather than "succeeding" with nothing.
     let statements: Vec<String> =
-        crate::ui::screens::query::split_statements_for(dialect, &query_text)
+        crate::console::split_statements_for(dialect, &query_text)
             .into_iter()
-            .filter(|s| !crate::ui::screens::query::is_comment_only(s))
+            .filter(|s| !crate::console::is_comment_only(s))
             .collect();
 
     let tab = exp.active_tab_index;
@@ -261,9 +261,9 @@ pub fn retry_console_query(
     use_tx: bool,
 ) {
     let statements: Vec<String> =
-        crate::ui::screens::query::split_statements_for(drv.console_dialect(), query_text)
+        crate::console::split_statements_for(drv.console_dialect(), query_text)
             .into_iter()
-            .filter(|s| !crate::ui::screens::query::is_comment_only(s))
+            .filter(|s| !crate::console::is_comment_only(s))
             .collect();
     if statements.is_empty() {
         return;

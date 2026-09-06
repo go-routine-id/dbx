@@ -728,6 +728,34 @@ fn json_to_bson(v: &serde_json::Value) -> Result<Bson> {
 
 /// Parse the console's mini query format (see module docs). Every failure
 /// path appends the usage text so the error message teaches the format.
+/// The aggregation stages that write. Nested stages count too: `$lookup`
+/// and `$facet` carry sub-pipelines, and `$merge` inside one writes just the
+/// same.
+fn write_stage(pipeline: &[Document]) -> Option<String> {
+    const WRITE_STAGES: [&str; 2] = ["$out", "$merge"];
+
+    fn scan_bson(v: &Bson) -> Option<String> {
+        match v {
+            Bson::Document(d) => scan_doc(d),
+            Bson::Array(a) => a.iter().find_map(scan_bson),
+            _ => None,
+        }
+    }
+    fn scan_doc(d: &Document) -> Option<String> {
+        for (k, v) in d {
+            if WRITE_STAGES.contains(&k.as_str()) {
+                return Some(k.clone());
+            }
+            if let Some(hit) = scan_bson(v) {
+                return Some(hit);
+            }
+        }
+        None
+    }
+
+    pipeline.iter().find_map(scan_doc)
+}
+
 fn parse_console_command(query: &str) -> Result<ConsoleCommand> {
     // The shared console splits scripts on ';' — tolerate the stray trailing
     // one it leaves on a single-statement JSON payload.
@@ -803,6 +831,16 @@ fn parse_console_command(query: &str) -> Result<ConsoleCommand> {
                 .iter()
                 .map(|s| json_doc(s, "pipeline stage"))
                 .collect::<Result<Vec<_>>>()?;
+            // `$out` REPLACES a whole collection and `$merge` writes into one,
+            // server-side, returning no documents — so the console would show
+            // an empty grid and say nothing. The console is documented
+            // read-only; enforce that instead of trusting the pipeline.
+            if let Some(stage) = write_stage(&pipeline) {
+                bail!(
+                    "pipeline stage \"{stage}\" writes to a collection — the console is \
+                     read-only (v1). Run it from a MongoDB shell if that is what you want."
+                );
+            }
             Ok(ConsoleCommand::Aggregate {
                 collection,
                 pipeline,
@@ -1179,5 +1217,37 @@ mod tests {
         assert!(json_to_bson(&json!({ "$oid": "zz" })).is_err());
         assert!(json_to_bson(&json!({ "$date": "not-a-date" })).is_err());
         assert!(json_to_bson(&json!({ "$date": true })).is_err());
+    }
+    #[test]
+    fn test_write_stages_are_rejected() {
+        // `$out` replaces the target collection outright; the console claims
+        // to be read-only, so it must never reach the server.
+        for pipeline in [
+            r#"[{"$match": {}}, {"$out": "users"}]"#,
+            r#"[{"$merge": {"into": "users", "whenMatched": "replace"}}]"#,
+            // Nested inside a sub-pipeline.
+            r#"[{"$lookup": {"from": "a", "pipeline": [{"$out": "b"}], "as": "x"}}]"#,
+            r#"[{"$facet": {"side": [{"$merge": {"into": "b"}}]}}]"#,
+        ] {
+            let q = format!(r#"{{"collection": "orders", "aggregate": {pipeline}}}"#);
+            let err = parse_console_command(&q)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "accepted!".to_string());
+            assert!(
+                err.contains("writes to a collection"),
+                "{pipeline} => {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_read_only_pipelines_still_parse() {
+        let q = r#"{"collection": "orders", "aggregate": [{"$group": {"_id": "$city", "n": {"$sum": 1}}}, {"$sort": {"n": -1}}]}"#;
+        assert!(parse_console_command(q).is_ok());
+        // A field literally named "$out" in a `$project` is not a stage but
+        // still reads as one — rejecting it is the safe direction.
+        let find = r#"{"collection": "orders", "find": {"filter": {"$out": 1}}}"#;
+        assert!(parse_console_command(find).is_ok(), "find is never a write");
     }
 }

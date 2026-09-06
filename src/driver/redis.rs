@@ -876,6 +876,17 @@ impl Driver for RedisDriver {
         if argv.is_empty() {
             return Err(anyhow!("empty command"));
         }
+        // `SELECT` would move the shared connection to another db. Every
+        // clone of a `ConnectionManager` multiplexes ONE socket, so the
+        // explorer, `records()` and any later confirmed FLUSHDB would follow
+        // it silently — and the manager's next auto-reconnect would silently
+        // move them back. Refuse instead of leaking the switch.
+        if argv[0].eq_ignore_ascii_case("SELECT") {
+            return Err(anyhow!(
+                "SELECT would change the database for everything sharing this connection — \
+                 pick the database in the explorer tree instead"
+            ));
+        }
         let mut cmd = ::redis::cmd(&argv[0]);
         for arg in &argv[1..] {
             cmd.arg(arg);

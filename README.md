@@ -151,9 +151,11 @@ run against the selected database:
 ```
 
 Extended values: `{"$oid": "<24-hex>"}` for ObjectId, `{"$date": "<rfc3339>"}`
-for BSON dates. v1 is read-only (find/aggregate, hard cap 1000 rows).
-Commands are separated by object boundaries, not `;` — several objects in one
-console run as several commands.
+for BSON dates. v1 is read-only (find/aggregate, hard cap 1000 rows): a
+pipeline containing `$out` or `$merge` — including inside a `$lookup` or
+`$facet` sub-pipeline — is rejected before it reaches the server, since those
+stages rewrite a collection. Commands are separated by object boundaries, not
+`;` — several objects in one console run as several commands.
 
 ### Redis console
 
@@ -164,8 +166,10 @@ separator — and `#` starts a comment line. Keyspace-clearing commands
 (`FLUSHDB`, `FLUSHALL`, `SCRIPT`/`FUNCTION FLUSH`, `SHUTDOWN`, `SWAPDB`,
 `REPLICAOF`/`SLAVEOF`, `CLUSTER RESET`/`FLUSHSLOTS`, and an `EVAL` whose
 script calls a flush) go through the same confirm dialog as `DROP` /
-`TRUNCATE` do in SQL. The explorer
-groups keys into collections by their first `:` prefix.
+`TRUNCATE` do in SQL. `SELECT` is refused: every pane shares one connection,
+so switching db in the console would silently move the explorer with it —
+pick the database in the tree instead. The explorer groups keys into
+collections by their first `:` prefix.
 
 All SQL is built through a generic helper layer (`quote_ident`,
 `single_row_suffix`, `render_*`, `build_where_for_row`, `build_insert_sql`)
@@ -268,9 +272,9 @@ drivers. SQL Server (tiberius) has no client-certificate API in the pinned
 driver version, and the MongoDB driver builds its URI without them — the
 fields are ignored there.
 
-`ssl_mode` takes `require` (encrypt) or `verify` (encrypt **and** validate the
-server certificate). What `require` means in practice differs per driver,
-because each one delegates to its own TLS stack:
+`ssl_mode` takes `disable` (plaintext), `require` (encrypt) or `verify`
+(encrypt **and** validate the server certificate). What `require` means in
+practice differs per driver, because each one delegates to its own TLS stack:
 
 | Driver | `require` | `verify` |
 |---|---|---|

@@ -587,7 +587,7 @@ pub fn is_destructive_statement(query: &str) -> bool {
     // Use the SAME splitter the executor uses (`split_statements`), so a
     // DROP hidden behind a `-- comment; more` can't slip past the guard
     // while the executor still runs it.
-    crate::ui::screens::query::split_statements(query)
+    crate::console::split_statements(query)
         .iter()
         .any(|s| is_destructive_stmt(strip_leading_comments(s)))
 }
@@ -602,7 +602,7 @@ pub fn is_destructive_for(dialect: crate::driver::ConsoleDialect, query: &str) -
     match dialect {
         ConsoleDialect::Sql => is_destructive_statement(query),
         ConsoleDialect::RedisCommand => {
-            crate::ui::screens::query::split_statements_for(dialect, query)
+            crate::console::split_statements_for(dialect, query)
                 .iter()
                 .any(|s| is_destructive_redis_command(s))
         }

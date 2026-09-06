@@ -3,6 +3,7 @@
 mod actions;
 mod app;
 mod clipboard;
+mod console;
 mod config;
 mod driver;
 mod explain;

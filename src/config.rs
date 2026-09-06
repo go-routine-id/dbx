@@ -56,6 +56,10 @@ where
 {
     let s = Option::<String>::deserialize(d)?;
     Ok(s.and_then(|v| match v.to_lowercase().as_str() {
+        // Without this arm `disable` fell through to `None` (= driver
+        // default), which on sqlx means "prefer TLS" and on ClickHouse:8443
+        // means TLS — the opposite of what the user wrote.
+        "disable" | "disabled" | "off" | "false" | "none" => Some(SslMode::Disable),
         "require" | "required" => Some(SslMode::Require),
         "verify" | "verify-full" | "verify_ca" | "verify_identity" | "verify_full" => {
             Some(SslMode::Verify)
@@ -562,5 +566,28 @@ driver = "mysql"
             cfg.query_collections.iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
             vec!["reporting"]
         );
+    }
+    #[test]
+    fn test_ssl_mode_disable_is_parseable() {
+        // `disable` used to fall through to None (= driver default), so an
+        // explicit "no TLS" silently negotiated TLS anyway.
+        let base = "[[connections]]\nname = \"c\"\ndriver = \"mysql\"\nhost = \"h\"\n";
+        for spelling in ["disable", "disabled", "off", "DISABLE"] {
+            let cfg: AppConfig =
+                toml::from_str(&format!("{base}ssl_mode = \"{spelling}\"\n")).unwrap();
+            assert_eq!(
+                cfg.connections[0].ssl_mode,
+                Some(SslMode::Disable),
+                "spelling {spelling}"
+            );
+            assert_eq!(
+                cfg.connections[0].effective_ssl_mode(),
+                Some(SslMode::Disable)
+            );
+        }
+        // An unknown spelling still degrades to the driver default rather
+        // than failing the whole config parse.
+        let cfg: AppConfig = toml::from_str(&format!("{base}ssl_mode = \"prefer\"\n")).unwrap();
+        assert_eq!(cfg.connections[0].ssl_mode, None);
     }
 }

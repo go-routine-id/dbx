@@ -1901,6 +1901,14 @@ impl App {
                                 .collect::<Vec<String>>(),
                             exp.column_cache.clone(),
                         );
+                        // Console text is only SQL for the SQL drivers; the
+                        // formatter and other SQL-shaped helpers must not run
+                        // on a Redis or Mongo console.
+                        let sql_console = self
+                            .active_driver
+                            .as_ref()
+                            .map(|d| d.console_dialect() == crate::driver::ConsoleDialect::Sql)
+                            .unwrap_or(true);
                         if let Some(tab) = exp.active_tab_mut() {
                             match tab {
                                 WorkspaceTab::Table(t) => {
@@ -2574,10 +2582,23 @@ impl App {
                                                     .push(ToastKind::Info, "watch off".to_string()),
                                             }
                                         }
-                                        // Ctrl+F: pretty-print the SQL.
+                                        // Ctrl+F: pretty-print the SQL. Only SQL —
+                                        // the formatter breaks lines on SQL
+                                        // keywords, which on a Redis console turns
+                                        // `CONFIG SET x 1` into two broken commands
+                                        // and on a Mongo one eats `$group` as a
+                                        // dollar-quote.
                                         KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                            let formatted = crate::ui::screens::query::format_sql(&c.text());
-                                            c.set_text(formatted);
+                                            if sql_console {
+                                                let formatted = crate::ui::screens::query::format_sql(&c.text());
+                                                c.set_text(formatted);
+                                            } else {
+                                                self.toasts.push(
+                                                    ToastKind::Info,
+                                                    "formatting is SQL-only — this console speaks another language"
+                                                        .to_string(),
+                                                );
+                                            }
                                         }
                                         KeyCode::Char(ch) => {
                                             if !key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -3723,21 +3744,34 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             app.toasts.push(ToastKind::Info, "executing confirmed statement...".to_string());
                             // Execute each split statement (same as the console),
                             // so a confirmed destructive script runs all of it.
-                            let statements = crate::ui::screens::query::split_statements_for(
+                            let statements = crate::console::split_statements_for(
                                 drv_clone.console_dialect(),
                                 &sql,
                             );
-                            let mut affected = 0u64;
+                            // Autocommit off means the confirmed statement must
+                            // land INSIDE the transaction, like every console run
+                            // — the destructive guard returns before
+                            // `start_console_query` opens one, so this path has to
+                            // do it itself or the delete commits unrollbackable.
                             let mut exec_err: Option<String> = None;
-                            for stmt in &statements {
-                                if crate::ui::screens::query::is_comment_only(stmt) {
-                                    continue;
-                                }
-                                match drv_clone.execute(&cref.namespace, stmt).await {
-                                    Ok(res) => affected += res.rows_affected,
-                                    Err(e) => {
-                                        exec_err = Some(format!("{e:#}"));
-                                        break;
+                            if !app.autocommit
+                                && !drv_clone.in_tx().await
+                                && let Err(e) = drv_clone.begin_tx().await
+                            {
+                                exec_err = Some(format!("failed to begin transaction: {e:#}"));
+                            }
+                            let mut affected = 0u64;
+                            if exec_err.is_none() {
+                                for stmt in &statements {
+                                    if crate::console::is_comment_only(stmt) {
+                                        continue;
+                                    }
+                                    match drv_clone.execute(&cref.namespace, stmt).await {
+                                        Ok(res) => affected += res.rows_affected,
+                                        Err(e) => {
+                                            exec_err = Some(format!("{e:#}"));
+                                            break;
+                                        }
                                     }
                                 }
                             }
@@ -5429,9 +5463,9 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             .map(|d| d.console_dialect())
                             .unwrap_or(crate::driver::ConsoleDialect::Sql);
                         let single_statement =
-                            crate::ui::screens::query::split_statements_for(dialect, &text)
+                            crate::console::split_statements_for(dialect, &text)
                                 .into_iter()
-                                .filter(|s| !crate::ui::screens::query::is_comment_only(s))
+                                .filter(|s| !crate::console::is_comment_only(s))
                                 .count()
                                 == 1;
                         let retried = match &outcome {
