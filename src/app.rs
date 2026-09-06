@@ -160,11 +160,19 @@ fn refresh_autocomplete(
         c.autocomplete_selected = 0;
         return;
     }
-    let before = c
-        .lines
-        .get(c.cursor_row)
-        .map(|l| l.chars().take(c.cursor_col).collect::<String>())
-        .unwrap_or_default();
+    // Everything up to the caret, not just its own line: the suggestion
+    // engine reads the query's `FROM` clause for aliases, table lists and
+    // unqualified columns, and a query of any length puts that on an earlier
+    // line — `Ctrl+F` exists to break one across lines.
+    let mut before = String::new();
+    for (i, line) in c.lines.iter().enumerate().take(c.cursor_row + 1) {
+        if i == c.cursor_row {
+            before.extend(line.chars().take(c.cursor_col));
+            break;
+        }
+        before.push_str(line);
+        before.push('\n');
+    }
     c.autocomplete = if req == AcRequest::Forced {
         crate::ui::screens::query::suggest_forced(&before, tables, columns)
     } else {
@@ -1770,7 +1778,19 @@ impl App {
                     // Enter → execute CREATE TABLE in the event loop.
                 }
 
+                // A tab in a text-input mode owns its letters: `q` typed into
+                // a search box must not quit dbx, and `?` must not open help.
+                // Esc still reaches the screen-level arm below, which is where
+                // every input mode is cancelled.
+                let typing_into_a_field = key.code != KeyCode::Esc
+                    && exp.active_tab().is_some_and(|t| match t {
+                        WorkspaceTab::Table(t) => t.search_editing || t.filter_editing,
+                        WorkspaceTab::Console(c) => c.search_editing,
+                        WorkspaceTab::Erd(_) => false,
+                    });
+
                 match key.code {
+                    _ if typing_into_a_field => {}
                     KeyCode::Esc => {
                         // Overlays with their own Esc handler close first, so
                         // Esc still dismisses them (don't hijack into
@@ -1798,6 +1818,19 @@ impl App {
                                 {
                                     c.autocomplete.clear();
                                     c.autocomplete_selected = 0;
+                                    return;
+                                }
+                                // The result pane's own modes cancel here too:
+                                // their Esc arms sit below this one and were
+                                // never reached, so a search could only be
+                                // left by committing it.
+                                WorkspaceTab::Console(c) if c.search_editing => {
+                                    c.search_editing = false;
+                                    c.search_buffer.clear();
+                                    return;
+                                }
+                                WorkspaceTab::Console(c) if c.row_detail => {
+                                    c.row_detail = false;
                                     return;
                                 }
                                 _ => {}
@@ -2544,10 +2577,12 @@ impl App {
                                             c.delete_word_left();
                                             refresh_autocomplete(c, ac_typed, &ac_tables, &ac_columns);
                                         }
-                                        // Ctrl+/ toggles `--` on the caret's
-                                        // line; many terminals send it as
-                                        // Ctrl+_ instead, so accept both.
-                                        KeyCode::Char('/') | KeyCode::Char('_')
+                                        // Ctrl+/ is byte 0x1F, which crossterm
+                                        // reports as Ctrl+7 on terminals
+                                        // without the kitty protocol; kitty
+                                        // itself sends the '/' codepoint.
+                                        // Nothing else is bound to Ctrl+7.
+                                        KeyCode::Char('/') | KeyCode::Char('7')
                                             if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                         {
                                             c.toggle_comment();
@@ -2557,7 +2592,10 @@ impl App {
                                         {
                                             c.duplicate_line();
                                         }
-                                        KeyCode::Char('K')
+                                        // Terminals disagree on the case they
+                                        // report for a shifted letter, so take
+                                        // both spellings.
+                                        KeyCode::Char('k') | KeyCode::Char('K')
                                             if key.modifiers.contains(KeyModifiers::CONTROL)
                                                 && key.modifiers.contains(KeyModifiers::SHIFT) =>
                                         {
@@ -2749,6 +2787,21 @@ impl App {
                                                 );
                                             }
                                         }
+                                        // Ctrl+Shift+Z collapses to a plain
+                                        // Ctrl+Z on terminals without the
+                                        // kitty protocol — where it would step
+                                        // BACKWARDS instead of forward — so
+                                        // Ctrl+Y is the redo that always works.
+                                        KeyCode::Char('y')
+                                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                        {
+                                            if !c.redo() {
+                                                self.toasts.push(
+                                                    ToastKind::Info,
+                                                    "nothing to redo".to_string(),
+                                                );
+                                            }
+                                        }
                                         KeyCode::Char('Z') | KeyCode::Char('z')
                                             if key.modifiers.contains(KeyModifiers::CONTROL)
                                                 && key.modifiers.contains(KeyModifiers::SHIFT) =>
@@ -2797,6 +2850,7 @@ impl App {
                                         KeyCode::Enter => {
                                             c.search_query = c.search_buffer.clone();
                                             c.search_editing = false;
+                                            c.refresh_search_matches();
                                             if let Some(&(r, col)) =
                                                 crate::ui::screens::query::result_search_matches(c)
                                                     .first()
@@ -2867,7 +2921,8 @@ impl App {
                                             if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                         {
                                             let hits =
-                                                crate::ui::screens::query::result_search_matches(c);
+                                                crate::ui::screens::query::result_search_matches(c)
+                                                    .to_vec();
                                             if hits.is_empty() {
                                                 self.toasts.push(
                                                     ToastKind::Info,
@@ -4754,8 +4809,12 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             _ => continue,
                         }
                     }
+                    // Ctrl+K opens the server's process list — but with Shift
+                    // it is the editor's delete-line, which this arm sits far
+                    // ahead of and would otherwise swallow.
                     if key.modifiers.contains(KeyModifiers::CONTROL)
-                        && key.code == KeyCode::Char('k')
+                        && !key.modifiers.contains(KeyModifiers::SHIFT)
+                        && matches!(key.code, KeyCode::Char('k'))
                     {
                         if !exp
                             .driver_capabilities
@@ -5291,6 +5350,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             start_console_query(exp, drv, &mut app.toasts, &mut app.query_run, !app.autocommit, scope);
                             if let Some(WorkspaceTab::Console(c)) = exp.active_tab_mut() {
                                 c.last_run = Some(Instant::now());
+                                c.last_run_whole_buffer = scope == RunScope::Buffer;
                             }
                         } else {
                             // Workspace-level edit/navigation keys. They only
@@ -5750,14 +5810,42 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
             }
                 // A pasted block goes into the console editor whole: one
                 // insert, one undo step, no per-character suggestion churn.
+                //
+                // Every other text field in the app — the connection form, the
+                // cell editor, every search and filter box — consumes
+                // `Char` events, and bracketed paste stops those arriving. So
+                // the paste is replayed as key presses for them, which is
+                // exactly what the terminal used to send.
                 Event::Paste(text) => {
-                    if let Some(exp) = &mut app.explorer_state
-                        && exp.focused_pane == FocusedPane::Workspace
-                        && let Some(WorkspaceTab::Console(c)) = exp.active_tab_mut()
-                        && c.focused_subpane == ConsoleSubpane::Editor
-                        && c.popup.is_none()
-                    {
-                        c.insert_text(&text);
+                    let into_editor = app
+                        .explorer_state
+                        .as_mut()
+                        .filter(|exp| exp.focused_pane == FocusedPane::Workspace)
+                        .and_then(|exp| exp.active_tab_mut())
+                        .and_then(|tab| match tab {
+                            WorkspaceTab::Console(c)
+                                if c.focused_subpane == ConsoleSubpane::Editor
+                                    && c.popup.is_none() =>
+                            {
+                                Some(c)
+                            }
+                            _ => None,
+                        });
+                    match into_editor {
+                        Some(c) => c.insert_text(&text),
+                        None => {
+                            for ch in text.chars() {
+                                // Single-line fields would take a newline as
+                                // "submit"; a pasted one is not that.
+                                if ch == '\n' || ch == '\r' {
+                                    continue;
+                                }
+                                app.handle_key(KeyEvent::new(
+                                    KeyCode::Char(ch),
+                                    KeyModifiers::NONE,
+                                ));
+                            }
+                        }
                     }
                 }
                 Event::Mouse(mouse) => {
@@ -5914,9 +6002,22 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
             if watch_due
                 && let (Some(drv), Some(exp)) = (&app.active_driver.clone(), &mut app.explorer_state)
             {
-                // Watch mode re-runs what the user last asked for; the whole
-                // buffer is the stable choice — the caret may have moved.
-                start_console_query(exp, drv, &mut app.toasts, &mut app.query_run, !app.autocommit, RunScope::Buffer);
+                // Watch mode repeats the LAST run's scope. Forcing the whole
+                // buffer here would re-run, unattended and on a timer, the
+                // statements the user deliberately narrowed away from.
+                let whole_buffer = exp
+                    .active_tab()
+                    .and_then(|t| match t {
+                        WorkspaceTab::Console(c) => Some(c.last_run_whole_buffer),
+                        _ => None,
+                    })
+                    .unwrap_or(false);
+                let scope = if whole_buffer {
+                    RunScope::Buffer
+                } else {
+                    RunScope::AtCursor
+                };
+                start_console_query(exp, drv, &mut app.toasts, &mut app.query_run, !app.autocommit, scope);
                 if let Some(WorkspaceTab::Console(c)) = exp.active_tab_mut() {
                     c.last_run = Some(Instant::now());
                 }

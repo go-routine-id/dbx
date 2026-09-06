@@ -385,6 +385,16 @@ pub fn finish_console_query(
         return;
     };
     console.is_executing = false;
+    // A new result invalidates everything the old one anchored: an expanded
+    // row whose record no longer exists renders nothing while still eating
+    // every key, and a search from the previous result would highlight cells
+    // it was never run against.
+    console.row_detail = false;
+    console.row_detail_scroll = 0;
+    console.search_query.clear();
+    console.search_editing = false;
+    console.search_buffer.clear();
+    console.refresh_search_matches();
     match outcome {
         Ok(results) => {
             console.last_result = results.first().cloned();

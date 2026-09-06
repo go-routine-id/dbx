@@ -134,6 +134,11 @@ pub struct QueryConsole {
     /// Free-text search across every cell of the result, mirroring the table
     /// grid's `Ctrl+F` / `Ctrl+G`. Empty = no search active.
     pub search_query: String,
+    /// Cells matching `search_query`, in reading order. Cached because the
+    /// title shows the hit count on every frame and a console result is
+    /// whatever the driver returned — rescanning 200k rows at 16fps froze the
+    /// UI. Rebuilt by `refresh_search_matches`.
+    search_hits: Vec<(usize, usize)>,
     /// True while the query is being typed; the pane owns every key then.
     pub search_editing: bool,
     pub search_buffer: String,
@@ -147,6 +152,11 @@ pub struct QueryConsole {
     pub autocomplete_hit: Option<(Rect, usize)>,
     /// X start of each visible result column, computed at draw time.
     pub result_col_starts: Vec<u16>,
+    /// Whether the last manual run covered the whole buffer. Watch mode
+    /// repeats what the user actually asked for: re-running the whole
+    /// scratchpad on a timer after they deliberately ran one statement would
+    /// fire the very statements they were avoiding.
+    pub last_run_whole_buffer: bool,
     /// Auto re-run interval. `None` = off. Set with `Ctrl+W`; the event loop
     /// re-executes the query whenever `last_run` is older than this.
     pub watch_interval: Option<std::time::Duration>,
@@ -323,11 +333,13 @@ impl QueryConsole {
             row_detail: false,
             row_detail_scroll: 0,
             search_query: String::new(),
+            search_hits: Vec::new(),
             search_editing: false,
             search_buffer: String::new(),
             caret_screen: None,
             autocomplete_hit: None,
             result_col_starts: Vec::new(),
+            last_run_whole_buffer: false,
             watch_interval: None,
             last_run: None,
             editor_scroll: 0,
@@ -392,6 +404,33 @@ impl QueryConsole {
         self.lines = lines;
         self.cursor_row = self.lines.len().saturating_sub(1);
         self.cursor_col = self.lines.last().map(|l| l.chars().count()).unwrap_or(0);
+    }
+
+    /// Rebuild the cached search hits. Called whenever the query or the
+    /// result set changes — never from the render path.
+    pub fn refresh_search_matches(&mut self) {
+        self.search_hits.clear();
+        if self.search_query.is_empty() {
+            return;
+        }
+        let Some(res) = &self.last_result else {
+            return;
+        };
+        for (r, rec) in res.records.iter().enumerate() {
+            for (c, v) in rec.values.iter().enumerate() {
+                if crate::ui::screens::explorer::cell_matches_search(v, &self.search_query) {
+                    self.search_hits.push((r, c));
+                }
+            }
+        }
+    }
+
+    /// Drop any suggestion list. Every edit that moves the caret without
+    /// recomputing suggestions must call this: the `Enter`-accepts binding
+    /// would otherwise apply a stale pick at a caret it was never meant for.
+    fn dismiss_suggestions(&mut self) {
+        self.autocomplete.clear();
+        self.autocomplete_selected = 0;
     }
 
     /// Snapshot the editor before an edit of `kind`.
@@ -632,6 +671,7 @@ impl QueryConsole {
     /// the marker when the line is not commented, removes it when it is.
     pub fn toggle_comment(&mut self) {
         self.checkpoint(EditKind::None);
+        self.dismiss_suggestions();
         let Some(line) = self.lines.get_mut(self.cursor_row) else {
             return;
         };
@@ -652,6 +692,7 @@ impl QueryConsole {
     /// Copy the caret's line below itself, caret following the copy.
     pub fn duplicate_line(&mut self) {
         self.checkpoint(EditKind::None);
+        self.dismiss_suggestions();
         let Some(line) = self.lines.get(self.cursor_row).cloned() else {
             return;
         };
@@ -662,6 +703,7 @@ impl QueryConsole {
     /// Delete the caret's line. The buffer always keeps at least one line.
     pub fn delete_line(&mut self) {
         self.checkpoint(EditKind::None);
+        self.dismiss_suggestions();
         if self.lines.len() <= 1 {
             self.lines = vec![String::new()];
             self.cursor_row = 0;
@@ -679,6 +721,7 @@ impl QueryConsole {
     /// undo step, and no autocomplete storm from a per-character replay.
     pub fn insert_text(&mut self, text: &str) {
         self.checkpoint(EditKind::None);
+        self.dismiss_suggestions();
         for (i, part) in text.replace("\r\n", "\n").split('\n').enumerate() {
             if i > 0 {
                 // `insert_newline` would checkpoint again; splice directly.
@@ -936,6 +979,11 @@ fn suggest_inner(
 ) -> Vec<Suggestion> {
     let (head, current) = split_token(line_before_cursor);
     let toks = tokenize(head);
+    // Inside an unterminated literal or comment the caret is in data, not in
+    // SQL — completing there would write a table name into the user's string.
+    if matches!(toks.last(), Some(Tok::InLiteral)) {
+        return Vec::new();
+    }
 
     // Inside a FROM/JOIN/INTO/UPDATE table list → table names.
     if in_table_list(&toks) {
@@ -1056,27 +1104,125 @@ fn split_token(line: &str) -> (&str, &str) {
 enum Tok<'a> {
     Word(&'a str),
     Punct(char),
+    /// The caret is inside an unterminated string literal — no suggestion
+    /// belongs there at all.
+    InLiteral,
 }
 
+/// Tokenize the text before the caret.
+///
+/// String literals and comments are skipped whole: without that, the words
+/// inside `note = 'copied from '` end in the token stream and the last one
+/// being `from` opens the table list *inside the literal* — where accepting a
+/// suggestion writes a table name into the user's data. Quoted identifiers
+/// (`"users"`, `` `users` ``) are the opposite case: they name a table, so
+/// they come through as a word with the quotes stripped.
 fn tokenize(s: &str) -> Vec<Tok<'_>> {
     let mut out = Vec::new();
     let mut word_start = None;
-    for (i, c) in s.char_indices() {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+
+    macro_rules! flush {
+        () => {
+            if let Some(start) = word_start.take() {
+                out.push(Tok::Word(&s[start..i]));
+            }
+        };
+    }
+
+    while i < s.len() {
+        let c = s[i..].chars().next().unwrap();
         if is_token_char(c) {
             word_start.get_or_insert(i);
+            i += c.len_utf8();
             continue;
         }
-        if let Some(start) = word_start.take() {
-            out.push(Tok::Word(&s[start..i]));
+        flush!();
+
+        // `--` to end of line, `/* */` to its close: everything inside is
+        // prose, not query structure.
+        if c == '-' && bytes.get(i + 1) == Some(&b'-') {
+            match s[i..].find('\n') {
+                Some(nl) => i += nl + 1,
+                // The caret is inside the comment.
+                None => {
+                    out.push(Tok::InLiteral);
+                    break;
+                }
+            }
+            continue;
+        }
+        if c == '/' && bytes.get(i + 1) == Some(&b'*') {
+            match s[i + 2..].find("*/") {
+                Some(end) => i += 2 + end + 2,
+                // Unterminated: the caret is inside the comment.
+                None => {
+                    out.push(Tok::InLiteral);
+                    break;
+                }
+            }
+            continue;
+        }
+        // A string literal is data. An unterminated one means the caret sits
+        // inside it, so nothing after it is query structure either.
+        if c == '\'' {
+            match closing_quote(s, i, '\'') {
+                Some(end) => {
+                    i = end;
+                    out.push(Tok::Punct('\''));
+                }
+                None => {
+                    out.push(Tok::InLiteral);
+                    break;
+                }
+            }
+            continue;
+        }
+        // Quoted identifiers name objects, so they read as words.
+        if c == '"' || c == '`' {
+            match closing_quote(s, i, c) {
+                Some(end) => {
+                    out.push(Tok::Word(&s[i + 1..end - 1]));
+                    i = end;
+                }
+                None => {
+                    out.push(Tok::Word(&s[i + 1..]));
+                    break;
+                }
+            }
+            continue;
         }
         if !c.is_whitespace() {
             out.push(Tok::Punct(c));
         }
+        i += c.len_utf8();
     }
-    if let Some(start) = word_start {
-        out.push(Tok::Word(&s[start..]));
-    }
+    flush!();
     out
+}
+
+/// Byte index just past the closing `quote`, honouring backslash escapes and
+/// the SQL doubled-quote form (`'it''s'`). `None` when the run never closes.
+fn closing_quote(s: &str, open: usize, quote: char) -> Option<usize> {
+    let mut i = open + quote.len_utf8();
+    while i < s.len() {
+        let c = s[i..].chars().next().unwrap();
+        if c == '\\' {
+            i += 1 + s[i + 1..].chars().next().map_or(0, |n| n.len_utf8());
+            continue;
+        }
+        if c == quote {
+            let next = s[i + c.len_utf8()..].chars().next();
+            if next == Some(quote) {
+                i += 2 * c.len_utf8();
+                continue;
+            }
+            return Some(i + c.len_utf8());
+        }
+        i += c.len_utf8();
+    }
+    None
 }
 
 /// Clauses that introduce table names.
@@ -1111,7 +1257,7 @@ fn in_table_list(toks: &[Tok<'_>]) -> bool {
                     words += 1;
                     i -= 1;
                 }
-                Tok::Punct(_) => break,
+                Tok::Punct(_) | Tok::InLiteral => break,
             }
         }
         if words == 0 || i == 0 || !matches!(toks[i - 1], Tok::Punct(',')) {
@@ -1286,7 +1432,11 @@ pub fn render_query_console(
     render_editor(f, chunks[0], console, is_tab_focused, theme);
     render_result(f, chunks[1], console, is_tab_focused, theme);
 
+    // Drawn only while the result pane actually has focus: Tab used to leave
+    // it covering the editor with no key in that pane able to close it.
     if console.row_detail
+        && is_tab_focused
+        && console.focused_subpane == ConsoleSubpane::Result
         && let Some(res) = &console.last_result
         && let Some(record) = res.records.get(console.result_selected_row)
     {
@@ -1358,28 +1508,9 @@ fn autocomplete_rect(
     })
 }
 
-/// Every (row, column) whose cell matches the console's search, in reading
-/// order. Empty when no search is active.
-pub fn result_search_matches(console: &QueryConsole) -> Vec<(usize, usize)> {
-    if console.search_query.is_empty() {
-        return Vec::new();
-    }
-    let Some(res) = &console.last_result else {
-        return Vec::new();
-    };
-    res.records
-        .iter()
-        .enumerate()
-        .flat_map(|(r, rec)| {
-            rec.values
-                .iter()
-                .enumerate()
-                .filter(|(_, v)| {
-                    crate::ui::screens::explorer::cell_matches_search(v, &console.search_query)
-                })
-                .map(move |(c, _)| (r, c))
-        })
-        .collect()
+/// The cells matching the console's search, in reading order.
+pub fn result_search_matches(console: &QueryConsole) -> &[(usize, usize)] {
+    &console.search_hits
 }
 
 /// Suggestion list, floating just under the editor pane. It overlaps the
@@ -1533,7 +1664,12 @@ fn render_editor(
         theme.border()
     };
 
-    let title = format!(" SQL Editor: {} [F5 / Ctrl+Enter / Alt+Enter to run] ", console.title);
+    // The two run keys are no longer interchangeable, and this title is the
+    // only place most users ever read the binding.
+    let title = format!(
+        " SQL Editor: {} [Ctrl+Enter: statement · F5: whole buffer] ",
+        console.title
+    );
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -2433,12 +2569,53 @@ mod tests {
 
     #[test]
     fn test_undo_history_is_bounded() {
-        let mut c = QueryConsole::new("t".to_string(), Some(""));
+        let mut c = QueryConsole::new("t".to_string(), Some("original"));
         // Each set_text is its own step; go well past the cap.
         for i in 0..(UNDO_DEPTH + 50) {
             c.set_text(format!("q{i}"));
         }
-        assert!(c.undo_stack.len() <= UNDO_DEPTH, "history grew unbounded");
+        assert_eq!(c.undo_stack.len(), UNDO_DEPTH, "cap not reached or exceeded");
+        // The oldest steps really are gone: undoing the whole history cannot
+        // walk back to the text from before the cap.
+        while c.undo() {}
+        assert_ne!(c.text(), "original", "history kept more than the cap");
+    }
+
+    #[test]
+    fn test_suggest_stays_out_of_string_literals_and_comments() {
+        // `… note = 'copied from ` used to end in the word `from`, opening the
+        // table list INSIDE the literal — where accepting writes a table name
+        // into the user's data.
+        let cache = std::collections::HashMap::new();
+        let tables = vec!["users".to_string(), "orders".to_string()];
+        assert!(
+            suggest("SELECT * FROM t WHERE note = 'copied from ", &tables, &cache).is_empty(),
+            "suggested inside a string literal"
+        );
+        assert!(
+            suggest("SELECT 1 -- pick a table from ", &tables, &cache).is_empty(),
+            "suggested inside a line comment"
+        );
+        // A closed literal is data the caret has left, so SQL resumes after it.
+        assert!(
+            !suggest("SELECT 'x' FROM ", &tables, &cache).is_empty(),
+            "a closed literal should not silence the rest of the query"
+        );
+    }
+
+    #[test]
+    fn test_suggest_reads_quoted_identifiers_as_table_names() {
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(
+            "shop.users".to_string(),
+            vec!["id".to_string(), "email".to_string()],
+        );
+        let tables = vec!["users".to_string()];
+        assert!(
+            texts(&suggest("SELECT * FROM \"users\" u WHERE u.em", &tables, &cache))
+                .contains(&"email".to_string()),
+            "a quoted table name contributed no alias"
+        );
     }
     fn console(text: &str) -> QueryConsole {
         QueryConsole::new("t".to_string(), Some(text))
@@ -2540,5 +2717,29 @@ mod tests {
         assert_eq!((c.cursor_row, c.cursor_col), (4, 1));
         c.move_to_buffer_edge(false);
         assert_eq!((c.cursor_row, c.cursor_col), (0, 0));
+    }
+    #[test]
+    fn test_suggest_reads_the_whole_query_not_just_one_line() {
+        // The editor is multi-line by nature — `Ctrl+F` exists to break a
+        // query across lines — so a `FROM` clause on an earlier line must
+        // still drive aliases, table lists and unqualified columns.
+        let mut cache = std::collections::HashMap::new();
+        cache.insert(
+            "shop.users".to_string(),
+            vec!["id".to_string(), "email".to_string()],
+        );
+        let tables = vec!["users".to_string()];
+
+        let multi = "SELECT *\nFROM users u\nWHERE u.em";
+        assert!(
+            texts(&suggest(multi, &tables, &cache)).contains(&"email".to_string()),
+            "alias on an earlier line was not resolved"
+        );
+
+        let multi = "SELECT *\nFROM users\nWHERE em";
+        assert!(
+            texts(&suggest(multi, &tables, &cache)).contains(&"email".to_string()),
+            "unqualified column from an earlier FROM was not offered"
+        );
     }
 }

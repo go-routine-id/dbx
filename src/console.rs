@@ -181,20 +181,40 @@ pub fn statement_at(
     text: &str,
     offset: usize,
 ) -> Option<(std::ops::Range<usize>, String)> {
+    // Trimmed ranges, not raw spans: a span starts right after the previous
+    // `;`, so the blank line UNDER a statement belongs to the next one. Using
+    // raw spans made a caret parked below `SELECT …;` run the statement after
+    // it — the opposite of what this function promises.
     let spans: Vec<std::ops::Range<usize>> = statement_spans(dialect, text)
         .into_iter()
+        .filter_map(|r| trimmed_range(text, r))
         .filter(|r| {
-            let s = text[r.clone()].trim();
-            !s.is_empty() && !is_dropped(dialect, s)
+            let s = &text[r.clone()];
+            !is_dropped(dialect, s) && !(dialect == ConsoleDialect::Sql && is_comment_only(s))
         })
         .collect();
 
     let hit = spans
         .iter()
         .find(|r| offset >= r.start && offset <= r.end)
+        // Otherwise the statement the caret sits BELOW — the one just
+        // finished, which is what pressing run there means.
         .or_else(|| spans.iter().rev().find(|r| r.end <= offset))
         .or_else(|| spans.first())?;
-    Some((hit.clone(), text[hit.clone()].trim().to_string()))
+    Some((hit.clone(), text[hit.clone()].to_string()))
+}
+
+/// `range` with leading and trailing whitespace removed, or `None` when it
+/// holds nothing but whitespace.
+fn trimmed_range(text: &str, range: std::ops::Range<usize>) -> Option<std::ops::Range<usize>> {
+    let slice = &text[range.clone()];
+    let lead = slice.len() - slice.trim_start().len();
+    let trimmed = slice.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let start = range.start + lead;
+    Some(start..start + trimmed.len())
 }
 
 /// Byte offset of a (row, column) caret in `text`, both zero-based and
@@ -614,5 +634,34 @@ mod tests {
         assert_eq!(offset_of(text, 0, 99), 6);
         // Past the last row clamps to the end of the text.
         assert_eq!(offset_of(text, 99, 0), text.len());
+    }
+    #[test]
+    fn test_statement_at_never_reaches_past_the_caret() {
+        // A span starts right after the previous `;`, so the blank line under
+        // a statement lives inside the NEXT span. Picking by raw span made a
+        // caret parked below `SELECT …;` run the UPDATE beneath it.
+        let sql = "SELECT * FROM users;\n\nUPDATE users SET active = 0 WHERE id = 1;";
+        for (row, col) in [(0usize, 20usize), (1, 0)] {
+            let off = offset_of(sql, row, col);
+            let (_, stmt) = statement_at(ConsoleDialect::Sql, sql, off).unwrap();
+            assert_eq!(
+                stmt, "SELECT * FROM users",
+                "caret at row {row} col {col} reached the statement below it"
+            );
+        }
+        // On the UPDATE's own line it does run the UPDATE.
+        let off = offset_of(sql, 2, 3);
+        let (_, stmt) = statement_at(ConsoleDialect::Sql, sql, off).unwrap();
+        assert!(stmt.starts_with("UPDATE"), "got {stmt}");
+    }
+
+    #[test]
+    fn test_statement_at_skips_a_trailing_comment() {
+        // Leaving the caret on a note under a query is normal; running it
+        // must re-run the query, not report "empty query" and wipe the grid.
+        let sql = "SELECT * FROM orders;\n-- TODO: add WHERE";
+        let off = offset_of(sql, 1, 5);
+        let (_, stmt) = statement_at(ConsoleDialect::Sql, sql, off).unwrap();
+        assert_eq!(stmt, "SELECT * FROM orders");
     }
 }
