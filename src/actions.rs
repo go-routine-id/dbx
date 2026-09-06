@@ -111,12 +111,24 @@ pub struct QueryRun {
 /// Everything that needs the UI (the destructive-statement guard, empty input,
 /// the multi-statement warning) happens here, synchronously; only the actual
 /// round trips move to a task. `run` receives the handle to poll.
+/// How much of the console buffer a run covers.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum RunScope {
+    /// Everything in the editor, `;`-separated (F5).
+    Buffer,
+    /// Only the statement the caret is in (Ctrl+Enter / Alt+Enter) — the
+    /// console-as-scratchpad workflow, and the reason a buffer that also
+    /// holds a `DELETE` is safe to keep around.
+    AtCursor,
+}
+
 pub fn start_console_query(
     exp: &mut crate::ui::screens::explorer::ExplorerState,
     drv: &Arc<dyn crate::driver::Driver>,
     toasts: &mut Toasts,
     run: &mut Option<QueryRun>,
     use_tx: bool,
+    scope: RunScope,
 ) {
     // Only one query at a time: starting a second would orphan the first,
     // leaving its console spinning forever with no way to cancel it.
@@ -137,16 +149,39 @@ pub fn start_console_query(
             .unwrap_or(crate::driver::Namespace("mysql".to_string()))
     };
 
-    let query_text = if let Some(WorkspaceTab::Console(c)) = exp.active_tab() {
-        c.text()
-    } else {
+    let dialect = drv.console_dialect();
+    let Some(WorkspaceTab::Console(console)) = exp.active_tab() else {
         return;
+    };
+    let buffer = console.text();
+    let mut narrowed_of = None;
+    let query_text = match scope {
+        RunScope::Buffer => buffer,
+        RunScope::AtCursor => {
+            let offset =
+                crate::console::offset_of(&buffer, console.cursor_row, console.cursor_col);
+            match crate::console::statement_at(dialect, &buffer, offset) {
+                Some((span, stmt)) => {
+                    // Only worth saying when the buffer holds more than the
+                    // one statement — otherwise the two scopes are identical.
+                    let all = crate::console::statement_spans(dialect, &buffer)
+                        .into_iter()
+                        .filter(|r| !buffer[r.clone()].trim().is_empty())
+                        .collect::<Vec<_>>();
+                    if all.len() > 1 {
+                        let n = all.iter().position(|r| r.start == span.start).unwrap_or(0) + 1;
+                        narrowed_of = Some((n, all.len()));
+                    }
+                    stmt
+                }
+                None => buffer,
+            }
+        }
     };
 
     // Destructive statement guard: DROP / TRUNCATE / DELETE-without-WHERE must
     // be confirmed first. Reuses the SQL-confirm modal with a placeholder
     // collection — that path only needs the namespace.
-    let dialect = drv.console_dialect();
     if is_destructive_for(dialect, &query_text) {
         toasts.push(
             ToastKind::Warning,
@@ -195,6 +230,12 @@ pub fn start_console_query(
         toasts.push(
             ToastKind::Warning,
             "multi-statement: SET @x / BEGIN..COMMIT won't persist between statements".to_string(),
+        );
+    }
+    if let Some((n, total)) = narrowed_of {
+        toasts.push(
+            ToastKind::Info,
+            format!("running statement {n} of {total} (F5 runs all)"),
         );
     }
     console.is_executing = true;

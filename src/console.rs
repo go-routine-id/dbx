@@ -43,14 +43,17 @@ pub fn dollar_quote_end(s: &str, i: usize) -> Option<usize> {
     Some(j + close + tag.len())
 }
 
-/// Split a query into individual `;`-separated statements, ignoring `;`
+/// Byte ranges of the `;`-separated statements in a query, ignoring `;`
 /// inside string literals (incl. backslash-escaped quotes), backtick
 /// identifiers, `--` line comments (only when followed by whitespace, per
 /// the SQL standard / MySQL), `/* */` block comments, and PostgreSQL
-/// `$tag$` dollar-quoted bodies. Returns trimmed, non-empty statements.
-pub fn split_statements(sql: &str) -> Vec<String> {
-    let mut stmts = Vec::new();
-    let mut cur = String::new();
+/// `$tag$` dollar-quoted bodies.
+///
+/// Ranges rather than strings so a caller can ask which statement the caret
+/// is in; [`split_statements`] trims them into the text to execute.
+fn sql_spans(sql: &str) -> Vec<std::ops::Range<usize>> {
+    let mut stmts: Vec<std::ops::Range<usize>> = Vec::new();
+    let mut start = 0usize;
     let mut in_string: Option<char> = None;
     let mut in_line_comment = false;
     let mut in_block_comment = false;
@@ -60,7 +63,6 @@ pub fn split_statements(sql: &str) -> Vec<String> {
     while i < bytes.len() {
         let c = sql[i..].chars().next().unwrap();
         if in_line_comment {
-            cur.push(c);
             if c == '\n' {
                 in_line_comment = false;
             }
@@ -68,9 +70,7 @@ pub fn split_statements(sql: &str) -> Vec<String> {
             continue;
         }
         if in_block_comment {
-            cur.push(c);
             if c == '*' && bytes.get(i + 1) == Some(&b'/') {
-                cur.push('/');
                 in_block_comment = false;
                 i += 2;
             } else {
@@ -79,15 +79,12 @@ pub fn split_statements(sql: &str) -> Vec<String> {
             continue;
         }
         if let Some(q) = in_string {
-            cur.push(c);
             // Backslash escape keeps the next char from closing the string
             // (MySQL `\'`). Consume it so it isn't re-scanned.
             if c == '\\' {
-                if let Some(nc) = sql[i + 1..].chars().next() {
-                    cur.push(nc);
-                    i += 1 + nc.len_utf8();
-                } else {
-                    i += 1;
+                match sql[i + 1..].chars().next() {
+                    Some(nc) => i += 1 + nc.len_utf8(),
+                    None => i += 1,
                 }
                 continue;
             }
@@ -99,14 +96,12 @@ pub fn split_statements(sql: &str) -> Vec<String> {
         }
         if c == '\'' || c == '"' || c == '`' {
             in_string = Some(c);
-            cur.push(c);
             i += 1;
             continue;
         }
         // PostgreSQL dollar-quote: a `;` inside `$$…$$` / `$tag$…$tag$` is
         // part of the body and must not split the statement.
         if c == '$' && let Some(end) = dollar_quote_end(sql, i) {
-            cur.push_str(&sql[i..end]);
             i = end;
             continue;
         }
@@ -119,36 +114,35 @@ pub fn split_statements(sql: &str) -> Vec<String> {
                 .unwrap_or(true);
             if is_comment {
                 in_line_comment = true;
-                cur.push('-');
-                cur.push('-');
                 i += 2;
                 continue;
             }
         }
         if c == '/' && bytes.get(i + 1) == Some(&b'*') {
             in_block_comment = true;
-            cur.push('/');
-            cur.push('*');
             i += 2;
             continue;
         }
         if c == ';' {
-            let s = cur.trim();
-            if !s.is_empty() {
-                stmts.push(s.to_string());
-            }
-            cur.clear();
+            stmts.push(start..i);
+            start = i + 1;
             i += 1;
             continue;
         }
-        cur.push(c);
         i += c.len_utf8();
     }
-    let tail = cur.trim();
-    if !tail.is_empty() {
-        stmts.push(tail.to_string());
-    }
+    stmts.push(start..sql.len());
     stmts
+}
+
+/// Byte ranges of the statements in console text, in the dialect the target
+/// server reads. Ranges may include surrounding whitespace and comments.
+pub fn statement_spans(dialect: ConsoleDialect, text: &str) -> Vec<std::ops::Range<usize>> {
+    match dialect {
+        ConsoleDialect::Sql => sql_spans(text),
+        ConsoleDialect::RedisCommand => command_line_spans(text),
+        ConsoleDialect::MongoJson => json_object_spans(text),
+    }
 }
 
 /// Split console text into statements the way the target server reads it.
@@ -157,73 +151,118 @@ pub fn split_statements(sql: &str) -> Vec<String> {
 /// object per command — feeding either through the SQL splitter merged a
 /// whole script into a single unparseable statement.
 pub fn split_statements_for(dialect: ConsoleDialect, text: &str) -> Vec<String> {
-    match dialect {
-        ConsoleDialect::Sql => split_statements(text),
-        ConsoleDialect::RedisCommand => split_command_lines(text),
-        ConsoleDialect::MongoJson => split_json_objects(text),
+    statement_spans(dialect, text)
+        .into_iter()
+        .filter_map(|r| {
+            let s = text[r].trim();
+            (!s.is_empty() && !is_dropped(dialect, s)).then(|| s.to_string())
+        })
+        .collect()
+}
+
+/// `;`-separated SQL statements — the dialect every SQL driver uses.
+pub fn split_statements(sql: &str) -> Vec<String> {
+    split_statements_for(ConsoleDialect::Sql, sql)
+}
+
+/// Text that is a comment for its dialect rather than a statement.
+fn is_dropped(dialect: ConsoleDialect, stmt: &str) -> bool {
+    dialect == ConsoleDialect::RedisCommand && stmt.starts_with('#')
+}
+
+/// The statement the caret sits in, with its range.
+///
+/// A caret in the whitespace *after* a statement belongs to that statement —
+/// parking on the blank line under a query and pressing run is a request to
+/// run the query above, not nothing. A caret before the first statement takes
+/// the first one.
+pub fn statement_at(
+    dialect: ConsoleDialect,
+    text: &str,
+    offset: usize,
+) -> Option<(std::ops::Range<usize>, String)> {
+    let spans: Vec<std::ops::Range<usize>> = statement_spans(dialect, text)
+        .into_iter()
+        .filter(|r| {
+            let s = text[r.clone()].trim();
+            !s.is_empty() && !is_dropped(dialect, s)
+        })
+        .collect();
+
+    let hit = spans
+        .iter()
+        .find(|r| offset >= r.start && offset <= r.end)
+        .or_else(|| spans.iter().rev().find(|r| r.end <= offset))
+        .or_else(|| spans.first())?;
+    Some((hit.clone(), text[hit.clone()].trim().to_string()))
+}
+
+/// Byte offset of a (row, column) caret in `text`, both zero-based and
+/// counted in characters, as the console editor stores them.
+pub fn offset_of(text: &str, row: usize, col: usize) -> usize {
+    let mut offset = 0usize;
+    for (i, line) in text.split('\n').enumerate() {
+        if i == row {
+            return offset
+                + line
+                    .char_indices()
+                    .nth(col)
+                    .map(|(b, _)| b)
+                    .unwrap_or(line.len());
+        }
+        offset += line.len() + 1; // + the newline
     }
+    text.len()
 }
 
 /// One Redis command per line, quote-aware: a newline inside an open quote
 /// belongs to the argument, so a multi-line `EVAL "…lua…" 1 k` stays one
-/// command. Blank lines and `#` comment lines are dropped.
+/// command. Blank and `#` comment lines are dropped by the caller.
 ///
 /// Nothing is trimmed off the ends of a command: a `;` is part of the value
 /// (`SET k a;b;c;` stores the trailing delimiter), matching the quoting rules
 /// `parse_command_line` applies next.
-fn split_command_lines(text: &str) -> Vec<String> {
+fn command_line_spans(text: &str) -> Vec<std::ops::Range<usize>> {
     let mut out = Vec::new();
-    let mut cur = String::new();
+    let mut start = 0usize;
     let mut quote: Option<char> = None;
-    let mut chars = text.chars().peekable();
+    let mut chars = text.char_indices().peekable();
 
-    let push = |cur: &mut String, out: &mut Vec<String>| {
-        let line = cur.trim();
-        if !line.is_empty() && !line.starts_with('#') {
-            out.push(line.to_string());
-        }
-        cur.clear();
-    };
-
-    while let Some(c) = chars.next() {
+    while let Some((i, c)) = chars.next() {
         match c {
             // A backslash escapes the next character (including a newline)
             // wherever `parse_command_line` would honour it.
             '\\' if quote != Some('\'') => {
-                cur.push(c);
-                if let Some(next) = chars.next() {
-                    cur.push(next);
-                }
+                chars.next();
             }
-            '\'' | '"' if quote.is_none() => {
-                quote = Some(c);
-                cur.push(c);
+            '\'' | '"' if quote.is_none() => quote = Some(c),
+            _ if Some(c) == quote => quote = None,
+            '\n' if quote.is_none() => {
+                out.push(start..i);
+                start = i + 1;
             }
-            _ if Some(c) == quote => {
-                quote = None;
-                cur.push(c);
-            }
-            '\n' if quote.is_none() => push(&mut cur, &mut out),
-            _ => cur.push(c),
+            _ => {}
         }
     }
-    push(&mut cur, &mut out);
+    out.push(start..text.len());
     out
 }
 
-/// Split a run of JSON objects into one statement each, tracking brace depth
-/// outside strings so `{"a": {"b": 1}}` stays whole and `{...} {...}` splits.
-/// Text outside any object (a stray token) is kept as its own statement so
+/// Byte ranges of a run of JSON objects, one statement each, tracking brace
+/// depth outside strings so `{"a": {"b": 1}}` stays whole and `{...} {...}`
+/// splits. Text outside any object (a stray token) becomes its own range so
 /// the driver reports the JSON error instead of it vanishing silently.
-fn split_json_objects(text: &str) -> Vec<String> {
-    let mut stmts = Vec::new();
-    let mut cur = String::new();
+fn json_object_spans(text: &str) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    // Where the current statement began — the first character that is
+    // neither whitespace nor a `;` separator.
+    let mut start: Option<usize> = None;
     let mut depth = 0usize;
     let mut in_string = false;
     let mut escaped = false;
-    for c in text.chars() {
+
+    for (i, c) in text.char_indices() {
         if in_string {
-            cur.push(c);
             if escaped {
                 escaped = false;
             } else if c == '\\' {
@@ -235,34 +274,32 @@ fn split_json_objects(text: &str) -> Vec<String> {
         }
         match c {
             '"' => {
+                start.get_or_insert(i);
                 in_string = true;
-                cur.push(c);
             }
             '{' => {
+                start.get_or_insert(i);
                 depth += 1;
-                cur.push(c);
             }
             '}' => {
+                start.get_or_insert(i);
                 depth = depth.saturating_sub(1);
-                cur.push(c);
-                if depth == 0 {
-                    let s = cur.trim();
-                    if !s.is_empty() {
-                        stmts.push(s.to_string());
-                    }
-                    cur.clear();
+                if depth == 0 && let Some(s) = start.take() {
+                    out.push(s..i + c.len_utf8());
                 }
             }
             // A separator between two objects is noise, not content.
             ';' if depth == 0 => {}
-            _ => cur.push(c),
+            _ if c.is_whitespace() && depth == 0 && start.is_none() => {}
+            _ => {
+                start.get_or_insert(i);
+            }
         }
     }
-    let tail = cur.trim();
-    if !tail.is_empty() {
-        stmts.push(tail.to_string());
+    if let Some(s) = start {
+        out.push(s..text.len());
     }
-    stmts
+    out
 }
 
 /// Is `stmt` a pure comment — nothing but `--` line / `/* */` block comments
@@ -507,5 +544,75 @@ mod tests {
             split_statements_for(ConsoleDialect::Sql, "SELECT 1; SELECT 2;"),
             vec!["SELECT 1".to_string(), "SELECT 2".to_string()]
         );
+    }
+    #[test]
+    fn test_statement_at_picks_the_one_under_the_caret() {
+        let sql = "SELECT 1;\nSELECT 2;\nDELETE FROM logs;";
+        // Caret inside the second statement.
+        let off = offset_of(sql, 1, 3);
+        let (_, stmt) = statement_at(ConsoleDialect::Sql, sql, off).expect("a statement");
+        assert_eq!(stmt, "SELECT 2");
+
+        // Caret on the third line: the DELETE, and nothing else, would run.
+        let off = offset_of(sql, 2, 0);
+        let (_, stmt) = statement_at(ConsoleDialect::Sql, sql, off).unwrap();
+        assert_eq!(stmt, "DELETE FROM logs");
+    }
+
+    #[test]
+    fn test_statement_at_takes_the_one_above_a_blank_caret() {
+        // Parking on the empty line under a query and pressing run means
+        // "run that query", not "run nothing".
+        let sql = "SELECT 1;\n\n";
+        let off = offset_of(sql, 2, 0);
+        let (_, stmt) = statement_at(ConsoleDialect::Sql, sql, off).unwrap();
+        assert_eq!(stmt, "SELECT 1");
+
+        // Before the first statement, take the first.
+        let sql = "\n\nSELECT 9";
+        let (_, stmt) = statement_at(ConsoleDialect::Sql, sql, 0).unwrap();
+        assert_eq!(stmt, "SELECT 9");
+
+        // An empty buffer has nothing to run.
+        assert!(statement_at(ConsoleDialect::Sql, "   \n", 0).is_none());
+    }
+
+    #[test]
+    fn test_statement_at_respects_strings_and_comments() {
+        let sql = "SELECT 'a;b' AS x;\nSELECT 2";
+        let off = offset_of(sql, 0, 12);
+        let (_, stmt) = statement_at(ConsoleDialect::Sql, sql, off).unwrap();
+        assert_eq!(stmt, "SELECT 'a;b' AS x", "a `;` in a literal is not a split");
+
+        let sql = "-- note; still\nSELECT 1;\nSELECT 2";
+        let off = offset_of(sql, 1, 2);
+        let (_, stmt) = statement_at(ConsoleDialect::Sql, sql, off).unwrap();
+        assert_eq!(stmt, "-- note; still\nSELECT 1");
+    }
+
+    #[test]
+    fn test_statement_at_follows_the_dialect() {
+        // Redis: one command per line.
+        let text = "SET a 1\nGET a\nDEL a";
+        let off = offset_of(text, 1, 1);
+        let (_, stmt) = statement_at(ConsoleDialect::RedisCommand, text, off).unwrap();
+        assert_eq!(stmt, "GET a");
+
+        // Mongo: the JSON object the caret is inside.
+        let text = "{\"collection\": \"a\", \"find\": {}}\n{\"collection\": \"b\", \"find\": {}}";
+        let off = offset_of(text, 1, 5);
+        let (_, stmt) = statement_at(ConsoleDialect::MongoJson, text, off).unwrap();
+        assert!(stmt.contains("\"b\""), "got {stmt}");
+    }
+
+    #[test]
+    fn test_offset_of_handles_multibyte_and_out_of_range() {
+        let text = "héllo\nwörld";
+        // Column 2 of line 0 is past a two-byte character.
+        assert_eq!(offset_of(text, 0, 2), 3);
+        // Past the end of a line clamps to its end, not into the next line.
+        assert_eq!(offset_of(text, 0, 99), 6);
+        // Past the last row clamps to the end of the text.
+        assert_eq!(offset_of(text, 99, 0), text.len());
     }
 }

@@ -190,7 +190,9 @@ and the rest of the app just works.
 | `+` / `-` (in ERD tab) | Zoom in / out |
 | `.` / `,` (in ERD tab) | Select next / previous node |
 | `Enter` (on ERD node) | Open that table's DDL |
-| `Ctrl+Enter` / `F5` | Run SQL in active console |
+| `Ctrl+Enter` / `Alt+Enter` | Run the statement under the cursor |
+| `F5` | Run every statement in the console |
+| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo in the editor |
 | `Enter` / `Space` | Open / expand tree node |
 | `i` (in table tab) | Insert a new row |
 | `Enter` (on cell, in table tab) | Edit cell |

@@ -7,6 +7,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, Paragraph, Row as TableRow, Table, TableState,
+    Wrap,
 };
 
 use unicode_width::UnicodeWidthStr;
@@ -74,6 +75,19 @@ pub struct QueryConsole {
     pub autocomplete_selected: usize,
     /// Result-pane inner area from the last draw — maps a mouse click to a cell.
     pub result_hit_area: Option<Rect>,
+    /// Editor text area from the last draw, so PageUp/PageDown move by the
+    /// number of rows actually on screen.
+    pub editor_hit_area: Option<Rect>,
+    /// `v` expands the selected result row vertically, the same way a table
+    /// tab does — a query returning a wide row was unreadable otherwise.
+    pub row_detail: bool,
+    pub row_detail_scroll: usize,
+    /// Free-text search across every cell of the result, mirroring the table
+    /// grid's `Ctrl+F` / `Ctrl+G`. Empty = no search active.
+    pub search_query: String,
+    /// True while the query is being typed; the pane owns every key then.
+    pub search_editing: bool,
+    pub search_buffer: String,
     /// Caret position in screen cells, recorded by `render_editor` (the only
     /// place that knows the block, gutter and scroll offsets). The suggestion
     /// box anchors to it rather than re-deriving the same arithmetic.
@@ -97,7 +111,45 @@ pub struct QueryConsole {
     /// How long the in-flight query has been running, refreshed each tick so
     /// the result pane can show a live counter.
     pub exec_elapsed: std::time::Duration,
+    /// Editor snapshots for undo, oldest first. Whole-buffer copies: a query
+    /// console holds a screenful of text, so the simplicity is worth more
+    /// than the bytes.
+    undo_stack: Vec<EditSnapshot>,
+    /// Snapshots undone and available to redo, most recent last. Cleared by
+    /// any new edit — the usual linear-history rule.
+    redo_stack: Vec<EditSnapshot>,
+    /// What the last edit was, so a run of typed characters collapses into a
+    /// single undo step instead of one per keystroke.
+    last_edit: EditKind,
 }
+
+/// A point-in-time copy of the editor: text plus caret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EditSnapshot {
+    lines: Vec<String>,
+    cursor_row: usize,
+    cursor_col: usize,
+}
+
+/// Edit categories for undo coalescing. Consecutive `Typing` (or
+/// `Deleting`) edits share one snapshot; anything else starts a new step.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditKind {
+    /// No edit yet, or the last one closed the current step.
+    None,
+    Typing,
+    Deleting,
+}
+
+/// Is `c` part of a word, for word-wise motion? Identifiers keep `_`, so
+/// `user_id` is one word rather than three.
+fn is_word_char(c: char) -> bool {
+    c.is_alphanumeric() || c == '_'
+}
+
+/// Cap on the undo history — deep enough for a session's worth of editing,
+/// bounded so a long-lived tab cannot grow without limit.
+const UNDO_DEPTH: usize = 200;
 
 /// Interval cycled through by `Ctrl+W`, in seconds. `None` (off) is the
 /// entry and exit of the cycle so watching is never left on by accident.
@@ -218,6 +270,12 @@ impl QueryConsole {
             autocomplete: Vec::new(),
             autocomplete_selected: 0,
             result_hit_area: None,
+            editor_hit_area: None,
+            row_detail: false,
+            row_detail_scroll: 0,
+            search_query: String::new(),
+            search_editing: false,
+            search_buffer: String::new(),
             caret_screen: None,
             autocomplete_hit: None,
             result_col_starts: Vec::new(),
@@ -226,6 +284,9 @@ impl QueryConsole {
             editor_scroll: 0,
             editor_scroll_x: 0,
             exec_elapsed: std::time::Duration::ZERO,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
+            last_edit: EditKind::None,
         }
     }
 
@@ -239,6 +300,7 @@ impl QueryConsole {
         let Some(s) = self.autocomplete.get(self.autocomplete_selected).cloned() else {
             return;
         };
+        self.checkpoint(EditKind::None);
         self.autocomplete.clear();
         self.autocomplete_selected = 0;
         let line = &mut self.lines[self.cursor_row];
@@ -259,6 +321,9 @@ impl QueryConsole {
 
     /// Replace the whole editor buffer, resetting the cursor to the end.
     pub fn set_text(&mut self, text: String) {
+        // Replacing the whole buffer (format, load from history or favorites)
+        // is exactly the edit a user most wants back.
+        self.checkpoint(EditKind::None);
         // Stale suggestions would otherwise linger after the text is replaced.
         self.autocomplete.clear();
         self.autocomplete_selected = 0;
@@ -272,7 +337,70 @@ impl QueryConsole {
         self.cursor_col = self.lines.last().map(|l| l.chars().count()).unwrap_or(0);
     }
 
+    /// Snapshot the editor before an edit of `kind`.
+    ///
+    /// Consecutive edits of the same kind share one snapshot, so a typed word
+    /// is one undo step, not one per letter. Any edit invalidates the redo
+    /// history — the usual linear-undo rule.
+    fn checkpoint(&mut self, kind: EditKind) {
+        self.redo_stack.clear();
+        if kind != EditKind::None && self.last_edit == kind {
+            return;
+        }
+        self.last_edit = kind;
+        self.undo_stack.push(self.snapshot());
+        if self.undo_stack.len() > UNDO_DEPTH {
+            self.undo_stack.remove(0);
+        }
+    }
+
+    fn snapshot(&self) -> EditSnapshot {
+        EditSnapshot {
+            lines: self.lines.clone(),
+            cursor_row: self.cursor_row,
+            cursor_col: self.cursor_col,
+        }
+    }
+
+    fn restore(&mut self, snap: EditSnapshot) {
+        self.lines = snap.lines;
+        self.cursor_row = self.cursor_row.min(self.lines.len().saturating_sub(1));
+        self.cursor_row = snap.cursor_row.min(self.lines.len().saturating_sub(1));
+        self.cursor_col = snap
+            .cursor_col
+            .min(self.lines.get(self.cursor_row).map_or(0, |l| l.chars().count()));
+        self.autocomplete.clear();
+        self.autocomplete_selected = 0;
+        // The next edit opens a fresh step: undoing then typing must not fold
+        // into whatever run was interrupted.
+        self.last_edit = EditKind::None;
+    }
+
+    /// Step back one edit. Returns false when there is nothing to undo.
+    pub fn undo(&mut self) -> bool {
+        let Some(prev) = self.undo_stack.pop() else {
+            return false;
+        };
+        let current = self.snapshot();
+        self.restore(prev);
+        self.redo_stack.push(current);
+        true
+    }
+
+    /// Step forward again after an undo. Returns false when there is nothing
+    /// to redo.
+    pub fn redo(&mut self) -> bool {
+        let Some(next) = self.redo_stack.pop() else {
+            return false;
+        };
+        let current = self.snapshot();
+        self.restore(next);
+        self.undo_stack.push(current);
+        true
+    }
+
     pub fn insert_char(&mut self, c: char) {
+        self.checkpoint(EditKind::Typing);
         if self.cursor_row >= self.lines.len() {
             self.lines.push(String::new());
             self.cursor_row = self.lines.len() - 1;
@@ -291,6 +419,9 @@ impl QueryConsole {
     }
 
     pub fn insert_newline(&mut self) {
+        // A line break closes the typing run: undo should step back to the
+        // start of this line, not swallow the previous one too.
+        self.checkpoint(EditKind::None);
         if self.cursor_row >= self.lines.len() {
             self.lines.push(String::new());
             self.cursor_row = self.lines.len() - 1;
@@ -313,6 +444,7 @@ impl QueryConsole {
     }
 
     pub fn backspace(&mut self) {
+        self.checkpoint(EditKind::Deleting);
         if self.cursor_row >= self.lines.len() {
             return;
         }
@@ -338,6 +470,7 @@ impl QueryConsole {
     /// Forward delete: removes the character the cursor sits before, and
     /// joins the next line when already at the end of one.
     pub fn delete_forward(&mut self) {
+        self.checkpoint(EditKind::Deleting);
         let Some(line) = self.lines.get(self.cursor_row) else {
             return;
         };
@@ -362,6 +495,181 @@ impl QueryConsole {
             .get(self.cursor_row)
             .map(|l| l.chars().count())
             .unwrap_or(0);
+    }
+
+    /// Byte-agnostic word scan: the column where the word before the caret
+    /// starts. Whitespace before the caret is skipped first, so pressing it
+    /// twice at the start of a word moves over the previous one.
+    fn word_start(&self) -> usize {
+        let Some(line) = self.lines.get(self.cursor_row) else {
+            return 0;
+        };
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = self.cursor_col.min(chars.len());
+        while i > 0 && !is_word_char(chars[i - 1]) {
+            i -= 1;
+        }
+        while i > 0 && is_word_char(chars[i - 1]) {
+            i -= 1;
+        }
+        i
+    }
+
+    /// The column just past the word after the caret.
+    fn word_end(&self) -> usize {
+        let Some(line) = self.lines.get(self.cursor_row) else {
+            return 0;
+        };
+        let chars: Vec<char> = line.chars().collect();
+        let mut i = self.cursor_col.min(chars.len());
+        while i < chars.len() && !is_word_char(chars[i]) {
+            i += 1;
+        }
+        while i < chars.len() && is_word_char(chars[i]) {
+            i += 1;
+        }
+        i
+    }
+
+    /// Ctrl+Left: jump to the start of the previous word, crossing to the end
+    /// of the line above when already at column 0.
+    pub fn move_word_left(&mut self) {
+        if self.cursor_col == 0 {
+            self.move_cursor_left();
+            return;
+        }
+        self.cursor_col = self.word_start();
+    }
+
+    /// Ctrl+Right: jump past the end of the next word.
+    pub fn move_word_right(&mut self) {
+        let len = self
+            .lines
+            .get(self.cursor_row)
+            .map_or(0, |l| l.chars().count());
+        if self.cursor_col >= len {
+            self.move_cursor_right();
+            return;
+        }
+        self.cursor_col = self.word_end();
+    }
+
+    /// Alt+Backspace / Ctrl+W: delete the word before the caret. At the start
+    /// of a line it falls back to joining with the line above.
+    pub fn delete_word_left(&mut self) {
+        if self.cursor_col == 0 {
+            self.backspace();
+            return;
+        }
+        self.checkpoint(EditKind::None);
+        let start = self.word_start();
+        let line = &mut self.lines[self.cursor_row];
+        let chars: Vec<char> = line.chars().collect();
+        let head: String = chars[..start].iter().collect();
+        let tail: String = chars[self.cursor_col.min(chars.len())..].iter().collect();
+        *line = format!("{head}{tail}");
+        self.cursor_col = start;
+    }
+
+    /// Toggle `-- ` on every line of the buffer touched by the caret. Adds
+    /// the marker when the line is not commented, removes it when it is.
+    pub fn toggle_comment(&mut self) {
+        self.checkpoint(EditKind::None);
+        let Some(line) = self.lines.get_mut(self.cursor_row) else {
+            return;
+        };
+        let indent: String = line.chars().take_while(|c| c.is_whitespace()).collect();
+        let rest = &line[indent.len()..];
+        if let Some(uncommented) = rest.strip_prefix("-- ") {
+            *line = format!("{indent}{uncommented}");
+            self.cursor_col = self.cursor_col.saturating_sub(3);
+        } else if let Some(uncommented) = rest.strip_prefix("--") {
+            *line = format!("{indent}{uncommented}");
+            self.cursor_col = self.cursor_col.saturating_sub(2);
+        } else {
+            *line = format!("{indent}-- {rest}");
+            self.cursor_col += 3;
+        }
+    }
+
+    /// Copy the caret's line below itself, caret following the copy.
+    pub fn duplicate_line(&mut self) {
+        self.checkpoint(EditKind::None);
+        let Some(line) = self.lines.get(self.cursor_row).cloned() else {
+            return;
+        };
+        self.lines.insert(self.cursor_row + 1, line);
+        self.cursor_row += 1;
+    }
+
+    /// Delete the caret's line. The buffer always keeps at least one line.
+    pub fn delete_line(&mut self) {
+        self.checkpoint(EditKind::None);
+        if self.lines.len() <= 1 {
+            self.lines = vec![String::new()];
+            self.cursor_row = 0;
+            self.cursor_col = 0;
+            return;
+        }
+        self.lines.remove(self.cursor_row);
+        self.cursor_row = self.cursor_row.min(self.lines.len() - 1);
+        self.cursor_col = self
+            .cursor_col
+            .min(self.lines[self.cursor_row].chars().count());
+    }
+
+    /// Insert pasted text at the caret, newlines included — one edit, one
+    /// undo step, and no autocomplete storm from a per-character replay.
+    pub fn insert_text(&mut self, text: &str) {
+        self.checkpoint(EditKind::None);
+        for (i, part) in text.replace("\r\n", "\n").split('\n').enumerate() {
+            if i > 0 {
+                // `insert_newline` would checkpoint again; splice directly.
+                let line = self.lines[self.cursor_row].clone();
+                let chars: Vec<char> = line.chars().collect();
+                let head: String = chars[..self.cursor_col.min(chars.len())].iter().collect();
+                let tail: String = chars[self.cursor_col.min(chars.len())..].iter().collect();
+                self.lines[self.cursor_row] = head;
+                self.lines.insert(self.cursor_row + 1, tail);
+                self.cursor_row += 1;
+                self.cursor_col = 0;
+            }
+            if part.is_empty() {
+                continue;
+            }
+            let line = &mut self.lines[self.cursor_row];
+            let chars: Vec<char> = line.chars().collect();
+            let at = self.cursor_col.min(chars.len());
+            let head: String = chars[..at].iter().collect();
+            let tail: String = chars[at..].iter().collect();
+            *line = format!("{head}{part}{tail}");
+            self.cursor_col = at + part.chars().count();
+        }
+        self.last_edit = EditKind::None;
+    }
+
+    /// Move the caret one screenful up / down, staying inside the buffer.
+    pub fn move_page(&mut self, rows: usize, down: bool) {
+        let last = self.lines.len().saturating_sub(1);
+        self.cursor_row = if down {
+            (self.cursor_row + rows).min(last)
+        } else {
+            self.cursor_row.saturating_sub(rows)
+        };
+        self.cursor_col = self
+            .cursor_col
+            .min(self.lines[self.cursor_row].chars().count());
+    }
+
+    /// Jump to the very start / end of the buffer (Ctrl+Home / Ctrl+End).
+    pub fn move_to_buffer_edge(&mut self, end: bool) {
+        if end {
+            self.cursor_row = self.lines.len().saturating_sub(1);
+            self.cursor_col = self.lines[self.cursor_row].chars().count();
+        } else {
+            self.cursor_row = 0;
+            self.cursor_col = 0;
+        }
     }
 
     pub fn move_cursor_left(&mut self) {
@@ -751,7 +1059,27 @@ pub fn render_query_console(
     render_editor(f, chunks[0], console, is_tab_focused, theme);
     render_result(f, chunks[1], console, is_tab_focused, theme);
 
-    if let Some(popup) = &console.popup {
+    if console.row_detail
+        && let Some(res) = &console.last_result
+        && let Some(record) = res.records.get(console.result_selected_row)
+    {
+        crate::ui::screens::explorer::render_record_detail(
+            f,
+            area,
+            &format!(
+                " query result — row {}/{} ",
+                console.result_selected_row + 1,
+                res.records.len()
+            ),
+            &res.columns,
+            record,
+            console.result_selected_col,
+            console.row_detail_scroll,
+            // A query result has no key metadata to mark.
+            &|_| "  ",
+            theme,
+        );
+    } else if let Some(popup) = &console.popup {
         render_console_popup(f, area, popup, theme);
     } else if is_tab_focused
         && console.focused_subpane == ConsoleSubpane::Editor
@@ -801,6 +1129,30 @@ fn autocomplete_rect(
         width,
         height,
     })
+}
+
+/// Every (row, column) whose cell matches the console's search, in reading
+/// order. Empty when no search is active.
+pub fn result_search_matches(console: &QueryConsole) -> Vec<(usize, usize)> {
+    if console.search_query.is_empty() {
+        return Vec::new();
+    }
+    let Some(res) = &console.last_result else {
+        return Vec::new();
+    };
+    res.records
+        .iter()
+        .enumerate()
+        .flat_map(|(r, rec)| {
+            rec.values
+                .iter()
+                .enumerate()
+                .filter(|(_, v)| {
+                    crate::ui::screens::explorer::cell_matches_search(v, &console.search_query)
+                })
+                .map(move |(c, _)| (r, c))
+        })
+        .collect()
 }
 
 /// Suggestion list, floating just under the editor pane. It overlaps the
@@ -1020,6 +1372,7 @@ fn render_editor(
     let p = Paragraph::new(lines);
     f.render_widget(p, inner);
 
+    console.editor_hit_area = Some(inner);
     // Record where the caret actually landed, for the suggestion box to
     // anchor to. The `-1` mirrors the block cursor drawn above, which sits on
     // the character LEFT of the insertion point.
@@ -1063,8 +1416,19 @@ fn render_result(
         } else {
             String::new()
         };
+        let search = if console.search_editing {
+            format!(" [find: {}_]", console.search_buffer)
+        } else if console.search_query.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " [find \"{}\": {} hits, Ctrl+G next]",
+                console.search_query,
+                result_search_matches(console).len()
+            )
+        };
         format!(
-            " Query Result{multi}{watch} ({} rows affected, {:.2?}) ",
+            " Query Result{multi}{watch}{search} ({} rows affected, {:.2?}) ",
             res.rows_affected, res.execution_time
         )
     } else if console.execution_error.is_some() {
@@ -1110,7 +1474,11 @@ fn render_result(
             Line::from(Span::styled("Execution failed with error:", theme.error())),
             Line::from(Span::styled(err, theme.base())),
         ];
-        let p = Paragraph::new(err_lines).style(theme.base());
+        // Wrapped: a server's error text routinely runs past the pane width,
+        // and the useful half ("syntax error at or near …") is at the end.
+        let p = Paragraph::new(err_lines)
+            .style(theme.base())
+            .wrap(Wrap { trim: false });
         f.render_widget(p, inner);
         return;
     }
@@ -1168,6 +1536,7 @@ fn render_result(
                 .map(|col| Cell::from(Span::styled(col, theme.accent().add_modifier(Modifier::BOLD))));
             let header = TableRow::new(header_cells).height(1).bottom_margin(1);
 
+            let search_query = console.search_query.clone();
             let rows: Vec<TableRow> = res
                 .records
                 .iter()
@@ -1188,10 +1557,16 @@ fn render_result(
                         } else {
                             theme.selected_inactive()
                         };
+                        // A search hit is marked even when it is not the
+                        // cursor, so the eye finds the others.
+                        let is_hit = !search_query.is_empty()
+                            && crate::ui::screens::explorer::cell_matches_search(val, &search_query);
                         let cell_style = if is_cell_sel {
                             sel.add_modifier(Modifier::BOLD)
                         } else if is_row_sel {
                             sel
+                        } else if is_hit {
+                            theme.accent().add_modifier(Modifier::BOLD)
                         } else {
                             theme.base()
                         };
@@ -1546,5 +1921,193 @@ mod tests {
             r.width >= w + 4,
             "box too narrow for a wide-character entry: {r:?}"
         );
+    }
+    #[test]
+    fn test_undo_groups_a_typed_word_into_one_step() {
+        let mut c = QueryConsole::new("t".to_string(), Some(""));
+        for ch in "SELECT".chars() {
+            c.insert_char(ch);
+        }
+        assert_eq!(c.text(), "SELECT");
+        // One step back clears the whole run, not one letter.
+        assert!(c.undo());
+        assert_eq!(c.text(), "");
+        assert!(!c.undo(), "nothing left to undo");
+    }
+
+    #[test]
+    fn test_undo_separates_typing_from_deleting() {
+        let mut c = QueryConsole::new("t".to_string(), Some(""));
+        for ch in "abc".chars() {
+            c.insert_char(ch);
+        }
+        c.backspace();
+        c.backspace();
+        assert_eq!(c.text(), "a");
+        assert!(c.undo());
+        assert_eq!(c.text(), "abc", "the deletions are one step");
+        assert!(c.undo());
+        assert_eq!(c.text(), "", "the typing is another");
+    }
+
+    #[test]
+    fn test_undo_restores_a_buffer_replaced_wholesale() {
+        // set_text is how formatting and loading a saved query work — the
+        // edit a user most often wants back.
+        let mut c = QueryConsole::new("t".to_string(), Some(""));
+        for ch in "select 1".chars() {
+            c.insert_char(ch);
+        }
+        c.set_text("SELECT\n  1".to_string());
+        assert_eq!(c.text(), "SELECT\n  1");
+        assert!(c.undo());
+        assert_eq!(c.text(), "select 1");
+    }
+
+    #[test]
+    fn test_redo_replays_and_is_dropped_by_a_new_edit() {
+        let mut c = QueryConsole::new("t".to_string(), Some(""));
+        for ch in "ab".chars() {
+            c.insert_char(ch);
+        }
+        assert!(c.undo());
+        assert_eq!(c.text(), "");
+        assert!(c.redo());
+        assert_eq!(c.text(), "ab");
+        assert!(!c.redo(), "nothing left to redo");
+
+        // Undo, then type: the redo branch is gone (linear history).
+        assert!(c.undo());
+        c.insert_char('x');
+        assert!(!c.redo());
+        assert_eq!(c.text(), "x");
+    }
+
+    #[test]
+    fn test_undo_restores_the_caret_and_survives_a_shorter_buffer() {
+        let mut c = QueryConsole::new("t".to_string(), Some(""));
+        for ch in "abc".chars() {
+            c.insert_char(ch);
+        }
+        c.insert_newline();
+        for ch in "defgh".chars() {
+            c.insert_char(ch);
+        }
+        assert_eq!((c.cursor_row, c.cursor_col), (1, 5));
+        assert!(c.undo());
+        // Caret must land somewhere valid for the restored text.
+        assert!(c.cursor_row < c.lines.len());
+        assert!(c.cursor_col <= c.lines[c.cursor_row].chars().count());
+    }
+
+    #[test]
+    fn test_undo_history_is_bounded() {
+        let mut c = QueryConsole::new("t".to_string(), Some(""));
+        // Each set_text is its own step; go well past the cap.
+        for i in 0..(UNDO_DEPTH + 50) {
+            c.set_text(format!("q{i}"));
+        }
+        assert!(c.undo_stack.len() <= UNDO_DEPTH, "history grew unbounded");
+    }
+    fn console(text: &str) -> QueryConsole {
+        QueryConsole::new("t".to_string(), Some(text))
+    }
+
+    #[test]
+    fn test_word_motion_treats_identifiers_as_one_word() {
+        let mut c = console("SELECT user_id FROM t");
+        c.cursor_row = 0;
+        c.cursor_col = 21;
+        c.move_word_left();
+        assert_eq!(c.cursor_col, 20, "start of `t`");
+        c.move_word_left();
+        assert_eq!(&"SELECT user_id FROM t"[c.cursor_col..c.cursor_col + 4], "FROM");
+        c.move_word_left();
+        assert_eq!(
+            &"SELECT user_id FROM t"[c.cursor_col..c.cursor_col + 7],
+            "user_id",
+            "`user_id` is one word, not three"
+        );
+        c.move_word_right();
+        assert_eq!(c.cursor_col, 14, "just past `user_id`");
+    }
+
+    #[test]
+    fn test_delete_word_left_removes_one_identifier() {
+        let mut c = console("SELECT user_id");
+        c.cursor_row = 0;
+        c.cursor_col = 14;
+        c.delete_word_left();
+        assert_eq!(c.text(), "SELECT ");
+        // And it is a single undo step.
+        assert!(c.undo());
+        assert_eq!(c.text(), "SELECT user_id");
+    }
+
+    #[test]
+    fn test_toggle_comment_round_trips_and_keeps_indent() {
+        let mut c = console("  SELECT 1");
+        c.cursor_row = 0;
+        c.cursor_col = 4;
+        c.toggle_comment();
+        assert_eq!(c.text(), "  -- SELECT 1");
+        c.toggle_comment();
+        assert_eq!(c.text(), "  SELECT 1");
+        // A marker without the space is removed too.
+        let mut c = console("--SELECT 1");
+        c.toggle_comment();
+        assert_eq!(c.text(), "SELECT 1");
+    }
+
+    #[test]
+    fn test_duplicate_and_delete_line() {
+        let mut c = console("a\nb");
+        c.cursor_row = 0;
+        c.cursor_col = 1;
+        c.duplicate_line();
+        assert_eq!(c.text(), "a\na\nb");
+        assert_eq!(c.cursor_row, 1, "caret follows the copy");
+        c.delete_line();
+        assert_eq!(c.text(), "a\nb");
+
+        // The buffer never becomes line-less.
+        let mut c = console("only");
+        c.delete_line();
+        assert_eq!(c.lines, vec![String::new()]);
+    }
+
+    #[test]
+    fn test_insert_text_pastes_multiple_lines_as_one_edit() {
+        let mut c = console("SELECT ");
+        c.cursor_row = 0;
+        c.cursor_col = 7;
+        c.insert_text("1,\n  2\n");
+        assert_eq!(c.text(), "SELECT 1,\n  2\n");
+        assert_eq!(c.cursor_row, 2);
+        // One undo takes the whole paste back.
+        assert!(c.undo());
+        assert_eq!(c.text(), "SELECT ");
+
+        // CRLF from a Windows clipboard does not leave stray carriage returns.
+        let mut c = console("");
+        c.insert_text("a\r\nb");
+        assert_eq!(c.text(), "a\nb");
+    }
+
+    #[test]
+    fn test_paging_and_buffer_edges_stay_in_bounds() {
+        let mut c = console("1\n2\n3\n4\n5");
+        // `new` parks the caret at the end of the buffer.
+        c.move_to_buffer_edge(false);
+        c.move_page(2, true);
+        assert_eq!(c.cursor_row, 2);
+        c.move_page(99, true);
+        assert_eq!(c.cursor_row, 4, "clamped to the last line");
+        c.move_page(99, false);
+        assert_eq!(c.cursor_row, 0);
+        c.move_to_buffer_edge(true);
+        assert_eq!((c.cursor_row, c.cursor_col), (4, 1));
+        c.move_to_buffer_edge(false);
+        assert_eq!((c.cursor_row, c.cursor_col), (0, 0));
     }
 }

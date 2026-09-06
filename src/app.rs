@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, KeyboardEnhancementFlags, MouseButton, MouseEvent, MouseEventKind,
     PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
@@ -49,7 +50,8 @@ use crate::keymap::{
     EXPLORER_HELP_BINDINGS, EXPLORER_HINTS, PICKER_HELP_BINDINGS, PICKER_HINTS,
 };
 use crate::actions::{
-    QueryRun, collect_schema, erd_menu_item_at, finish_console_query, open_collection_tab,
+    QueryRun, RunScope, collect_schema, erd_menu_item_at, finish_console_query,
+    open_collection_tab,
     retry_console_query,
     open_tree_node, refresh_table_page, run_erd_menu_action, start_console_query, step_column,
 };
@@ -2489,13 +2491,77 @@ impl App {
                                                     (c.autocomplete_selected + 1) % n;
                                             }
                                         }
+                                        // Ctrl+←/→ step by word; plain arrows
+                                        // by character. Both dismiss the
+                                        // suggestion list — the caret has left
+                                        // the token it was completing.
                                         KeyCode::Left => {
-                                            c.move_cursor_left();
+                                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                                c.move_word_left();
+                                            } else {
+                                                c.move_cursor_left();
+                                            }
                                             c.autocomplete.clear();
                                         }
                                         KeyCode::Right => {
-                                            c.move_cursor_right();
+                                            if key.modifiers.contains(KeyModifiers::CONTROL) {
+                                                c.move_word_right();
+                                            } else {
+                                                c.move_cursor_right();
+                                            }
                                             c.autocomplete.clear();
+                                        }
+                                        // A screenful at a time: a 40-line
+                                        // query was navigable only one row at
+                                        // a time.
+                                        KeyCode::PageUp | KeyCode::PageDown => {
+                                            let rows = c
+                                                .editor_hit_area
+                                                .map(|r| r.height as usize)
+                                                .unwrap_or(10)
+                                                .max(1);
+                                            c.move_page(rows, key.code == KeyCode::PageDown);
+                                            c.autocomplete.clear();
+                                        }
+                                        KeyCode::Home
+                                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                        {
+                                            c.move_to_buffer_edge(false);
+                                            c.autocomplete.clear();
+                                        }
+                                        KeyCode::End
+                                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                        {
+                                            c.move_to_buffer_edge(true);
+                                            c.autocomplete.clear();
+                                        }
+                                        // Alt+Backspace deletes the word before
+                                        // the caret (Ctrl+Backspace is not
+                                        // distinguishable on many terminals).
+                                        KeyCode::Backspace
+                                            if key.modifiers.contains(KeyModifiers::ALT) =>
+                                        {
+                                            c.delete_word_left();
+                                            refresh_autocomplete(c, ac_typed, &ac_tables, &ac_columns);
+                                        }
+                                        // Ctrl+/ toggles `--` on the caret's
+                                        // line; many terminals send it as
+                                        // Ctrl+_ instead, so accept both.
+                                        KeyCode::Char('/') | KeyCode::Char('_')
+                                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                        {
+                                            c.toggle_comment();
+                                        }
+                                        KeyCode::Char('d')
+                                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                        {
+                                            c.duplicate_line();
+                                        }
+                                        KeyCode::Char('K')
+                                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                                                && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                                        {
+                                            c.delete_line();
                                         }
                                         // Ctrl+Space asks for suggestions without
                                         // having to type another character.
@@ -2661,6 +2727,32 @@ impl App {
                                                     .push(ToastKind::Info, "watch off".to_string()),
                                             }
                                         }
+                                        // Ctrl+Z / Ctrl+Shift+Z: step the editor
+                                        // back and forth. Formatting and loading
+                                        // a saved query replace the whole buffer,
+                                        // so this is the only way back from them.
+                                        KeyCode::Char('z')
+                                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                                                && !key.modifiers.contains(KeyModifiers::SHIFT) =>
+                                        {
+                                            if !c.undo() {
+                                                self.toasts.push(
+                                                    ToastKind::Info,
+                                                    "nothing to undo".to_string(),
+                                                );
+                                            }
+                                        }
+                                        KeyCode::Char('Z') | KeyCode::Char('z')
+                                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                                                && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                                        {
+                                            if !c.redo() {
+                                                self.toasts.push(
+                                                    ToastKind::Info,
+                                                    "nothing to redo".to_string(),
+                                                );
+                                            }
+                                        }
                                         // Ctrl+F: pretty-print the SQL. Only SQL —
                                         // the formatter breaks lines on SQL
                                         // keywords, which on a Redis console turns
@@ -2687,7 +2779,116 @@ impl App {
                                         }
                                         _ => {}
                                     },
+                                    // Search input owns every key until
+                                    // Enter/Esc, the same shape as the table
+                                    // grid's.
+                                    ConsoleSubpane::Result if c.search_editing => match key.code {
+                                        KeyCode::Esc => {
+                                            c.search_editing = false;
+                                            c.search_buffer.clear();
+                                        }
+                                        KeyCode::Enter => {
+                                            c.search_query = c.search_buffer.clone();
+                                            c.search_editing = false;
+                                            if let Some(&(r, col)) =
+                                                crate::ui::screens::query::result_search_matches(c)
+                                                    .first()
+                                            {
+                                                c.result_selected_row = r;
+                                                c.result_selected_col = col;
+                                            }
+                                        }
+                                        KeyCode::Backspace => {
+                                            c.search_buffer.pop();
+                                        }
+                                        KeyCode::Char(ch)
+                                            if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                        {
+                                            c.search_buffer.push(ch);
+                                        }
+                                        _ => {}
+                                    },
+                                    ConsoleSubpane::Result if c.row_detail => match key.code {
+                                        // The expanded row owns every key
+                                        // until it closes, like the table
+                                        // tab's own detail view.
+                                        KeyCode::Esc | KeyCode::Char('v') | KeyCode::Char('V') => {
+                                            c.row_detail = false;
+                                        }
+                                        KeyCode::Down | KeyCode::Char('j') => {
+                                            let last = c
+                                                .last_result
+                                                .as_ref()
+                                                .map(|r| r.columns.len().saturating_sub(1))
+                                                .unwrap_or(0);
+                                            if c.row_detail_scroll < last {
+                                                c.row_detail_scroll += 1;
+                                            }
+                                        }
+                                        KeyCode::Up | KeyCode::Char('k') => {
+                                            c.row_detail_scroll = c.row_detail_scroll.saturating_sub(1);
+                                        }
+                                        // ←/→ step rows without closing, so a
+                                        // result set can be read one row at a
+                                        // time.
+                                        KeyCode::Right | KeyCode::Char('l') => {
+                                            if let Some(res) = &c.last_result
+                                                && c.result_selected_row + 1 < res.records.len()
+                                            {
+                                                c.result_selected_row += 1;
+                                                c.row_detail_scroll = 0;
+                                            }
+                                        }
+                                        KeyCode::Left | KeyCode::Char('h') => {
+                                            if c.result_selected_row > 0 {
+                                                c.result_selected_row -= 1;
+                                                c.row_detail_scroll = 0;
+                                            }
+                                        }
+                                        _ => {}
+                                    },
                                     ConsoleSubpane::Result => match key.code {
+                                        // Ctrl+F searches every cell of the
+                                        // result; Ctrl+G walks the hits.
+                                        KeyCode::Char('f')
+                                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                        {
+                                            c.search_editing = true;
+                                            c.search_buffer = c.search_query.clone();
+                                        }
+                                        KeyCode::Char('g')
+                                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                        {
+                                            let hits =
+                                                crate::ui::screens::query::result_search_matches(c);
+                                            if hits.is_empty() {
+                                                self.toasts.push(
+                                                    ToastKind::Info,
+                                                    "no matches — press Ctrl+F to search".to_string(),
+                                                );
+                                            } else {
+                                                let cur =
+                                                    (c.result_selected_row, c.result_selected_col);
+                                                let next = hits
+                                                    .iter()
+                                                    .find(|&&h| h > cur)
+                                                    .copied()
+                                                    .unwrap_or(hits[0]);
+                                                c.result_selected_row = next.0;
+                                                c.result_selected_col = next.1;
+                                            }
+                                        }
+                                        // `v` expands the selected row — the
+                                        // readable way to inspect a wide result.
+                                        KeyCode::Char('v') | KeyCode::Char('V') => {
+                                            if c.last_result
+                                                .as_ref()
+                                                .is_some_and(|r| !r.records.is_empty())
+                                            {
+                                                c.row_detail = true;
+                                                c.row_detail_scroll = 0;
+                                            }
+                                        }
                                         // Switch between multiple result sets.
                                         KeyCode::Char('[') => {
                                             if c.active_result > 0 {
@@ -3233,7 +3434,16 @@ impl TerminalGuard {
         // Mouse capture lets the user click an ERD node (hit-tested in scene
         // space) to open its DDL. `EnableMouseCapture` + `EnterAlternateScreen`
         // in one execute keeps the two terminal modes atomic.
-        execute!(io::stdout(), EnableMouseCapture, EnterAlternateScreen)?;
+        // Bracketed paste turns a pasted block into ONE `Event::Paste`
+        // instead of a replay of individual key presses — which inserted a
+        // multi-line query line-by-line, recomputed suggestions on every
+        // character, and left one undo step per keystroke.
+        execute!(
+            io::stdout(),
+            EnableMouseCapture,
+            EnableBracketedPaste,
+            EnterAlternateScreen
+        )?;
 
         // Without the enhanced keyboard protocol a terminal cannot report
         // Ctrl+Enter at all — it arrives as a plain Enter, so the console's
@@ -3255,7 +3465,12 @@ impl TerminalGuard {
         // Popping is harmless when nothing was pushed, and leaving the flags
         // set would confuse the shell we hand the terminal back to.
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -5057,7 +5272,16 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 _ => true,
                             })
                         {
-                            start_console_query(exp, drv, &mut app.toasts, &mut app.query_run, !app.autocommit);
+                            // Ctrl/Alt+Enter runs the statement under the
+                            // caret — a console is a scratchpad, and running
+                            // the whole buffer means running the `DELETE` you
+                            // left three lines up. F5 keeps "run everything".
+                            let scope = if is_f5 {
+                                RunScope::Buffer
+                            } else {
+                                RunScope::AtCursor
+                            };
+                            start_console_query(exp, drv, &mut app.toasts, &mut app.query_run, !app.autocommit, scope);
                             if let Some(WorkspaceTab::Console(c)) = exp.active_tab_mut() {
                                 c.last_run = Some(Instant::now());
                             }
@@ -5084,6 +5308,14 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             let table_input_mode = exp.active_tab().is_some_and(|t| match t {
                                 WorkspaceTab::Table(t) => {
                                     t.search_editing || t.filter_editing || t.row_detail
+                                }
+                                // The console's result pane has the same two
+                                // modes now, and the same reason: typing a
+                                // search must not fire the shortcuts its
+                                // letters are bound to.
+                                WorkspaceTab::Console(c) => {
+                                    c.focused_subpane == ConsoleSubpane::Result
+                                        && (c.search_editing || c.row_detail)
                                 }
                                 _ => false,
                             });
@@ -5221,6 +5453,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                                 &mut app.toasts,
                                                 &mut app.query_run,
                                                 !app.autocommit,
+                                                RunScope::Buffer,
                                             );
                                         }
                                         None => app.toasts.push(
@@ -5336,6 +5569,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                         &mut app.toasts,
                                         &mut app.query_run,
                                         !app.autocommit,
+                                        RunScope::Buffer,
                                     );
                                 }
                                 // `i` → open the INSERT-row modal. All fields start
@@ -5507,6 +5741,18 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                 }
             }
             }
+                // A pasted block goes into the console editor whole: one
+                // insert, one undo step, no per-character suggestion churn.
+                Event::Paste(text) => {
+                    if let Some(exp) = &mut app.explorer_state
+                        && exp.focused_pane == FocusedPane::Workspace
+                        && let Some(WorkspaceTab::Console(c)) = exp.active_tab_mut()
+                        && c.focused_subpane == ConsoleSubpane::Editor
+                        && c.popup.is_none()
+                    {
+                        c.insert_text(&text);
+                    }
+                }
                 Event::Mouse(mouse) => {
                     app.handle_mouse(mouse).await?;
                 }
@@ -5661,7 +5907,9 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
             if watch_due
                 && let (Some(drv), Some(exp)) = (&app.active_driver.clone(), &mut app.explorer_state)
             {
-                start_console_query(exp, drv, &mut app.toasts, &mut app.query_run, !app.autocommit);
+                // Watch mode re-runs what the user last asked for; the whole
+                // buffer is the stable choice — the caret may have moved.
+                start_console_query(exp, drv, &mut app.toasts, &mut app.query_run, !app.autocommit, RunScope::Buffer);
                 if let Some(WorkspaceTab::Console(c)) = exp.active_tab_mut() {
                     c.last_run = Some(Instant::now());
                 }

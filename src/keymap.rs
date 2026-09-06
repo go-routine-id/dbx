@@ -38,12 +38,13 @@ pub const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 51] = [
+pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 58] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
     ("Ctrl+T", "search all objects / jump to a table"),
-    ("Ctrl+Enter / Alt+Enter / F5", "execute SQL query in active console"),
+    ("Ctrl+Enter / Alt+Enter", "run the statement under the cursor"),
+    ("F5", "run every statement in the console"),
     ("Home / End (in editor)", "jump to start / end of line (also Ctrl+A / Ctrl+E)"),
     ("s / S (in table tab)", "add a sort column (asc/desc/off) / clear all sorting"),
     ("Ctrl+B", "collapse / restore the explorer tree"),
@@ -56,6 +57,12 @@ pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 51] = [
     ("Alt+F", "open saved query collections"),
     ("Ctrl+S", "save current query to a collection"),
     ("Ctrl+F", "pretty-print SQL in the editor"),
+    ("Ctrl+Z / Ctrl+Shift+Z (in editor)", "undo / redo the last edit"),
+    ("Ctrl+← / Ctrl+→ (in editor)", "move one word left / right"),
+    ("Alt+Backspace (in editor)", "delete the word before the cursor"),
+    ("PageUp / PageDown, Ctrl+Home / Ctrl+End (in editor)", "page, or jump to buffer start / end"),
+    ("Ctrl+/ · Ctrl+D · Ctrl+Shift+K (in editor)", "toggle comment · duplicate line · delete line"),
+    ("v · Ctrl+F / Ctrl+G (in console result)", "expand row · search cells / next match"),
     ("[ / ]", "switch workspace tab (or result set in console)"),
     ("j / Down", "move cursor / selection down"),
     ("k / Up", "move cursor / selection up"),

@@ -1221,7 +1221,56 @@ fn render_row_detail(f: &mut Frame, area: Rect, tab: &DataTab, theme: &Theme) {
     let Some(record) = rows.get(tab.selected_row) else {
         return;
     };
+    // Key markers come from the table's own metadata; a query result has no
+    // such shape, which is why the shared renderer takes them as a closure.
+    let flag = |col: &str| {
+        tab.column_meta
+            .iter()
+            .find(|m| m.name == col)
+            .map(|m| {
+                if m.is_primary_key {
+                    "🔑"
+                } else if m.is_foreign_key {
+                    "🔗"
+                } else {
+                    "  "
+                }
+            })
+            .unwrap_or("  ")
+    };
+    render_record_detail(
+        f,
+        area,
+        &format!(
+            " {} — row {}/{} ",
+            tab.collection.name,
+            tab.selected_row + 1,
+            rows.len()
+        ),
+        &tab.page.columns,
+        record,
+        tab.selected_col,
+        tab.row_detail_scroll,
+        &flag,
+        theme,
+    );
+}
 
+/// One record laid out vertically, one column per line — the readable way to
+/// inspect a wide row. Shared by the table grid and the query console, which
+/// differ only in their title and whether they can mark key columns.
+#[allow(clippy::too_many_arguments)]
+pub fn render_record_detail(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    columns: &[String],
+    record: &crate::driver::Record,
+    selected_col: usize,
+    scroll: usize,
+    flag: &dyn Fn(&str) -> &'static str,
+    theme: &Theme,
+) {
     let width = 72.min(area.width.saturating_sub(4));
     let height = 20.min(area.height.saturating_sub(2));
     let popup_area = Rect {
@@ -1237,12 +1286,7 @@ fn render_row_detail(f: &mut Frame, area: Rect, tab: &DataTab, theme: &Theme) {
         .border_type(BorderType::Rounded)
         .border_style(theme.accent())
         .style(theme.panel())
-        .title(format!(
-            " {} — row {}/{} ",
-            tab.collection.name,
-            tab.selected_row + 1,
-            rows.len()
-        ));
+        .title(title.to_string());
     let inner = block.inner(popup_area);
     f.render_widget(block, popup_area);
 
@@ -1252,9 +1296,7 @@ fn render_row_detail(f: &mut Frame, area: Rect, tab: &DataTab, theme: &Theme) {
         .split(inner);
 
     // Align the values into a column so long tables stay scannable.
-    let name_w = tab
-        .page
-        .columns
+    let name_w = columns
         .iter()
         .map(|c| c.chars().count())
         .max()
@@ -1263,37 +1305,15 @@ fn render_row_detail(f: &mut Frame, area: Rect, tab: &DataTab, theme: &Theme) {
 
     let visible = chunks[0].height as usize;
     let mut lines = Vec::new();
-    for (i, col) in tab
-        .page
-        .columns
-        .iter()
-        .enumerate()
-        .skip(tab.row_detail_scroll)
-        .take(visible)
-    {
+    for (i, col) in columns.iter().enumerate().skip(scroll).take(visible) {
         let value = record
             .values
             .get(i)
             .map(|v| v.display_str())
             .unwrap_or_default();
-        // Mark the key columns so the row reads like the table's own shape.
-        let flag = tab
-            .column_meta
-            .iter()
-            .find(|m| &m.name == col)
-            .map(|m| {
-                if m.is_primary_key {
-                    "🔑"
-                } else if m.is_foreign_key {
-                    "🔗"
-                } else {
-                    "  "
-                }
-            })
-            .unwrap_or("  ");
-        let is_sel = i == tab.selected_col;
+        let is_sel = i == selected_col;
         lines.push(Line::from(vec![
-            Span::styled(format!("{flag} "), theme.dim()),
+            Span::styled(format!("{} ", flag(col)), theme.dim()),
             Span::styled(
                 format!("{:<name_w$} : ", col.chars().take(name_w).collect::<String>()),
                 if is_sel { theme.accent() } else { theme.dim() },
@@ -1310,7 +1330,7 @@ fn render_row_detail(f: &mut Frame, area: Rect, tab: &DataTab, theme: &Theme) {
     }
     f.render_widget(Paragraph::new(lines), chunks[0]);
 
-    let more = tab.page.columns.len().saturating_sub(tab.row_detail_scroll + visible);
+    let more = columns.len().saturating_sub(scroll + visible);
     let hint = if more > 0 {
         format!(" ↑/↓ scroll ({more} more) · ←/→ row · v/Esc close ")
     } else {
