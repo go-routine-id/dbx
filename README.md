@@ -308,6 +308,23 @@ Environment variables:
 
 Passwords may reference environment variables directly: `password = "$ENV:MY_DB_PASS"`.
 
+## Tests
+
+`cargo test` is hermetic and offline. The driver tests that need real servers
+are `#[ignore]`d and run separately against Docker containers (Redis,
+MongoDB, ClickHouse — including TLS with a generated self-signed CA, so
+`ssl_mode = "require"` and `"verify"` are proven to behave differently):
+
+```bash
+cargo test -- --ignored --test-threads=2
+```
+
+On Colima, point Docker at its socket first:
+
+```bash
+export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
+```
+
 ## Tech
 
 Built in Rust with [ratatui](https://github.com/ratatui-org/ratatui),

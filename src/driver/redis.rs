@@ -102,6 +102,16 @@ pub(crate) const ROOT_COLLECTION: &str = "(root)";
 /// Fallback logical-database count when `CONFIG GET databases` fails
 /// (the stock Redis default).
 const DEFAULT_DB_COUNT: usize = 16;
+/// How long a single connection attempt (TCP + TLS handshake) may take.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long any one command may wait for its reply. Generous — Redis
+/// commands are near-instant — but finite, so a wedged connection surfaces
+/// as an error the user can act on rather than a frozen pane.
+const RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cap on the backoff between the (few) connection retries.
+const RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
+
 /// SCAN batch size per round trip.
 const SCAN_BATCH: u64 = 1000;
 /// Safety cap on keys enumerated for one collection listing, so a fat db
@@ -438,8 +448,21 @@ impl RedisDriver {
             .context("invalid Redis TLS material (ssl_ca / ssl_cert / ssl_key)")?,
             None => ::redis::Client::open(info).context("invalid Redis connection parameters")?,
         };
+        // redis-rs defaults BOTH timeouts to None, so a server that accepts
+        // the TCP connection and then never replies — a TLS-only port reached
+        // in plaintext, a stale SSH tunnel, a firewall that drops — hangs the
+        // pane forever instead of reporting a failure.
+        // The retry defaults (6 attempts, exponential backoff) turn a wrong
+        // port or a plaintext connect to a TLS-only server into an EIGHT
+        // MINUTE wait before the error appears. One retry is plenty here: the
+        // app has its own reconnect-and-retry on top.
+        let config = ::redis::aio::ConnectionManagerConfig::new()
+            .set_connection_timeout(CONNECT_TIMEOUT)
+            .set_response_timeout(RESPONSE_TIMEOUT)
+            .set_number_of_retries(1)
+            .set_max_delay(RETRY_MAX_DELAY.as_millis() as u64);
         let tls = matches!(base.addr, ::redis::ConnectionAddr::TcpTls { .. });
-        ConnManager::new(client).await.map_err(|e| {
+        ConnManager::new_with_config(client, config).await.map_err(|e| {
             let hint = if tls {
                 // Redis ignored `ssl` / `ssl_mode` before 0.5.2, so an entry
                 // that carried them has just started speaking TLS. Say so:

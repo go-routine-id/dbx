@@ -33,3 +33,20 @@ jobs:
       # warning baseline, so this never blocks a merge.
       - name: Clippy (informational)
         run: cargo clippy --all-targets || true
+
+  # Real servers in Docker. Ubuntu runners ship a working daemon; macOS
+  # runners do not, so this job is Linux-only. It is separate from `test` so
+  # a Docker Hub hiccup cannot block the fast, hermetic suite.
+  integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Integration tests (Docker)
+        run: cargo test -- --ignored --test-threads=2

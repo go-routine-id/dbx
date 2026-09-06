@@ -39,3 +39,11 @@ tiberius = { version = "0.12.3", features = ["chrono"] }
 # mongo — default features: rustls TLS (no OpenSSL system dep), DNS resolver, bson 2.x re-exported as mongodb::bson
 mongodb = "3.9"
 redis = { version = "0.27", default-features = false, features = ["tokio-comp", "connection-manager", "tokio-rustls-comp", "tls-rustls-insecure"] }
+
+[dev-dependencies]
+# Integration tests run the real servers in Docker. They are `#[ignore]`d by
+# default, so `cargo test` stays hermetic; CI runs them with `--ignored`.
+testcontainers = "0.28"
+# Self-signed CA + server certificate, generated per test run, so the TLS
+# modes can be exercised without checking key material into the repo.
+rcgen = "0.14"

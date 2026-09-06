@@ -7,6 +7,9 @@ pub mod mssql;
 pub mod mysql;
 pub mod postgres;
 pub mod redis; // redis
+
+#[cfg(test)]
+mod integration_tests;
 pub mod sqlite;
 
 use std::fmt;
