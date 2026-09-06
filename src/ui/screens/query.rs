@@ -9,6 +9,8 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, Paragraph, Row as TableRow, Table, TableState,
 };
 
+use unicode_width::UnicodeWidthStr;
+
 use crate::console::dollar_quote_end;
 use crate::driver::QueryResult;
 use crate::theme::Theme;
@@ -22,6 +24,12 @@ const GUTTER_W: usize = 6;
 const MIN_KEYWORD_PREFIX: usize = 2;
 /// Total popup height, borders included — four suggestions at a time.
 const AC_POPUP_H: u16 = 6;
+/// Title of the suggestion box; also drives its minimum width.
+const AC_TITLE: &str = " Complete (Tab) ";
+/// Columns the box adds around a suggestion: two borders plus the two-cell
+/// "▶ " selection marker, and one trailing space so text never touches the
+/// right border.
+const AC_CHROME_W: u16 = 5;
 
 /// SQL keywords to highlight in the editor.
 const SQL_KEYWORDS: &[&str] = &[
@@ -66,6 +74,14 @@ pub struct QueryConsole {
     pub autocomplete_selected: usize,
     /// Result-pane inner area from the last draw — maps a mouse click to a cell.
     pub result_hit_area: Option<Rect>,
+    /// Caret position in screen cells, recorded by `render_editor` (the only
+    /// place that knows the block, gutter and scroll offsets). The suggestion
+    /// box anchors to it rather than re-deriving the same arithmetic.
+    pub caret_screen: Option<(u16, u16)>,
+    /// The suggestion box's inner rect and the index of its first visible
+    /// entry, recorded while it is drawn so a click can land on a suggestion
+    /// instead of the result grid underneath.
+    pub autocomplete_hit: Option<(Rect, usize)>,
     /// X start of each visible result column, computed at draw time.
     pub result_col_starts: Vec<u16>,
     /// Auto re-run interval. `None` = off. Set with `Ctrl+W`; the event loop
@@ -202,6 +218,8 @@ impl QueryConsole {
             autocomplete: Vec::new(),
             autocomplete_selected: 0,
             result_hit_area: None,
+            caret_screen: None,
+            autocomplete_hit: None,
             result_col_starts: Vec::new(),
             watch_interval: None,
             last_run: None,
@@ -524,14 +542,21 @@ pub fn suggest(
     suggest_inner(line_before_cursor, tables, column_cache, MIN_KEYWORD_PREFIX)
 }
 
-/// Suggestions for an explicit request (Ctrl+Space), where the typed-prefix
-/// threshold does not apply — the user asked, so answer even on a bare word.
+/// Suggestions for an explicit request (Ctrl+Space): the two-character
+/// threshold drops to one, so a single letter is answered.
+///
+/// It does NOT drop to zero. With no token at all, `starts_with("")` matches
+/// every keyword and the cap keeps the first twenty in declaration order —
+/// `select`, `from`, `where`… — which can never offer the `AND` / `OR` /
+/// `LIKE` a bare `WHERE ` actually wants. Table and column context (after
+/// `FROM`, after `table.`) is handled before this point and still answers on
+/// an empty prefix.
 pub fn suggest_forced(
     line_before_cursor: &str,
     tables: &[String],
     column_cache: &std::collections::HashMap<String, Vec<String>>,
 ) -> Vec<String> {
-    suggest_inner(line_before_cursor, tables, column_cache, 0)
+    suggest_inner(line_before_cursor, tables, column_cache, 1)
 }
 
 fn suggest_inner(
@@ -731,98 +756,81 @@ pub fn render_query_console(
     } else if is_tab_focused
         && console.focused_subpane == ConsoleSubpane::Editor
         && !console.autocomplete.is_empty()
+        && let Some((caret_x, _)) = console.caret_screen
     {
-        // Anchored to the caret, not to the editor's bottom edge: the old
-        // placement covered every text row of a short editor, hiding the very
-        // line being typed. `render_editor` has just refreshed the scroll
-        // offsets, so this maps cursor → screen exactly.
-        let inner = Rect {
-            x: chunks[0].x + 1,
-            y: chunks[0].y + 1,
-            width: chunks[0].width.saturating_sub(2),
-            height: chunks[0].height.saturating_sub(2),
-        };
-        let cursor_row =
-            inner.y + (console.cursor_row.saturating_sub(console.editor_scroll)) as u16;
-        let cursor_col = inner.x
-            + GUTTER_W as u16
-            + (console.cursor_col.saturating_sub(console.editor_scroll_x)) as u16;
-        render_autocomplete(f, area, (cursor_col, cursor_row), console, theme);
+        render_autocomplete(f, area, chunks[0], caret_x, console, theme);
+    } else {
+        console.autocomplete_hit = None;
     }
 }
 
-/// Where the suggestion box goes: just under the caret when it fits, just
-/// above it when the pane's bottom is too close, and never on the caret's own
-/// row. `None` when the pane is too short to hold a box at all.
+/// Where the suggestion box goes: directly under the **editor pane**,
+/// horizontally aligned with the caret.
+///
+/// "Under the caret" is not enough — the editor is six rows at its smallest,
+/// so a box one row below the caret still buries the rest of the query. This
+/// places it in the result pane's space instead, where it hides results (a
+/// transient loss) rather than the text being written.
+///
+/// `None` when there is not enough room below the editor to draw a box.
 ///
 /// Split out of the renderer so the placement rules are testable.
 fn autocomplete_rect(
     area: Rect,
-    cursor: (u16, u16),
+    editor: Rect,
+    caret_x: u16,
     items: u16,
     widest: u16,
 ) -> Option<Rect> {
-    let (cur_x, cur_y) = cursor;
-    let height = (items + 2).min(AC_POPUP_H).min(area.height);
+    let below = editor.y.saturating_add(editor.height);
+    let room = (area.y + area.height).saturating_sub(below);
+    let height = (items + 2).min(AC_POPUP_H).min(room);
     if height < 3 {
         return None;
     }
     // Width follows the longest suggestion, not the pane: a list of short
     // keywords should not draw a box across the whole screen.
-    let title_w = " Complete (Tab) ".len() as u16 + 2;
-    let width = (widest + 6).max(title_w).min(area.width);
-
-    let below = cur_y.saturating_add(1);
-    let y = if below + height <= area.y + area.height {
-        below
-    } else {
-        // Above the caret; if even that does not fit, sit at the top of the
-        // pane — still clear of the caret row whenever the pane allows.
-        cur_y.saturating_sub(height).max(area.y)
-    };
-    let x = cur_x.min((area.x + area.width).saturating_sub(width));
+    let title_w = UnicodeWidthStr::width(AC_TITLE) as u16 + 2;
+    let width = (widest + AC_CHROME_W).max(title_w).min(area.width);
+    let x = caret_x
+        .max(area.x)
+        .min((area.x + area.width).saturating_sub(width));
     Some(Rect {
         x,
-        y,
+        y: below,
         width,
         height,
     })
 }
 
-/// Suggestion list, floating just under the caret (or above it when the
-/// bottom of the pane is closer). It may overlap the result grid — a
-/// transient popup over results is far cheaper than one over the query being
-/// written.
-///
-/// `cursor` is the caret's screen position; `area` is the whole console pane,
-/// which bounds the popup.
+/// Suggestion list, floating just under the editor pane. It overlaps the
+/// result grid on purpose — a transient popup over results is far cheaper
+/// than one over the query being written.
 fn render_autocomplete(
     f: &mut Frame,
     area: Rect,
-    cursor: (u16, u16),
-    console: &QueryConsole,
+    editor: Rect,
+    caret_x: u16,
+    console: &mut QueryConsole,
     theme: &Theme,
 ) {
     let widest = console
         .autocomplete
         .iter()
-        .map(|s| s.chars().count())
+        .map(|s| UnicodeWidthStr::width(s.as_str()))
         .max()
         .unwrap_or(0) as u16;
-    let Some(popup_area) =
-        autocomplete_rect(area, cursor, console.autocomplete.len() as u16, widest)
-    else {
+    let Some(popup_area) = autocomplete_rect(
+        area,
+        editor,
+        caret_x,
+        console.autocomplete.len() as u16,
+        widest,
+    ) else {
+        console.autocomplete_hit = None;
         return;
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Rounded)
-        .border_style(theme.accent())
-        .style(theme.panel())
-        .title(" Complete (Tab) ");
-    let inner = block.inner(popup_area);
-    f.render_widget(Clear, popup_area);
-    f.render_widget(block, popup_area);
+    let inner = crate::ui::widgets::popup::render_frame_in(f, popup_area, Some(AC_TITLE), theme);
 
     let visible = inner.height as usize;
     let sel = console
@@ -849,6 +857,7 @@ fn render_autocomplete(
         )));
     }
     f.render_widget(Paragraph::new(lines), inner);
+    console.autocomplete_hit = Some((inner, start));
 }
 
 /// Centered searchable picker overlay for history / saved queries.
@@ -1010,6 +1019,17 @@ fn render_editor(
 
     let p = Paragraph::new(lines);
     f.render_widget(p, inner);
+
+    // Record where the caret actually landed, for the suggestion box to
+    // anchor to. The `-1` mirrors the block cursor drawn above, which sits on
+    // the character LEFT of the insertion point.
+    console.caret_screen = is_editor_focused.then(|| {
+        let col = inner.x
+            + GUTTER_W as u16
+            + (console.cursor_col.saturating_sub(console.editor_scroll_x)) as u16;
+        let row = inner.y + (console.cursor_row.saturating_sub(console.editor_scroll)) as u16;
+        (col.saturating_sub(1).max(inner.x), row.min(inner.bottom().saturating_sub(1)))
+    });
 }
 
 fn render_result(
@@ -1448,49 +1468,83 @@ mod tests {
     }
 
     #[test]
-    fn test_ctrl_space_ignores_the_prefix_threshold() {
+    fn test_ctrl_space_lowers_the_threshold_but_still_needs_a_word() {
         let cache = std::collections::HashMap::new();
         let tables = vec!["users".to_string()];
         // Typing `s` stays quiet, but asking explicitly answers.
         assert!(suggest("s", &tables, &cache).is_empty());
         assert!(!suggest_forced("s", &tables, &cache).is_empty());
+
+        // With no word at all, a keyword dump would be the first twenty
+        // entries in declaration order — never the AND/OR/LIKE that a bare
+        // `WHERE ` wants. Say nothing instead.
+        assert!(suggest_forced("SELECT * FROM users WHERE ", &tables, &cache).is_empty());
+
+        // Table context is real context, so it still answers on an empty word.
+        assert_eq!(
+            suggest_forced("SELECT * FROM ", &tables, &cache),
+            vec!["users".to_string()]
+        );
     }    #[test]
-    fn test_autocomplete_box_never_covers_the_caret() {
-        // A 24-row console pane, caret near the top: the box hangs below.
+    fn test_autocomplete_box_never_covers_editor_text() {
+        // Console pane rows 0..24, editor occupying its first 6 (the minimum,
+        // i.e. the case the old placement got wrong).
         let area = Rect::new(0, 0, 80, 24);
-        let r = autocomplete_rect(area, (10, 3), 4, 6).expect("fits");
-        assert!(r.y > 3, "box must start below the caret row, got {r:?}");
+        let editor = Rect::new(0, 0, 80, 6);
+
+        let r = autocomplete_rect(area, editor, 10, 4, 6).expect("fits");
+        assert!(
+            r.y >= editor.y + editor.height,
+            "box overlaps the editor: {r:?}"
+        );
         assert_eq!(r.x, 10, "box aligns with the caret column");
 
-        // Caret near the bottom: the box flips above it rather than
-        // overlapping the line being typed.
-        let r = autocomplete_rect(area, (10, 22), 4, 6).expect("fits");
-        assert!(
-            r.y + r.height <= 22,
-            "box must end above the caret row, got {r:?}"
-        );
+        // True wherever the caret sits, including the editor's last line —
+        // "below the caret" used to bury the rest of a short query.
+        for caret_row in 1..6 {
+            let r = autocomplete_rect(area, editor, 0, 4, 6).expect("fits");
+            assert!(r.y > caret_row, "caret row {caret_row} covered by {r:?}");
+        }
 
         // Width follows the content, not the pane.
-        let r = autocomplete_rect(area, (0, 3), 2, 6).expect("fits");
+        let r = autocomplete_rect(area, editor, 0, 2, 6).expect("fits");
         assert!(r.width < area.width, "box spans the pane: {r:?}");
 
         // A caret at the right edge pulls the box back inside the pane.
-        let r = autocomplete_rect(area, (79, 3), 4, 20).expect("fits");
+        let r = autocomplete_rect(area, editor, 79, 4, 20).expect("fits");
         assert!(r.x + r.width <= 80, "box runs off the right edge: {r:?}");
 
-        // Too short a pane: no box at all rather than a broken one.
-        assert!(autocomplete_rect(Rect::new(0, 0, 80, 2), (10, 0), 4, 6).is_none());
+        // No room under the editor → no box, rather than one drawn over the
+        // query or off the buffer.
+        assert!(autocomplete_rect(Rect::new(0, 0, 80, 8), Rect::new(0, 0, 80, 6), 0, 4, 6).is_none());
     }
 
     #[test]
     fn test_autocomplete_box_height_follows_the_list() {
         let area = Rect::new(0, 0, 80, 24);
+        let editor = Rect::new(0, 0, 80, 6);
         // One suggestion → borders + one row.
-        assert_eq!(autocomplete_rect(area, (0, 0), 1, 6).unwrap().height, 3);
+        assert_eq!(autocomplete_rect(area, editor, 0, 1, 6).unwrap().height, 3);
         // A long list is capped instead of filling the pane.
         assert_eq!(
-            autocomplete_rect(area, (0, 0), 40, 6).unwrap().height,
+            autocomplete_rect(area, editor, 0, 40, 6).unwrap().height,
             AC_POPUP_H
+        );
+    }
+
+    #[test]
+    fn test_autocomplete_box_fits_wide_characters() {
+        // Terminal columns, not `chars().count()`: a CJK name is twice as
+        // wide as it is long and used to be clipped by the right border.
+        let area = Rect::new(0, 0, 80, 24);
+        let editor = Rect::new(0, 0, 80, 6);
+        let name = "顧客マスタ";
+        let w = UnicodeWidthStr::width(name) as u16;
+        assert_eq!(w, 10, "fixture assumption");
+        let r = autocomplete_rect(area, editor, 0, 1, w).expect("fits");
+        assert!(
+            r.width >= w + 4,
+            "box too narrow for a wide-character entry: {r:?}"
         );
     }
 }

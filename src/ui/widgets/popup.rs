@@ -30,6 +30,33 @@ pub fn dim_background(f: &mut Frame, area: Rect, theme: &Theme) {
         .set_style(area, theme.dim().add_modifier(Modifier::DIM));
 }
 
+/// Draw the popup chrome into an already-placed rect: same rounded border,
+/// panel background and accent title as [`render_frame`], but the caller
+/// decides where the box goes (anchored overlays, not centered dialogs).
+/// Returns the inner content Rect.
+pub fn render_frame_in(f: &mut Frame, popup_area: Rect, title: Option<&str>, theme: &Theme) -> Rect {
+    if popup_area.width == 0 || popup_area.height == 0 {
+        return Rect {
+            x: popup_area.x,
+            y: popup_area.y,
+            width: 0,
+            height: 0,
+        };
+    }
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.border())
+        .style(theme.panel());
+    if let Some(t) = title {
+        block = block.title(Span::styled(t.to_string(), theme.accent()));
+    }
+    let inner = block.inner(popup_area);
+    f.render_widget(ratatui::widgets::Clear, popup_area);
+    f.render_widget(block, popup_area);
+    inner
+}
+
 pub fn render_frame(f: &mut Frame, area: Rect, title: Option<&str>, width: u16, height: u16, theme: &Theme) -> Rect {
     if area.width == 0 || area.height == 0 {
         return Rect {

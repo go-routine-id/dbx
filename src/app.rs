@@ -134,14 +134,26 @@ fn switch_tab(exp: &mut crate::ui::screens::explorer::ExplorerState, delta: isiz
 
 /// Recompute the console editor's autocomplete suggestions from the text
 /// before the cursor.
+/// Why suggestions are being recomputed. One argument instead of two
+/// adjacent booleans: `(false, true)` — disabled but forced — was
+/// representable and silently meaningless.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AcRequest {
+    /// Not a SQL console editor: never suggest.
+    Off,
+    /// The user typed; the prefix threshold applies.
+    Typed,
+    /// The user asked (Ctrl+Space); a single character is enough.
+    Forced,
+}
+
 fn refresh_autocomplete(
     c: &mut crate::ui::screens::query::QueryConsole,
-    enabled: bool,
-    forced: bool,
+    req: AcRequest,
     tables: &[String],
     columns: &std::collections::HashMap<String, Vec<String>>,
 ) {
-    if !enabled {
+    if req == AcRequest::Off {
         c.autocomplete.clear();
         c.autocomplete_selected = 0;
         return;
@@ -151,7 +163,7 @@ fn refresh_autocomplete(
         .get(c.cursor_row)
         .map(|l| l.chars().take(c.cursor_col).collect::<String>())
         .unwrap_or_default();
-    c.autocomplete = if forced {
+    c.autocomplete = if req == AcRequest::Forced {
         crate::ui::screens::query::suggest_forced(&before, tables, columns)
     } else {
         crate::ui::screens::query::suggest(&before, tables, columns)
@@ -433,6 +445,14 @@ impl App {
                         || e.process_list.is_some()
                         || e.schema_diff.is_some()
                         || e.diff_picker.is_some()
+                        // A half-written word with the suggestion box open is
+                        // mid-edit too: re-running it every second would
+                        // execute fragments and stack a confirm dialog under
+                        // the popup.
+                        || matches!(
+                            e.active_tab(),
+                            Some(WorkspaceTab::Console(c)) if !c.autocomplete.is_empty()
+                        )
                 })
                 .unwrap_or(false);
             if modal_open {
@@ -903,36 +923,51 @@ impl App {
                 }
             }
             WorkspaceTab::Console(c) => {
-                let Some(area) = c.result_hit_area else { return Ok(()) };
-                if mouse.column >= area.x
+                // The suggestion box floats over the result grid, so it has to
+                // be hit-tested FIRST — otherwise clicking a suggestion picks
+                // the result cell hidden underneath it.
+                let suggestion_click = c.autocomplete_hit.and_then(|(ac, start)| {
+                    let inside = mouse.column >= ac.x
+                        && mouse.column < ac.x + ac.width
+                        && mouse.row >= ac.y
+                        && mouse.row < ac.y + ac.height;
+                    inside.then(|| start + (mouse.row - ac.y) as usize)
+                });
+                if let Some(idx) = suggestion_click {
+                    if idx < c.autocomplete.len() {
+                        c.autocomplete_selected = idx;
+                        c.accept_autocomplete();
+                    }
+                    focus_workspace = true;
+                } else if let Some(area) = c.result_hit_area
+                    && mouse.column >= area.x
                     && mouse.column < area.x + area.width
                     && mouse.row >= area.y
                     && mouse.row < area.y + area.height
+                    && let Some(res) = &c.last_result
                 {
-                    if let Some(res) = &c.last_result {
-                        let rel_row = mouse.row - area.y;
-                        // Table header (1) + bottom_margin (1) = 2 rows. The
-                        // rendered window is sliced by `result_scroll_y`, so the
-                        // click's absolute row is offset + (rel_row - 2).
-                        if rel_row >= 2 {
-                            let data_row = c.result_scroll_y + (rel_row - 2) as usize;
-                            if data_row < res.records.len() {
-                                c.result_selected_row = data_row;
-                            }
+                    let rel_row = mouse.row - area.y;
+                    // Table header (1) + bottom_margin (1) = 2 rows. The
+                    // rendered window is sliced by `result_scroll_y`, so the
+                    // click's absolute row is offset + (rel_row - 2).
+                    if rel_row >= 2 {
+                        let data_row = c.result_scroll_y + (rel_row - 2) as usize;
+                        if data_row < res.records.len() {
+                            c.result_selected_row = data_row;
                         }
-                        let mut col_visible = 0usize;
-                        for (i, s) in c.result_col_starts.iter().enumerate() {
-                            if mouse.column >= *s {
-                                col_visible = i;
-                            } else {
-                                break;
-                            }
-                        }
-                        c.result_selected_col = (col_visible + c.result_scroll_x)
-                            .min(res.columns.len().saturating_sub(1));
-                        c.focused_subpane = ConsoleSubpane::Result;
-                        focus_workspace = true;
                     }
+                    let mut col_visible = 0usize;
+                    for (i, s) in c.result_col_starts.iter().enumerate() {
+                        if mouse.column >= *s {
+                            col_visible = i;
+                        } else {
+                            break;
+                        }
+                    }
+                    c.result_selected_col = (col_visible + c.result_scroll_x)
+                        .min(res.columns.len().saturating_sub(1));
+                    c.focused_subpane = ConsoleSubpane::Result;
+                    focus_workspace = true;
                 }
             }
             WorkspaceTab::Erd(erd) => {
@@ -1738,6 +1773,7 @@ impl App {
                         // Overlays with their own Esc handler close first, so
                         // Esc still dismisses them (don't hijack into
                         // back-one-level or the picker).
+                        let focused_pane = exp.focused_pane;
                         if let Some(tab) = exp.active_tab_mut() {
                             match tab {
                                 WorkspaceTab::Table(t) if t.filter_editing => {
@@ -1750,8 +1786,14 @@ impl App {
                                 }
                                 // Suggestions are an overlay too: Esc should
                                 // dismiss them, not throw focus to the tree
-                                // and leave them hanging.
-                                WorkspaceTab::Console(c) if !c.autocomplete.is_empty() => {
+                                // and leave them hanging. Guarded by the same
+                                // focus conditions the box is DRAWN under, so
+                                // Esc is never swallowed by an invisible list.
+                                WorkspaceTab::Console(c)
+                                    if !c.autocomplete.is_empty()
+                                        && focused_pane == FocusedPane::Workspace
+                                        && c.focused_subpane == ConsoleSubpane::Editor =>
+                                {
                                     c.autocomplete.clear();
                                     c.autocomplete_selected = 0;
                                     return;
@@ -1923,8 +1965,17 @@ impl App {
                         // `active_tab_mut` takes &mut on `exp`). Built only
                         // for a SQL console: cloning the whole column cache on
                         // every keystroke of every pane is pure waste.
-                        let needs_ac =
-                            sql_console && matches!(exp.active_tab(), Some(WorkspaceTab::Console(_)));
+                        let needs_ac = sql_console
+                            && matches!(
+                                exp.active_tab(),
+                                Some(WorkspaceTab::Console(c))
+                                    if c.focused_subpane == ConsoleSubpane::Editor
+                            );
+                        let (ac_typed, ac_forced) = if needs_ac {
+                            (AcRequest::Typed, AcRequest::Forced)
+                        } else {
+                            (AcRequest::Off, AcRequest::Off)
+                        };
                         let (ac_tables, ac_columns) = if needs_ac {
                             (
                                 exp.tables
@@ -2451,7 +2502,7 @@ impl App {
                                         KeyCode::Char(' ')
                                             if key.modifiers.contains(KeyModifiers::CONTROL) =>
                                         {
-                                            refresh_autocomplete(c, needs_ac, true, &ac_tables, &ac_columns);
+                                            refresh_autocomplete(c, ac_forced, &ac_tables, &ac_columns);
                                             if c.autocomplete.is_empty() {
                                                 self.toasts.push(
                                                     ToastKind::Info,
@@ -2461,11 +2512,11 @@ impl App {
                                         }
                                         KeyCode::Backspace => {
                                             c.backspace();
-                                            refresh_autocomplete(c, needs_ac, false, &ac_tables, &ac_columns);
+                                            refresh_autocomplete(c, ac_typed, &ac_tables, &ac_columns);
                                         }
                                         KeyCode::Delete => {
                                             c.delete_forward();
-                                            refresh_autocomplete(c, needs_ac, false, &ac_tables, &ac_columns);
+                                            refresh_autocomplete(c, ac_typed, &ac_tables, &ac_columns);
                                         }
                                         // Home/End and their emacs equivalents,
                                         // which terminals deliver more reliably.
@@ -2631,7 +2682,7 @@ impl App {
                                         KeyCode::Char(ch) => {
                                             if !key.modifiers.contains(KeyModifiers::CONTROL) {
                                                 c.insert_char(ch);
-                                                refresh_autocomplete(c, needs_ac, false, &ac_tables, &ac_columns);
+                                                refresh_autocomplete(c, ac_typed, &ac_tables, &ac_columns);
                                             }
                                         }
                                         _ => {}
