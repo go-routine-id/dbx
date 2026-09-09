@@ -13,20 +13,64 @@ pub const PICKER_HINTS: [(&str, &str); 7] = [
     ("?", "help"),
 ];
 
-pub const EXPLORER_HINTS: [(&str, &str); 12] = [
-    ("Tab", "pane"),
-    ("c", "new console"),
-    ("g", "erd"),
-    ("Ctrl+Enter", "run statement"),
-    ("Enter/Space", "open/expand"),
-    ("y/Y", "copy cell/row"),
-    ("Ctrl+E", "export"),
-    ("e", "edit cell"),
-    ("x", "delete row"),
-    ("i", "insert row"),
-    ("w", "close tab"),
-    ("Esc", "picker"),
-];
+/// Which surface the status-bar hints describe. Computed at render time in
+/// app.rs from the focused pane and the active workspace tab, so the hint
+/// line always matches the keys that are actually live there.
+pub enum HintContext {
+    Tree,
+    Table,
+    Console,
+    Erd,
+}
+
+/// Contextual status-bar hints for the explorer screen. The old static list
+/// advertised console-only bindings on a table tab (and `c` as "new console"
+/// in grids where it copies a cell); each context now lists only keys that
+/// work there, with a universal tail. `g erd` appears only when the driver
+/// can lay out an ERD — otherwise the key would just toast a warning.
+pub fn explorer_status_hints(
+    ctx: HintContext,
+    erd_capable: bool,
+) -> Vec<(&'static str, &'static str)> {
+    let mut hints: Vec<(&'static str, &'static str)> = Vec::new();
+    match ctx {
+        HintContext::Tree => {
+            hints.push(("Enter/Space", "open"));
+            hints.push(("c", "console"));
+            if erd_capable {
+                hints.push(("g", "erd"));
+            }
+            hints.push(("Tab", "pane"));
+        }
+        HintContext::Table => {
+            hints.push(("e", "edit cell"));
+            hints.push(("x", "delete"));
+            hints.push(("i", "insert"));
+            hints.push(("Ctrl+E", "export"));
+            if erd_capable {
+                hints.push(("g", "erd"));
+            }
+            hints.push(("Tab", "pane"));
+        }
+        HintContext::Console => {
+            hints.push(("Ctrl+Enter", "run"));
+            hints.push(("F5", "run all"));
+            hints.push(("Tab", "subpane"));
+        }
+        HintContext::Erd => {
+            hints.push(("E", "export svg"));
+            hints.push(("+/-", "zoom"));
+            hints.push(("hjkl", "pan"));
+            hints.push(("0", "reset view"));
+            hints.push(("Tab", "pane"));
+        }
+    }
+    // Universal tail — true in every context.
+    hints.push(("w", "close tab"));
+    hints.push(("Esc", "back"));
+    hints.push(("?", "help"));
+    hints
+}
 
 pub const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Enter", "connect to selected database"),
@@ -102,3 +146,49 @@ pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 62] = [
     ("n / p", "next / previous page in data grid"),
     ("w", "close active workspace tab"),
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_hints_follow_context() {
+        let tree = explorer_status_hints(HintContext::Tree, true);
+        assert!(tree.contains(&("c", "console")));
+        assert!(!tree.contains(&("Ctrl+Enter", "run")));
+
+        let table = explorer_status_hints(HintContext::Table, true);
+        assert!(table.contains(&("Ctrl+E", "export")));
+        assert!(!table.contains(&("Ctrl+Enter", "run")));
+
+        let console = explorer_status_hints(HintContext::Console, true);
+        assert!(console.contains(&("Ctrl+Enter", "run")));
+        assert!(!console.contains(&("Ctrl+E", "export")));
+
+        let erd = explorer_status_hints(HintContext::Erd, true);
+        assert!(erd.contains(&("E", "export svg")));
+    }
+
+    #[test]
+    fn status_hints_erd_gate() {
+        let without = explorer_status_hints(HintContext::Tree, false);
+        assert!(!without.iter().any(|(k, _)| *k == "g"));
+        let with = explorer_status_hints(HintContext::Tree, true);
+        assert!(with.contains(&("g", "erd")));
+    }
+
+    #[test]
+    fn status_hints_always_end_with_universal_keys() {
+        for ctx in [
+            HintContext::Tree,
+            HintContext::Table,
+            HintContext::Console,
+            HintContext::Erd,
+        ] {
+            let hints = explorer_status_hints(ctx, true);
+            assert_eq!(hints.last(), Some(&("?", "help")));
+            assert!(hints.contains(&("w", "close tab")));
+            assert!(hints.contains(&("Esc", "back")));
+        }
+    }
+}

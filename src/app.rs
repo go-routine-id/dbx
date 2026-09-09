@@ -47,7 +47,8 @@ const TICK_CAP: Duration = Duration::from_millis(60);
 /// the bold-italic word "NULL".
 pub use crate::sql::NULL_SENTINEL;
 use crate::keymap::{
-    EXPLORER_HELP_BINDINGS, EXPLORER_HINTS, PICKER_HELP_BINDINGS, PICKER_HINTS,
+    explorer_status_hints, HintContext, EXPLORER_HELP_BINDINGS, PICKER_HELP_BINDINGS,
+    PICKER_HINTS,
 };
 use crate::actions::{
     QueryRun, RunScope, collect_schema, erd_menu_item_at, finish_console_query,
@@ -3592,7 +3593,31 @@ impl App {
                     }
                     _ => "● not connected".to_string(),
                 };
-                statusbar::render(f, layout.status, &status, &EXPLORER_HINTS, theme);
+                // The hint line must match the keys that are actually live:
+                // the old static list advertised console-only bindings on a
+                // table tab (and `c` as "new console" where it copies a cell).
+                let hints = self
+                    .explorer_state
+                    .as_ref()
+                    .map(|exp| {
+                        let ctx = match exp.focused_pane {
+                            FocusedPane::Tree => HintContext::Tree,
+                            FocusedPane::Workspace => match exp.active_tab() {
+                                Some(WorkspaceTab::Table(_)) => HintContext::Table,
+                                Some(WorkspaceTab::Console(_)) => HintContext::Console,
+                                Some(WorkspaceTab::Erd(_)) => HintContext::Erd,
+                                // Empty workspace: focus sits on the tree.
+                                None => HintContext::Tree,
+                            },
+                        };
+                        explorer_status_hints(
+                            ctx,
+                            exp.driver_capabilities
+                                .contains(crate::driver::Capabilities::ERD),
+                        )
+                    })
+                    .unwrap_or_default();
+                statusbar::render(f, layout.status, &status, &hints, theme);
             }
         }
 
