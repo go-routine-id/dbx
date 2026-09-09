@@ -38,7 +38,7 @@ pub const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 58] = [
+pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 62] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
@@ -58,6 +58,7 @@ pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 58] = [
     ("Ctrl+S", "save current query to a collection"),
     ("Ctrl+F", "pretty-print SQL in the editor"),
     ("Ctrl+Z / Ctrl+Y (in editor)", "undo / redo the last edit"),
+    ("Ctrl+Shift+C (in editor)", "copy the whole query buffer to the clipboard"),
     ("Ctrl+← / Ctrl+→ (in editor)", "move one word left / right"),
     ("Alt+Backspace (in editor)", "delete the word before the cursor"),
     ("PageUp / PageDown, Ctrl+Home / Ctrl+End (in editor)", "page, or jump to buffer start / end"),
@@ -74,7 +75,9 @@ pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 58] = [
     ("< / > (in table tab)", "shrink / grow the focused column's width (or Alt+drag a header separator)"),
     ("/", "filter data grid rows (col op value, e.g. status = paid)"),
     ("y / c", "copy active cell value to system clipboard"),
-    ("Y / Ctrl+Y", "copy active row as formatted JSON to clipboard"),
+    ("Y / Ctrl+Y", "copy active row (Y: JSON · Ctrl+Y: TSV)"),
+    ("y / c (in row detail)", "copy the highlighted column's value"),
+    ("Y / Ctrl+Y (in row detail)", "copy the expanded row (JSON / TSV)"),
     ("Ctrl+E", "open export dialog (CSV, JSON, SQL INSERT, SQL dump, xlsx)"),
     ("e / Enter", "edit active cell value (shows safe SQL confirmation)"),
     ("e (on tree table)", "edit table schema (ALTER: drop/add column, rename)"),
@@ -95,6 +98,7 @@ pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 58] = [
     ("Alt+D", "compare this schema with another saved connection"),
     ("i", "open INSERT-row modal — fill fields, server applies DEFAULT for skipped"),
     ("F1", "view table DDL schema popup"),
+    ("y (in DDL popup)", "copy the shown DDL to the clipboard"),
     ("n / p", "next / previous page in data grid"),
     ("w", "close active workspace tab"),
 ];

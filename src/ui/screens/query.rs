@@ -1667,7 +1667,7 @@ fn render_editor(
     // The two run keys are no longer interchangeable, and this title is the
     // only place most users ever read the binding.
     let title = format!(
-        " SQL Editor: {} [Ctrl+Enter: statement · F5: whole buffer] ",
+        " SQL Editor: {} [Ctrl+Enter: statement · F5: whole buffer · Ctrl+Shift+C: copy] ",
         console.title
     );
     let block = Block::default()

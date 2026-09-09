@@ -1214,6 +1214,24 @@ pub fn render_explorer(
     }
 }
 
+/// Lines the row-detail popup shows at once: the 20-row popup minus its two
+/// border rows and the hint line. Key handlers nudge the scroll window with
+/// this estimate; the renderer re-clamps it against the real height, so a
+/// small terminal cannot strand the highlight off screen.
+pub const DETAIL_WINDOW: usize = 17;
+
+/// Keep the row-detail scroll window following the column selection: moving
+/// down past the window pushes it forward, moving up above it pulls it back.
+pub fn follow_detail_scroll(selected: usize, scroll: usize) -> usize {
+    if selected < scroll {
+        selected
+    } else if selected >= scroll + DETAIL_WINDOW {
+        selected + 1 - DETAIL_WINDOW
+    } else {
+        scroll
+    }
+}
+
 /// One row shown vertically — `column : value` per line — which is the only
 /// readable way to inspect a table too wide to fit on screen.
 fn render_row_detail(f: &mut Frame, area: Rect, tab: &DataTab, theme: &Theme) {
@@ -1304,6 +1322,16 @@ pub fn render_record_detail(
         .min(24);
 
     let visible = chunks[0].height as usize;
+    // The key handlers estimate the window height (DETAIL_WINDOW); on a small
+    // terminal the popup is shorter, so re-clamp here against the real height
+    // to keep the selected column on screen.
+    let scroll = if selected_col < scroll {
+        selected_col
+    } else if visible > 0 && selected_col >= scroll + visible {
+        selected_col + 1 - visible
+    } else {
+        scroll
+    };
     let mut lines = Vec::new();
     for (i, col) in columns.iter().enumerate().skip(scroll).take(visible) {
         let value = record
@@ -1332,9 +1360,9 @@ pub fn render_record_detail(
 
     let more = columns.len().saturating_sub(scroll + visible);
     let hint = if more > 0 {
-        format!(" ↑/↓ scroll ({more} more) · ←/→ row · v/Esc close ")
+        format!(" y copy · Y row · ↑/↓ column ({more} more) · ←/→ row · v/Esc close ")
     } else {
-        " ↑/↓ scroll · ←/→ row · v/Esc close ".to_string()
+        " y copy · Y row · ↑/↓ column · ←/→ row · v/Esc close ".to_string()
     };
     f.render_widget(
         Paragraph::new(Line::from(Span::styled(hint, theme.dim()))),
@@ -2527,7 +2555,7 @@ fn render_workspace(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme:
                         )
                     };
                     let footer_text = format!(
-                        " Page {} (showing {} rows{}){}{}{} | [v] row  [s/S] sort/clear  [</>] width  [/] filter  [Ctrl+F] search  [n]/[p] page  [w] Close",
+                        " Page {} (showing {} rows{}){}{}{} | [v] row  [y] copy  [s/S] sort/clear  [</>] width  [/] filter  [Ctrl+F] search  [n]/[p] page  [w] Close",
                         data_tab.page.page + 1,
                         data_tab.page.records.len(),
                         total_str,
@@ -2542,7 +2570,15 @@ fn render_workspace(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme:
             WorkspaceTab::Console(console) => {
                 query::render_query_console(f, chunks[1], console, is_focused, theme);
 
-                let footer_text = " [Ctrl+Enter/F5] Run Query | [Tab] Switch Subpane | [w] Close Console Tab";
+                // Contextual footer: once Tab moves the focus into the result
+                // pane, that pane earns its own hints — without this, "v
+                // expands a row" is undiscoverable and pressing v in the
+                // editor just types the letter into the query.
+                let footer_text = if console.focused_subpane == query::ConsoleSubpane::Result {
+                    " [Ctrl+Enter/F5] Run Query | [v] row detail  [y] copy  [Ctrl+F] find  [Tab] editor  [w] Close Console Tab"
+                } else {
+                    " [Ctrl+Enter/F5] Run Query | [Tab] Switch Subpane | [w] Close Console Tab"
+                };
                 let p = Paragraph::new(Span::styled(footer_text, theme.dim()));
                 f.render_widget(p, chunks[2]);
             }
@@ -2808,7 +2844,7 @@ fn render_ddl_popup(
 
     f.render_widget(Clear, popup_area);
 
-    let title = format!(" DDL Schema: {} [Esc to close] ", cref);
+    let title = format!(" DDL Schema: {} [y copy · Esc close] ", cref);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -3261,6 +3297,21 @@ fn render_insert_row_modal(
 mod tests {
     use super::*;
     use crate::driver::Value;
+
+    #[test]
+    fn test_follow_detail_scroll_keeps_selection_in_view() {
+        // Inside the window: scroll stays put.
+        assert_eq!(follow_detail_scroll(3, 0), 0);
+        assert_eq!(follow_detail_scroll(16, 0), 0);
+        // Stepping past the bottom edge pushes the window forward.
+        assert_eq!(follow_detail_scroll(17, 0), 1);
+        assert_eq!(follow_detail_scroll(30, 1), 14);
+        // Stepping back above the window pulls it to the selection.
+        assert_eq!(follow_detail_scroll(0, 14), 0);
+        assert_eq!(follow_detail_scroll(10, 14), 10);
+        // Never scrolls past the very last column.
+        assert_eq!(follow_detail_scroll(2, 2), 2);
+    }
 
     fn record(values: Vec<Value>) -> Record {
         Record { values }

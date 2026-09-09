@@ -1014,7 +1014,13 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) {
         // Universal exit: in raw mode Ctrl+C arrives as a key event, not SIGINT.
-        if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
+        // Ctrl+Shift+C is excluded — in the console editor it copies the query
+        // buffer. On terminals without the kitty protocol that chord arrives
+        // as a plain Ctrl+C (no SHIFT) and still quits, same as before.
+        if key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+            && key.code == KeyCode::Char('c')
+        {
             self.should_quit = true;
             return;
         }
@@ -1055,10 +1061,26 @@ impl App {
         // Screen S2 (Explorer) Handlers
         if matches!(self.mode, ScreenMode::Connected) {
             if let Some(exp) = &mut self.explorer_state {
-                // If DDL popup is open, Esc closes it
+                // If DDL popup is open, Esc closes it and y copies the DDL
+                // text — the schema shown here is often wanted verbatim.
                 if exp.ddl_popup.is_some() {
-                    if key.code == KeyCode::Esc {
-                        exp.ddl_popup = None;
+                    match key.code {
+                        KeyCode::Esc => exp.ddl_popup = None,
+                        KeyCode::Char('y') => {
+                            let res = exp
+                                .ddl_popup
+                                .as_ref()
+                                .map(|(_, ddl)| ClipboardManager::set_text(ddl));
+                            match res {
+                                Some(Ok(_)) => self.toasts.push(
+                                    ToastKind::Success,
+                                    "copied DDL to clipboard".to_string(),
+                                ),
+                                Some(Err(e)) => self.toasts.push(ToastKind::Error, e),
+                                None => {}
+                            }
+                        }
+                        _ => {}
                     }
                     return;
                 }
@@ -2059,21 +2081,32 @@ impl App {
                                             _ => {}
                                         }
                                     } else if t.row_detail {
-                                        // Row-detail overlay: scroll columns,
-                                        // step rows, close.
+                                        // Row-detail overlay: step the column
+                                        // selection, walk rows, copy, close.
                                         match key.code {
                                             KeyCode::Esc | KeyCode::Char('v') | KeyCode::Char('V') => {
                                                 t.row_detail = false;
                                             }
                                             KeyCode::Down | KeyCode::Char('j') => {
                                                 let last = t.page.columns.len().saturating_sub(1);
-                                                if t.row_detail_scroll < last {
-                                                    t.row_detail_scroll += 1;
+                                                if t.selected_col < last {
+                                                    t.selected_col += 1;
+                                                    t.row_detail_scroll =
+                                                        crate::ui::screens::explorer::follow_detail_scroll(
+                                                            t.selected_col,
+                                                            t.row_detail_scroll,
+                                                        );
                                                 }
                                             }
                                             KeyCode::Up | KeyCode::Char('k') => {
-                                                t.row_detail_scroll =
-                                                    t.row_detail_scroll.saturating_sub(1);
+                                                if t.selected_col > 0 {
+                                                    t.selected_col -= 1;
+                                                    t.row_detail_scroll =
+                                                        crate::ui::screens::explorer::follow_detail_scroll(
+                                                            t.selected_col,
+                                                            t.row_detail_scroll,
+                                                        );
+                                                }
                                             }
                                             // ←/→ walk rows without leaving the
                                             // overlay, so scanning is fast.
@@ -2089,6 +2122,49 @@ impl App {
                                             {
                                                 t.selected_row -= 1;
                                                 t.row_detail_scroll = 0;
+                                            }
+                                            // Copy bindings mirror the grid
+                                            // behind the overlay. `c` checks
+                                            // !CONTROL because Ctrl+C is the
+                                            // universal quit, not a copy.
+                                            KeyCode::Char('y')
+                                                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                            {
+                                                if let Some(row) = crate::ui::screens::explorer::visible_records(t).get(t.selected_row).copied() {
+                                                    match ClipboardManager::copy_row_tsv(row) {
+                                                        Ok(_) => self.toasts.push(ToastKind::Success, "copied row as TSV (spreadsheet) to clipboard".to_string()),
+                                                        Err(e) => self.toasts.push(ToastKind::Error, e),
+                                                    }
+                                                }
+                                            }
+                                            KeyCode::Char('y') => {
+                                                if let Some(row) = crate::ui::screens::explorer::visible_records(t).get(t.selected_row).copied()
+                                                    && let Some(val) = row.values.get(t.selected_col)
+                                                {
+                                                    match ClipboardManager::copy_cell(val) {
+                                                        Ok(_) => self.toasts.push(ToastKind::Success, "copied cell to clipboard".to_string()),
+                                                        Err(e) => self.toasts.push(ToastKind::Error, e),
+                                                    }
+                                                }
+                                            }
+                                            KeyCode::Char('c') => {
+                                                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                                    && let Some(row) = crate::ui::screens::explorer::visible_records(t).get(t.selected_row).copied()
+                                                    && let Some(val) = row.values.get(t.selected_col)
+                                                {
+                                                    match ClipboardManager::copy_cell(val) {
+                                                        Ok(_) => self.toasts.push(ToastKind::Success, "copied cell to clipboard".to_string()),
+                                                        Err(e) => self.toasts.push(ToastKind::Error, e),
+                                                    }
+                                                }
+                                            }
+                                            KeyCode::Char('Y') => {
+                                                if let Some(row) = crate::ui::screens::explorer::visible_records(t).get(t.selected_row).copied() {
+                                                    match ClipboardManager::copy_row_json(&t.page.columns, row) {
+                                                        Ok(_) => self.toasts.push(ToastKind::Success, "copied row as JSON to clipboard".to_string()),
+                                                        Err(e) => self.toasts.push(ToastKind::Error, e),
+                                                    }
+                                                }
                                             }
                                             _ => {}
                                         }
@@ -2813,6 +2889,22 @@ impl App {
                                                 );
                                             }
                                         }
+                                        // Ctrl+Shift+C copies the whole query
+                                        // buffer. Same caveat as Ctrl+Shift+Z
+                                        // above: without the kitty protocol the
+                                        // chord collapses to Ctrl+C and quits.
+                                        KeyCode::Char('c')
+                                            if key.modifiers.contains(KeyModifiers::CONTROL)
+                                                && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                                        {
+                                            match ClipboardManager::set_text(&c.text()) {
+                                                Ok(_) => self.toasts.push(
+                                                    ToastKind::Success,
+                                                    "copied query to clipboard".to_string(),
+                                                ),
+                                                Err(e) => self.toasts.push(ToastKind::Error, e),
+                                            }
+                                        }
                                         // Ctrl+F: pretty-print the SQL. Only SQL —
                                         // the formatter breaks lines on SQL
                                         // keywords, which on a Redis console turns
@@ -2882,12 +2974,24 @@ impl App {
                                                 .as_ref()
                                                 .map(|r| r.columns.len().saturating_sub(1))
                                                 .unwrap_or(0);
-                                            if c.row_detail_scroll < last {
-                                                c.row_detail_scroll += 1;
+                                            if c.result_selected_col < last {
+                                                c.result_selected_col += 1;
+                                                c.row_detail_scroll =
+                                                    crate::ui::screens::explorer::follow_detail_scroll(
+                                                        c.result_selected_col,
+                                                        c.row_detail_scroll,
+                                                    );
                                             }
                                         }
                                         KeyCode::Up | KeyCode::Char('k') => {
-                                            c.row_detail_scroll = c.row_detail_scroll.saturating_sub(1);
+                                            if c.result_selected_col > 0 {
+                                                c.result_selected_col -= 1;
+                                                c.row_detail_scroll =
+                                                    crate::ui::screens::explorer::follow_detail_scroll(
+                                                        c.result_selected_col,
+                                                        c.row_detail_scroll,
+                                                    );
+                                            }
                                         }
                                         // ←/→ step rows without closing, so a
                                         // result set can be read one row at a
@@ -2904,6 +3008,56 @@ impl App {
                                             if c.result_selected_row > 0 {
                                                 c.result_selected_row -= 1;
                                                 c.row_detail_scroll = 0;
+                                            }
+                                        }
+                                        // Copy bindings mirror the result grid
+                                        // behind the overlay. Ctrl+Y is redo
+                                        // only in the editor subpane — here it
+                                        // copies the row as TSV, exactly like
+                                        // the grid's own Ctrl+Y.
+                                        KeyCode::Char('y')
+                                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+                                        {
+                                            if let Some(res) = &c.last_result {
+                                                if let Some(row) = res.records.get(c.result_selected_row) {
+                                                    match ClipboardManager::copy_row_tsv(row) {
+                                                        Ok(_) => self.toasts.push(ToastKind::Success, "copied row as TSV (spreadsheet) to clipboard".to_string()),
+                                                        Err(e) => self.toasts.push(ToastKind::Error, e),
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Char('y') => {
+                                            if let Some(res) = &c.last_result
+                                                && let Some(row) = res.records.get(c.result_selected_row)
+                                                && let Some(val) = row.values.get(c.result_selected_col)
+                                            {
+                                                match ClipboardManager::copy_cell(val) {
+                                                    Ok(_) => self.toasts.push(ToastKind::Success, "copied cell to clipboard".to_string()),
+                                                    Err(e) => self.toasts.push(ToastKind::Error, e),
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Char('c') => {
+                                            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                                && let Some(res) = &c.last_result
+                                                && let Some(row) = res.records.get(c.result_selected_row)
+                                                && let Some(val) = row.values.get(c.result_selected_col)
+                                            {
+                                                match ClipboardManager::copy_cell(val) {
+                                                    Ok(_) => self.toasts.push(ToastKind::Success, "copied cell to clipboard".to_string()),
+                                                    Err(e) => self.toasts.push(ToastKind::Error, e),
+                                                }
+                                            }
+                                        }
+                                        KeyCode::Char('Y') => {
+                                            if let Some(res) = &c.last_result {
+                                                if let Some(row) = res.records.get(c.result_selected_row) {
+                                                    match ClipboardManager::copy_row_json(&res.columns, row) {
+                                                        Ok(_) => self.toasts.push(ToastKind::Success, "copied row as JSON to clipboard".to_string()),
+                                                        Err(e) => self.toasts.push(ToastKind::Error, e),
+                                                    }
+                                                }
                                             }
                                         }
                                         _ => {}
