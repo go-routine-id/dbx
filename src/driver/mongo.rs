@@ -43,7 +43,7 @@ use mongodb::options::ClientOptions;
 
 use super::{
     Capabilities, Collection, CollectionMeta, CollectionRef, ColumnMeta, Driver, DriverInfo,
-    IndexMeta, Namespace, Page, QueryResult, Record, RecordPage, Value,
+    FilterOp, IndexMeta, Namespace, Page, QueryResult, Record, RecordPage, RowFilter, Value,
 };
 use crate::config::{ConnectionConfig, SslMode};
 
@@ -134,6 +134,41 @@ async fn drain(mut cursor: mongodb::Cursor<Document>) -> Result<Vec<Document>> {
         docs.push(cursor.deserialize_current()?);
     }
     Ok(docs)
+}
+
+/// Translate a `RowFilter` into a BSON filter document for `records()`.
+/// Mongo documents are untyped, so `value` is always treated as a BSON
+/// string literal — no numeric/bool coercion (documented v1 behavior).
+/// `Exists`/`NotExists` ignore `value` entirely.
+///
+/// Errors (rather than silently matching all documents) if given an
+/// operator this driver doesn't advertise via `filter_operators()` — a
+/// mismatch there is a bug in the caller, not something to fail open on.
+fn row_filter_to_doc(f: &RowFilter) -> Result<Document> {
+    Ok(match f.op {
+        FilterOp::Eq => doc! { f.column.clone(): f.value.clone() },
+        FilterOp::Ne => doc! { f.column.clone(): { "$ne": f.value.clone() } },
+        FilterOp::Gt => doc! { f.column.clone(): { "$gt": f.value.clone() } },
+        FilterOp::Gte => doc! { f.column.clone(): { "$gte": f.value.clone() } },
+        FilterOp::Lt => doc! { f.column.clone(): { "$lt": f.value.clone() } },
+        FilterOp::Lte => doc! { f.column.clone(): { "$lte": f.value.clone() } },
+        FilterOp::Regex => doc! { f.column.clone(): { "$regex": f.value.as_str() } },
+        FilterOp::Exists => doc! { f.column.clone(): { "$exists": true } },
+        FilterOp::NotExists => doc! { f.column.clone(): { "$exists": false } },
+        // Unsupported by this driver's filter_operators(); the filter modal
+        // never offers these, so reaching here means the contract between
+        // the UI and the driver was violated somewhere upstream.
+        FilterOp::Like
+        | FilterOp::NotLike
+        | FilterOp::ILike
+        | FilterOp::IsNull
+        | FilterOp::IsNotNull => {
+            bail!(
+                "mongo driver does not support filter operator {}",
+                f.op.label()
+            );
+        }
+    })
 }
 
 #[async_trait]
@@ -267,16 +302,40 @@ impl Driver for MongoDriver {
         })
     }
 
+    fn filter_operators(&self) -> &'static [FilterOp] {
+        &[
+            FilterOp::Eq,
+            FilterOp::Ne,
+            FilterOp::Gt,
+            FilterOp::Gte,
+            FilterOp::Lt,
+            FilterOp::Lte,
+            FilterOp::Regex,
+            FilterOp::Exists,
+            FilterOp::NotExists,
+        ]
+    }
+
     async fn records(&self, c: &CollectionRef, page: Page) -> Result<RecordPage> {
         let coll = self
             .client
             .database(&c.namespace.0)
             .collection::<Document>(&c.name);
 
-        let total_records = coll.estimated_document_count().await.ok();
+        let filter_doc = page
+            .filter
+            .as_ref()
+            .map(row_filter_to_doc)
+            .transpose()?;
+
+        let total_records = match &filter_doc {
+            Some(f) => coll.count_documents(f.clone()).await.ok(),
+            None => coll.estimated_document_count().await.ok(),
+        };
 
         // Column set comes from the same sampling used for metadata, so the
-        // grid matches what the schema panel shows…
+        // grid matches what the schema panel shows… (unfiltered — sampling
+        // columns is a separate concern from filtering rows).
         let sample = drain(
             coll.find(doc! {})
                 .limit(SCHEMA_SAMPLE_LIMIT)
@@ -293,7 +352,7 @@ impl Driver for MongoDriver {
         // cursor between pages.
         let limit = page.limit.clamp(1, i64::MAX as u64) as i64;
         let docs = drain(
-            coll.find(doc! {})
+            coll.find(filter_doc.clone().unwrap_or_default())
                 .sort(doc! { "_id": 1 })
                 .skip(page.offset)
                 .limit(limit)

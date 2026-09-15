@@ -9,7 +9,9 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Cell, Clear, Paragraph, Row as TableRow, Table, TableState,
 };
 
-use crate::driver::{Collection, CollectionRef, ColumnMeta, Namespace, Record, RecordPage, Value};
+use crate::driver::{
+    Collection, CollectionRef, ColumnMeta, FilterOp, Namespace, Record, RecordPage, RowFilter, Value,
+};
 use crate::export::ExportFormat;
 use crate::theme::Theme;
 use crate::ui::screens::erd::{self, ErdTab};
@@ -577,12 +579,13 @@ pub struct DataTab {
     /// Active sort keys in priority order: the first decides, later ones only
     /// break ties. Empty = natural order.
     pub sort_keys: Vec<(usize, SortDir)>,
-    /// Active client-side filter, applied on top of the sort.
-    pub filter: Option<FilterExpr>,
-    /// `true` while the user is typing a filter expression in the footer.
-    pub filter_editing: bool,
-    /// Text buffer for the filter being typed.
-    pub filter_buffer: String,
+    /// Active server-side row filter — drives the WHERE/filter clause the
+    /// driver's `records()` builds. `None` = no filter, the original
+    /// unconditional `SELECT *` behavior. Survives pagination (`n`/`p`) and
+    /// manual refresh, unlike the old client-side filter it replaces.
+    pub row_filter: Option<RowFilter>,
+    /// The filter modal (`/` or Ctrl+F) while it's open — `None` otherwise.
+    pub filter_modal: Option<FilterModalState>,
     /// `true` for views (may be read-only / not updatable). Disables the
     /// cell-edit / insert / delete shortcuts so the UI never offers an
     /// operation that would fail at the DB (or silently mutate base rows).
@@ -669,25 +672,17 @@ fn fitting_columns(widths: &[u16], offset: usize, inner_w: u16) -> usize {
     n.max(1)
 }
 
-/// Rows of `tab` as they are actually displayed: client-side filter applied,
-/// then the client-side sort. Row *references* are returned so
-/// `page.records` keeps its natural order for pagination.
+/// Rows of `tab` as they are actually displayed: the client-side sort
+/// applied on top of whatever page the server already sent (filtering now
+/// happens server-side, before rows are ever loaded — see `row_filter`).
+/// Row *references* are returned so `page.records` keeps its natural order
+/// for pagination.
 ///
 /// Every place that maps a `selected_row` back to a record must go through
-/// this, or the selection silently points at the wrong row whenever a filter
-/// or sort is active.
+/// this, or the selection silently points at the wrong row whenever a sort
+/// is active.
 pub fn visible_records(tab: &DataTab) -> Vec<&Record> {
-    let mut rows: Vec<&Record> = tab
-        .page
-        .records
-        .iter()
-        .filter(|r| {
-            tab.filter
-                .as_ref()
-                .map(|f| record_matches_filter(r, f))
-                .unwrap_or(true)
-        })
-        .collect();
+    let mut rows: Vec<&Record> = tab.page.records.iter().collect();
     if !tab.sort_keys.is_empty() {
         // Stable so equal rows keep the order the server sent them in.
         rows.sort_by(|a, b| compare_by_keys(a, b, &tab.sort_keys));
@@ -749,91 +744,56 @@ pub fn format_size(bytes: u64) -> String {
     }
 }
 
-/// Comparison operator for a client-side row filter.
+/// Which field of the filter modal has focus.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FilterOp {
-    Eq,
-    Ne,
-    Gt,
-    Lt,
-    Contains,
+pub enum FilterModalField {
+    Column,
+    Operator,
+    Value,
 }
 
-/// A parsed client-side filter: keep rows where `col op value` holds.
+/// State of the server-side filter modal (`/` or Ctrl+F) while it's open.
+/// `columns` and `operators` are snapshotted when the modal opens, so the
+/// picker lists never change out from under the user mid-edit.
 #[derive(Clone, Debug)]
-pub struct FilterExpr {
-    pub col: usize,
-    pub op: FilterOp,
+pub struct FilterModalState {
+    pub columns: Vec<String>,
+    pub operators: Vec<FilterOp>,
+    pub field: FilterModalField,
+    pub column_idx: usize,
+    pub op_idx: usize,
     pub value: String,
 }
 
-impl FilterExpr {
-    /// Re-render the expression as a string (used to pre-fill the edit box).
-    pub fn display(&self) -> String {
-        let sym = match self.op {
-            FilterOp::Eq => "=",
-            FilterOp::Ne => "!=",
-            FilterOp::Gt => ">",
-            FilterOp::Lt => "<",
-            FilterOp::Contains => "~",
-        };
-        format!("{} {sym} {}", self.col, self.value)
-    }
-}
-
-/// Parse a footer filter expression of the form `col op value` (e.g.
-/// `status = paid`, `amount > 100`, `name ~ ada`). The operator is detected
-/// by scanning for the first known symbol; column matches by exact name.
-pub fn parse_filter(buf: &str, columns: &[String]) -> Option<FilterExpr> {
-    let buf = buf.trim();
-    if buf.is_empty() {
+/// Build filter-modal state for `tab`, seeded from the driver's supported
+/// `operators` and — when `tab.row_filter` is already active — pre-selecting
+/// its column/operator/value so reopening the modal to tweak a filter shows
+/// the current selection instead of a blank form.
+///
+/// `None` when `operators` is empty (the driver has no server-side filter
+/// support for this connection): the caller toasts instead of opening an
+/// empty modal.
+pub fn build_filter_modal(operators: &'static [FilterOp], tab: &DataTab) -> Option<FilterModalState> {
+    if operators.is_empty() {
         return None;
     }
-    for (sym, op) in [
-        ("!=", FilterOp::Ne),
-        ("=", FilterOp::Eq),
-        (">", FilterOp::Gt),
-        ("<", FilterOp::Lt),
-        ("~", FilterOp::Contains),
-    ] {
-        if let Some(pos) = buf.find(sym) {
-            let col_name = buf[..pos].trim();
-            let value = buf[pos + sym.len()..].trim().to_string();
-            if value.is_empty() {
-                return None;
-            }
-            let col = columns.iter().position(|c| c == col_name)?;
-            return Some(FilterExpr { col, op, value });
-        }
-    }
-    None
-}
-
-/// Does `record` satisfy the filter? Non-numeric `Gt`/`Lt` fall back to
-/// string comparison; `Eq`/`Ne`/`Contains` always use the display string.
-pub fn record_matches_filter(record: &Record, f: &FilterExpr) -> bool {
-    let Some(val) = record.values.get(f.col) else {
-        return false;
+    let columns = tab.page.columns.clone();
+    let (column_idx, op_idx, value) = match &tab.row_filter {
+        Some(f) => (
+            columns.iter().position(|c| c == &f.column).unwrap_or(0),
+            operators.iter().position(|o| *o == f.op).unwrap_or(0),
+            f.value.clone(),
+        ),
+        None => (0, 0, String::new()),
     };
-    let cell = val.display_str();
-    match f.op {
-        FilterOp::Eq => cell == f.value,
-        FilterOp::Ne => cell != f.value,
-        FilterOp::Contains => cell.contains(&f.value),
-        FilterOp::Gt => match numeric_pair(&cell, &f.value) {
-            Some((a, b)) => a > b,
-            None => cell > f.value,
-        },
-        FilterOp::Lt => match numeric_pair(&cell, &f.value) {
-            Some((a, b)) => a < b,
-            None => cell < f.value,
-        },
-    }
-}
-
-/// Parse two strings as numbers; `Some((a, b))` when both parse.
-fn numeric_pair(a: &str, b: &str) -> Option<(f64, f64)> {
-    Some((a.parse::<f64>().ok()?, b.parse::<f64>().ok()?))
+    Some(FilterModalState {
+        columns,
+        operators: operators.to_vec(),
+        field: FilterModalField::Column,
+        column_idx,
+        op_idx,
+        value,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -1133,6 +1093,12 @@ pub fn render_explorer(
 
     if let Some(export_modal) = &state.export_modal {
         render_export_modal(f, area, export_modal, theme);
+    }
+
+    if let Some(WorkspaceTab::Table(tab)) = state.active_tab()
+        && let Some(filter_modal) = &tab.filter_modal
+    {
+        render_filter_modal(f, area, filter_modal, theme);
     }
 
     if let Some(edit_modal) = &state.cell_edit_modal {
@@ -2488,16 +2454,14 @@ fn render_workspace(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme:
             WorkspaceTab::Table(data_tab) => {
                 render_grid(f, chunks[1], data_tab, is_focused, theme);
 
-                // 3. Pagination Footer. While the user is typing a filter, the
-                // footer becomes the filter input line.
+                // 3. Pagination Footer. While the user is typing a search, the
+                // footer becomes the search input line (filtering now opens
+                // its own modal instead of taking over the footer).
                 let p = if data_tab.search_editing {
                     let input = format!(
                         "[search] {}_ [Enter] find  [Esc] cancel",
                         data_tab.search_buffer
                     );
-                    Paragraph::new(Span::styled(input, theme.accent()))
-                } else if data_tab.filter_editing {
-                    let input = format!("[filter] {}_ [Enter] apply  [Esc] cancel", data_tab.filter_buffer);
                     Paragraph::new(Span::styled(input, theme.accent()))
                 } else {
                     let total_str = data_tab
@@ -2505,14 +2469,15 @@ fn render_workspace(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme:
                         .total_records
                         .map(|t| format!(" of {} total", t))
                         .unwrap_or_default();
-                    let filter_badge = data_tab.filter.as_ref().map(|f| {
-                        let shown = data_tab
-                            .page
-                            .records
-                            .iter()
-                            .filter(|r| record_matches_filter(r, f))
-                            .count();
-                        format!(" | filter {} ({}/{} shown)", f.display(), shown, data_tab.page.records.len())
+                    // The filter is applied server-side, so every loaded row
+                    // already matches it — no local count to show, just what
+                    // the active filter is.
+                    let filter_badge = data_tab.row_filter.as_ref().map(|f| {
+                        if f.op.needs_value() {
+                            format!(" | filter: {} {} {}", f.column, f.op.label(), f.value)
+                        } else {
+                            format!(" | filter: {} {}", f.column, f.op.label())
+                        }
                     });
                     let ro = if data_tab.read_only { " [read-only view]" } else { "" };
                     // Name the whole sort stack (primary first) so a
@@ -2555,7 +2520,7 @@ fn render_workspace(f: &mut Frame, area: Rect, state: &mut ExplorerState, theme:
                         )
                     };
                     let footer_text = format!(
-                        " Page {} (showing {} rows{}){}{}{} | [v] row  [y] copy  [s/S] sort/clear  [</>] width  [/] filter  [Ctrl+F] search  [n]/[p] page  [w] Close",
+                        " Page {} (showing {} rows{}){}{}{} | [v] row  [y] copy  [s/S] sort/clear  [</>] width  [Ctrl+F] filter  [Ctrl+G] search  [n]/[p] page  [w] Close",
                         data_tab.page.page + 1,
                         data_tab.page.records.len(),
                         total_str,
@@ -2945,6 +2910,133 @@ fn render_export_modal(
     // 3. Hints
     let hint = "[Tab] Switch Field | [←/→] Change Format | [Enter] Export | [Esc] Cancel";
     f.render_widget(Paragraph::new(Span::styled(hint, theme.dim())).alignment(Alignment::Center), chunks[3]);
+}
+
+/// Server-side filter modal (`/` or Ctrl+F): pick a column, an operator the
+/// active driver supports, and (when the operator takes one) a value, then
+/// Enter applies it as the tab's `row_filter` and re-fetches page 1.
+fn render_filter_modal(f: &mut Frame, area: Rect, modal: &FilterModalState, theme: &Theme) {
+    let show_value = modal
+        .operators
+        .get(modal.op_idx)
+        .map(|op| op.needs_value())
+        .unwrap_or(true);
+
+    let width = 60.min(area.width.saturating_sub(4));
+    // Up to 6 visible rows in the column list; the value row disappears
+    // entirely for an operand-less operator (IS NULL and friends).
+    let list_rows: u16 = (modal.columns.len().clamp(1, 6)) as u16;
+    let value_rows: u16 = if show_value { 3 } else { 0 };
+    let height = (list_rows + 6 + value_rows).min(area.height.saturating_sub(2));
+
+    let popup_area = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+
+    f.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(theme.accent())
+        .style(theme.panel())
+        .title(" Filter Rows [Ctrl+F] ");
+
+    let inner = block.inner(popup_area);
+    f.render_widget(block, popup_area);
+
+    let mut constraints = vec![
+        Constraint::Length(list_rows + 2), // Column list (bordered)
+        Constraint::Length(1),             // Operator row
+    ];
+    if show_value {
+        constraints.push(Constraint::Length(3)); // Value input (bordered)
+    }
+    constraints.push(Constraint::Length(1)); // Hint line
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
+        .split(inner);
+
+    // 1. Column list — a scrolling window kept centered on `column_idx`.
+    let col_border = if modal.field == FilterModalField::Column { theme.accent() } else { theme.border() };
+    let col_block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(col_border)
+        .title(" Column ");
+    let col_inner = col_block.inner(chunks[0]);
+    f.render_widget(col_block, chunks[0]);
+
+    let visible = col_inner.height as usize;
+    let scroll = if visible == 0 || modal.column_idx < visible {
+        0
+    } else {
+        modal.column_idx + 1 - visible
+    };
+    let col_lines: Vec<Line> = modal
+        .columns
+        .iter()
+        .enumerate()
+        .skip(scroll)
+        .take(visible)
+        .map(|(i, name)| {
+            let selected = i == modal.column_idx;
+            let style = if selected && modal.field == FilterModalField::Column {
+                theme.accent().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else if selected {
+                theme.accent().add_modifier(Modifier::BOLD)
+            } else {
+                theme.base()
+            };
+            let marker = if selected { "▶ " } else { "  " };
+            Line::from(Span::styled(format!("{marker}{name}"), style))
+        })
+        .collect();
+    f.render_widget(Paragraph::new(col_lines), col_inner);
+
+    // 2. Operator picker — a single "◀ label ▶" row, per operator the
+    // active driver actually supports.
+    let op_style = if modal.field == FilterModalField::Operator {
+        theme.accent().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+    } else {
+        theme.accent().add_modifier(Modifier::BOLD)
+    };
+    let op_label = modal.operators.get(modal.op_idx).map(|op| op.label()).unwrap_or("?");
+    let op_line = Line::from(vec![
+        Span::styled(" Operator: ", theme.dim()),
+        Span::styled(format!("◀ {op_label} ▶"), op_style),
+    ]);
+    f.render_widget(Paragraph::new(op_line), chunks[1]);
+
+    // 3. Value input — hidden entirely for an operator that takes no operand.
+    if show_value {
+        let val_border = if modal.field == FilterModalField::Value { theme.accent() } else { theme.border() };
+        let val_block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(val_border)
+            .title(" Value ");
+        let val_inner = val_block.inner(chunks[2]);
+        f.render_widget(val_block, chunks[2]);
+        let cursor = if modal.field == FilterModalField::Value { "_" } else { "" };
+        f.render_widget(
+            Paragraph::new(format!("{}{cursor}", modal.value)).style(theme.base()),
+            val_inner,
+        );
+    }
+
+    // 4. Hint line
+    let hint = "[Tab] next field  [↑/↓ or j/k] change column/operator  [type] edit value  [Enter] apply  [Ctrl+X] clear filter  [Esc] cancel";
+    let hint_idx = chunks.len() - 1;
+    f.render_widget(
+        Paragraph::new(Span::styled(hint, theme.dim())).alignment(Alignment::Center),
+        chunks[hint_idx],
+    );
 }
 
 fn render_cell_edit_modal(
@@ -3353,9 +3445,8 @@ mod tests {
             column_meta: Vec::new(),
             foreign_keys: Vec::new(),
             sort_keys: Vec::new(),
-            filter: None,
-            filter_editing: false,
-            filter_buffer: String::new(),
+            row_filter: None,
+            filter_modal: None,
             read_only: false,
             grid_hit_area: None,
             grid_col_rects: Vec::new(),
@@ -3425,23 +3516,6 @@ mod tests {
         assert_eq!(displayed[tab.selected_row].values[0].display_str(), "10");
         // The natural-order read that used to back DELETE points elsewhere.
         assert_eq!(tab.page.records[tab.selected_row].values[0].display_str(), "30");
-    }
-
-    #[test]
-    fn test_filter_shrinks_the_selectable_row_range() {
-        let mut tab = tab_with(
-            &["id"],
-            vec![
-                record(vec![Value::Int(1)]),
-                record(vec![Value::Int(2)]),
-                record(vec![Value::Int(3)]),
-            ],
-        );
-        tab.filter = parse_filter("id = 2", &tab.page.columns);
-        // Only one row is displayed, so only index 0 is a valid selection even
-        // though `page.records` still holds three.
-        assert_eq!(visible_records(&tab).len(), 1);
-        assert_eq!(tab.page.records.len(), 3);
     }
 
     #[test]
@@ -3774,51 +3848,36 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_filter() {
-        let cols = vec!["status".to_string(), "amount".to_string(), "name".to_string()];
-        let f = parse_filter("status = paid", &cols).expect("parse");
-        assert_eq!(f.col, 0);
-        assert_eq!(f.op, FilterOp::Eq);
-        assert_eq!(f.value, "paid");
-
-        let f = parse_filter("amount > 100", &cols).expect("parse");
-        assert_eq!(f.col, 1);
-        assert_eq!(f.op, FilterOp::Gt);
-
-        let f = parse_filter("name ~ ada", &cols).expect("parse");
-        assert_eq!(f.col, 2);
-        assert_eq!(f.op, FilterOp::Contains);
-
-        // Unknown column / malformed → None.
-        assert!(parse_filter("nope = 1", &cols).is_none());
-        assert!(parse_filter("status >", &cols).is_none());
-        assert!(parse_filter("", &cols).is_none());
+    fn test_build_filter_modal_defaults_when_no_active_filter() {
+        let tab = tab_with(&["id", "status"], vec![record(vec![Value::Int(1), Value::String("paid".to_string())])]);
+        let ops: &'static [FilterOp] = &[FilterOp::Eq, FilterOp::Gt, FilterOp::IsNull];
+        let modal = build_filter_modal(ops, &tab).expect("driver supports filtering");
+        assert_eq!(modal.columns, vec!["id".to_string(), "status".to_string()]);
+        assert_eq!(modal.operators, ops.to_vec());
+        assert_eq!(modal.column_idx, 0);
+        assert_eq!(modal.op_idx, 0);
+        assert_eq!(modal.value, "");
     }
 
     #[test]
-    fn test_record_matches_filter() {
-        use crate::driver::Value;
-        let cols = vec!["status".to_string(), "amount".to_string(), "name".to_string()];
-        let rec = record(vec![
-            Value::String("paid".to_string()),
-            Value::Decimal("150.50".to_string()),
-            Value::String("ada lovelace".to_string()),
-        ]);
+    fn test_build_filter_modal_none_when_driver_has_no_operators() {
+        let tab = tab_with(&["id"], vec![]);
+        assert!(build_filter_modal(&[], &tab).is_none());
+    }
 
-        let eq = parse_filter("status = paid", &cols).unwrap();
-        assert!(record_matches_filter(&rec, &eq));
-        let ne = parse_filter("status != pending", &cols).unwrap();
-        assert!(record_matches_filter(&rec, &ne));
-
-        // Numeric comparison (not lexicographic).
-        let gt = parse_filter("amount > 100", &cols).unwrap();
-        assert!(record_matches_filter(&rec, &gt));
-        let lt = parse_filter("amount < 100", &cols).unwrap();
-        assert!(!record_matches_filter(&rec, &lt));
-
-        // Contains (case-sensitive, like a LIKE without wildcards).
-        let cont = parse_filter("name ~ lovelace", &cols).unwrap();
-        assert!(record_matches_filter(&rec, &cont));
+    #[test]
+    fn test_build_filter_modal_preselects_active_row_filter() {
+        let mut tab = tab_with(&["id", "status"], vec![]);
+        tab.row_filter = Some(RowFilter {
+            column: "status".to_string(),
+            op: FilterOp::Ne,
+            value: "pending".to_string(),
+        });
+        let ops: &'static [FilterOp] = &[FilterOp::Eq, FilterOp::Ne];
+        let modal = build_filter_modal(ops, &tab).expect("driver supports filtering");
+        assert_eq!(modal.column_idx, 1);
+        assert_eq!(modal.op_idx, 1);
+        assert_eq!(modal.value, "pending");
     }
 
     // ---- Create-table form state ----

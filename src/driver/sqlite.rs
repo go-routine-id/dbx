@@ -21,7 +21,7 @@ use sqlx::{AssertSqlSafe, Column, Row, TypeInfo, ValueRef};
 
 use super::{
     Capabilities, Collection, CollectionMeta, CollectionRef, ColumnMeta, Driver, DriverInfo,
-    ForeignKeyMeta, IndexMeta, Namespace, Page, QueryResult, Record, RecordPage, Value,
+    FilterOp, ForeignKeyMeta, IndexMeta, Namespace, Page, QueryResult, Record, RecordPage, Value,
 };
 use crate::config::ConnectionConfig;
 
@@ -289,23 +289,73 @@ impl Driver for SqliteDriver {
         })
     }
 
+    /// Operators `records()` below knows how to translate into a SQLite
+    /// `WHERE` clause. `ILike`/`Regex` have no native SQLite operator and
+    /// `Exists`/`NotExists` don't apply to a plain column value, so those
+    /// stay unoffered rather than silently no-op.
+    fn filter_operators(&self) -> &'static [FilterOp] {
+        &[
+            FilterOp::Eq,
+            FilterOp::Ne,
+            FilterOp::Gt,
+            FilterOp::Gte,
+            FilterOp::Lt,
+            FilterOp::Lte,
+            FilterOp::Like,
+            FilterOp::NotLike,
+            FilterOp::IsNull,
+            FilterOp::IsNotNull,
+        ]
+    }
+
     async fn records(&self, c: &CollectionRef, page: Page) -> Result<RecordPage> {
         let ns_esc = escape_ident(&c.namespace.0);
         let name_esc = escape_ident(&c.name);
 
-        let count_sql = format!("SELECT COUNT(*) FROM {ns_esc}.{name_esc}");
-        let total_records: Option<u64> =
-            sqlx::query_scalar::<_, i64>(AssertSqlSafe(count_sql.as_str()))
-                .fetch_one(&self.pool)
-                .await
-                .ok()
-                .map(|count| count.max(0) as u64);
+        // Build the WHERE clause (if any) once, along with the bind value
+        // it needs — shared by the COUNT and SELECT queries so the total
+        // and the page are computed against the same filtered set.
+        let (where_sql, bind_val): (String, Option<&str>) = match &page.filter {
+            Some(f) if matches!(f.op, FilterOp::Exists | FilterOp::NotExists) => {
+                return Err(anyhow!(
+                    "SQLite filters don't support the '{}' operator",
+                    f.op.label()
+                ));
+            }
+            Some(f) => {
+                let col_esc = escape_ident(&f.column);
+                if f.op.needs_value() {
+                    (
+                        format!(" WHERE {} {} ?", col_esc, f.op.label()),
+                        Some(f.value.as_str()),
+                    )
+                } else {
+                    (format!(" WHERE {} {}", col_esc, f.op.label()), None)
+                }
+            }
+            None => (String::new(), None),
+        };
+
+        let count_sql = format!("SELECT COUNT(*) FROM {ns_esc}.{name_esc}{where_sql}");
+        let mut count_query = sqlx::query_scalar::<_, i64>(AssertSqlSafe(count_sql.as_str()));
+        if let Some(v) = bind_val {
+            count_query = count_query.bind(v);
+        }
+        let total_records: Option<u64> = count_query
+            .fetch_one(&self.pool)
+            .await
+            .ok()
+            .map(|count| count.max(0) as u64);
 
         let query = format!(
-            "SELECT * FROM {}.{} LIMIT {} OFFSET {}",
-            ns_esc, name_esc, page.limit, page.offset
+            "SELECT * FROM {}.{}{} LIMIT {} OFFSET {}",
+            ns_esc, name_esc, where_sql, page.limit, page.offset
         );
-        let rows = sqlx::query(AssertSqlSafe(query.as_str()))
+        let mut select_query = sqlx::query(AssertSqlSafe(query.as_str()));
+        if let Some(v) = bind_val {
+            select_query = select_query.bind(v);
+        }
+        let rows = select_query
             .fetch_all(&self.pool)
             .await
             .with_context(|| format!("failed to fetch records for {}", c))?;

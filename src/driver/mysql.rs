@@ -9,7 +9,7 @@ use sqlx::{Column, Row, TypeInfo, ValueRef, AssertSqlSafe};
 
 use super::{
     Capabilities, Collection, CollectionMeta, CollectionRef, ColumnMeta, Driver, DriverInfo,
-    ForeignKeyMeta, IndexMeta, Namespace, Page, QueryResult, Record, RecordPage, Value,
+    FilterOp, ForeignKeyMeta, IndexMeta, Namespace, Page, QueryResult, Record, RecordPage, Value,
 };
 use crate::config::ConnectionConfig;
 
@@ -126,6 +126,21 @@ impl Driver for MySqlDriver {
             | Capabilities::EXPLAIN
             | Capabilities::PROCESS_LIST
             | Capabilities::EDIT_DATA
+    }
+
+    fn filter_operators(&self) -> &'static [FilterOp] {
+        &[
+            FilterOp::Eq,
+            FilterOp::Ne,
+            FilterOp::Gt,
+            FilterOp::Gte,
+            FilterOp::Lt,
+            FilterOp::Lte,
+            FilterOp::Like,
+            FilterOp::NotLike,
+            FilterOp::IsNull,
+            FilterOp::IsNotNull,
+        ]
     }
 
     /// One catalog query for every FK in the schema.
@@ -357,20 +372,50 @@ impl Driver for MySqlDriver {
         let ns_esc = escape_ident(&c.namespace.0);
         let name_esc = escape_ident(&c.name);
 
-        let count_sql = format!("SELECT COUNT(*) FROM {}.{}", ns_esc, name_esc);
-        let total_records: Option<u64> = sqlx::query_as::<_, (i64,)>(AssertSqlSafe(count_sql.as_str()))
+        // Build the optional WHERE clause once; both the COUNT and SELECT
+        // queries share it so paging stays correct against the filtered set.
+        let where_clause = page.filter.as_ref().map(|f| {
+            let col_esc = escape_ident(&f.column);
+            if f.op.needs_value() {
+                format!("WHERE {} {} ?", col_esc, f.op.label())
+            } else {
+                format!("WHERE {} {}", col_esc, f.op.label())
+            }
+        });
+        let needs_bind = page.filter.as_ref().map(|f| f.op.needs_value()).unwrap_or(false);
+        let filter_value = page.filter.as_ref().map(|f| f.value.clone());
+
+        let count_sql = match &where_clause {
+            Some(clause) => format!("SELECT COUNT(*) FROM {}.{} {}", ns_esc, name_esc, clause),
+            None => format!("SELECT COUNT(*) FROM {}.{}", ns_esc, name_esc),
+        };
+        let mut count_query = sqlx::query_as::<_, (i64,)>(AssertSqlSafe(count_sql.as_str()));
+        if needs_bind {
+            count_query = count_query.bind(filter_value.clone().unwrap());
+        }
+        let total_records: Option<u64> = count_query
             .fetch_one(&self.pool)
             .await
             .ok()
             .map(|(count,)| count.max(0) as u64);
 
-        let query = format!(
-            "SELECT * FROM {}.{} LIMIT {} OFFSET {}",
-            ns_esc, name_esc, page.limit, page.offset
-        );
+        let query = match &where_clause {
+            Some(clause) => format!(
+                "SELECT * FROM {}.{} {} LIMIT {} OFFSET {}",
+                ns_esc, name_esc, clause, page.limit, page.offset
+            ),
+            None => format!(
+                "SELECT * FROM {}.{} LIMIT {} OFFSET {}",
+                ns_esc, name_esc, page.limit, page.offset
+            ),
+        };
 
         let start = Instant::now();
-        let rows = sqlx::query(AssertSqlSafe(query.as_str()))
+        let mut select_query = sqlx::query(AssertSqlSafe(query.as_str()));
+        if needs_bind {
+            select_query = select_query.bind(filter_value.unwrap());
+        }
+        let rows = select_query
             .fetch_all(&self.pool)
             .await
             .with_context(|| format!("failed to fetch records for {}", c))?;

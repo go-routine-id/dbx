@@ -11,7 +11,7 @@ use tokio_util::compat::{Compat, TokioAsyncWriteCompatExt};
 
 use super::{
     Capabilities, Collection, CollectionMeta, CollectionRef, ColumnMeta, Driver, DriverInfo,
-    ForeignKeyMeta, IndexMeta, Namespace, Page, QueryResult, Record, RecordPage, Value,
+    FilterOp, ForeignKeyMeta, IndexMeta, Namespace, Page, QueryResult, Record, RecordPage, Value,
 };
 use crate::config::{ConnectionConfig, SslMode};
 
@@ -21,6 +21,31 @@ type MssqlClient = Client<Compat<TcpStream>>;
 /// Safely escapes a T-SQL identifier with brackets (`]` → `]]`).
 fn escape_ident(ident: &str) -> String {
     format!("[{}]", ident.replace(']', "]]"))
+}
+
+/// Builds the `column <op> [@P1]` fragment for a row filter. `escaped_col`
+/// must already be through `escape_ident`; the value itself is never spliced
+/// in here — callers bind it as `@P1` via the params slice.
+fn mssql_filter_fragment(escaped_col: &str, op: FilterOp) -> Result<String> {
+    Ok(match op {
+        FilterOp::Eq => format!("{escaped_col} = @P1"),
+        FilterOp::Ne => format!("{escaped_col} <> @P1"),
+        FilterOp::Gt => format!("{escaped_col} > @P1"),
+        FilterOp::Gte => format!("{escaped_col} >= @P1"),
+        FilterOp::Lt => format!("{escaped_col} < @P1"),
+        FilterOp::Lte => format!("{escaped_col} <= @P1"),
+        FilterOp::Like => format!("{escaped_col} LIKE @P1"),
+        FilterOp::NotLike => format!("{escaped_col} NOT LIKE @P1"),
+        FilterOp::IsNull => format!("{escaped_col} IS NULL"),
+        FilterOp::IsNotNull => format!("{escaped_col} IS NOT NULL"),
+        // Not offered by `filter_operators()` below, so this only fires if a
+        // caller builds a `RowFilter` with an operator this driver never
+        // advertised.
+        other => anyhow::bail!(
+            "SQL Server driver does not support filter operator {}",
+            other.label()
+        ),
+    })
 }
 
 pub struct MssqlDriver {
@@ -500,12 +525,45 @@ impl Driver for MssqlDriver {
         })
     }
 
+    /// Same 10 operators as mysql (no ILike — T-SQL has no case-insensitive
+    /// LIKE variant to map it to).
+    fn filter_operators(&self) -> &'static [FilterOp] {
+        &[
+            FilterOp::Eq,
+            FilterOp::Ne,
+            FilterOp::Gt,
+            FilterOp::Gte,
+            FilterOp::Lt,
+            FilterOp::Lte,
+            FilterOp::Like,
+            FilterOp::NotLike,
+            FilterOp::IsNull,
+            FilterOp::IsNotNull,
+        ]
+    }
+
     async fn records(&self, c: &CollectionRef, page: Page) -> Result<RecordPage> {
         let table = format!("{}.{}", escape_ident(&c.namespace.0), escape_ident(&c.name));
 
-        let count_sql = format!("SELECT COUNT(*) FROM {table}");
+        // Build the optional WHERE clause and its bound parameter once, so
+        // the COUNT query and the paged SELECT below see the exact same
+        // filtered set. `None` filter keeps both queries byte-identical to
+        // the unfiltered form (empty where_clause, empty params).
+        let mut params: Vec<&dyn tiberius::ToSql> = Vec::new();
+        let where_clause = match &page.filter {
+            Some(f) => {
+                let fragment = mssql_filter_fragment(&escape_ident(&f.column), f.op)?;
+                if f.op.needs_value() {
+                    params.push(&f.value);
+                }
+                format!(" WHERE {fragment}")
+            }
+            None => String::new(),
+        };
+
+        let count_sql = format!("SELECT COUNT(*) FROM {table}{where_clause}");
         let mut client = self.client.lock().await;
-        let count_row = match client.query(count_sql.as_str(), &[]).await {
+        let count_row = match client.query(count_sql.as_str(), &params).await {
             Ok(s) => s.into_row().await.ok().flatten(),
             Err(_) => None,
         };
@@ -522,13 +580,13 @@ impl Driver for MssqlDriver {
         // accepted no-op ordering for "I just want paging". Page numbers are
         // u64 from our own Page struct, so inlining them is injection-free.
         let query = format!(
-            "SELECT * FROM {table} ORDER BY (SELECT NULL) OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
+            "SELECT * FROM {table}{where_clause} ORDER BY (SELECT NULL) OFFSET {} ROWS FETCH NEXT {} ROWS ONLY",
             page.offset, page.limit
         );
 
         let start = Instant::now();
         let mut stream = client
-            .query(query.as_str(), &[])
+            .query(query.as_str(), &params)
             .await
             .with_context(|| format!("failed to fetch records for {}", c))?;
         // Column names come from the stream metadata, so an empty page still
