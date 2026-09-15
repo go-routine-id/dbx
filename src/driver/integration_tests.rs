@@ -216,6 +216,7 @@ async fn redis_browses_and_executes() {
             Page {
                 offset: 0,
                 limit: 10,
+                filter: None,
             },
         )
         .await

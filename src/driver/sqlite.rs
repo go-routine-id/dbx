@@ -611,7 +611,7 @@ mod tests {
 
         // Rows + paging, and NULL / REAL / TEXT decoding.
         let page = drv
-            .records(&users, Page { offset: 0, limit: 10 })
+            .records(&users, Page { offset: 0, limit: 10 , filter: None })
             .await
             .unwrap();
         assert_eq!(page.total_records, Some(2));
@@ -620,14 +620,14 @@ mod tests {
         assert_eq!(page.records[1].values[2], Value::Null);
 
         let one = drv
-            .records(&users, Page { offset: 1, limit: 1 })
+            .records(&users, Page { offset: 1, limit: 1 , filter: None })
             .await
             .unwrap();
         assert_eq!(one.records.len(), 1);
         assert_eq!(one.page, 1);
 
         let orow = drv
-            .records(&orders, Page { offset: 0, limit: 10 })
+            .records(&orders, Page { offset: 0, limit: 10 , filter: None })
             .await
             .unwrap();
         assert_eq!(orow.records[0].values[2], Value::Float(25.5));

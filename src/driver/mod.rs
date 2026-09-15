@@ -178,11 +178,79 @@ pub struct QueryResult {
     pub execution_time: Duration,
 }
 
+/// A server-side row filter: `column op value`, translated into each
+/// driver's native query language by that driver's `records()`. Values are
+/// always sent as bound parameters (or, where the wire protocol has no bind
+/// API, safely escaped) — never spliced into query text as-is.
+#[derive(Clone, Debug)]
+pub struct RowFilter {
+    pub column: String,
+    pub op: FilterOp,
+    /// Ignored for `IsNull` / `IsNotNull` / `Exists` / `NotExists`, which
+    /// carry no operand.
+    pub value: String,
+}
+
+/// Filter operators a driver may support. The UI only offers the subset a
+/// driver's `filter_operators()` returns, so the filter modal never asks a
+/// driver to translate an operator it doesn't understand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilterOp {
+    Eq,
+    Ne,
+    Gt,
+    Gte,
+    Lt,
+    Lte,
+    Like,
+    NotLike,
+    ILike,
+    Regex,
+    IsNull,
+    IsNotNull,
+    Exists,
+    NotExists,
+}
+
+impl FilterOp {
+    /// Short label for the operator picker in the filter modal.
+    pub fn label(self) -> &'static str {
+        match self {
+            FilterOp::Eq => "=",
+            FilterOp::Ne => "!=",
+            FilterOp::Gt => ">",
+            FilterOp::Gte => ">=",
+            FilterOp::Lt => "<",
+            FilterOp::Lte => "<=",
+            FilterOp::Like => "LIKE",
+            FilterOp::NotLike => "NOT LIKE",
+            FilterOp::ILike => "ILIKE",
+            FilterOp::Regex => "regex",
+            FilterOp::IsNull => "IS NULL",
+            FilterOp::IsNotNull => "IS NOT NULL",
+            FilterOp::Exists => "exists",
+            FilterOp::NotExists => "not exists",
+        }
+    }
+
+    /// Whether this operator takes an operand — `IS NULL` and the exists
+    /// family don't, so the filter modal skips the value field for them.
+    pub fn needs_value(self) -> bool {
+        !matches!(
+            self,
+            FilterOp::IsNull | FilterOp::IsNotNull | FilterOp::Exists | FilterOp::NotExists
+        )
+    }
+}
+
 /// Pagination request parameters.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Page {
     pub offset: u64,
     pub limit: u64,
+    /// Server-side row filter applied before offset/limit. `None` = no
+    /// filter, the previous unconditional `SELECT *` behavior.
+    pub filter: Option<RowFilter>,
 }
 
 impl Default for Page {
@@ -190,6 +258,7 @@ impl Default for Page {
         Self {
             offset: 0,
             limit: 50,
+            filter: None,
         }
     }
 }
@@ -228,6 +297,14 @@ pub trait Driver: Send + Sync {
     async fn collections(&self, ns: &Namespace) -> Result<Vec<Collection>>;
     async fn collection_meta(&self, c: &CollectionRef) -> Result<CollectionMeta>;
     async fn records(&self, c: &CollectionRef, page: Page) -> Result<RecordPage>;
+
+    /// Row-filter operators this driver's `records()` can translate for the
+    /// current collection. Empty (the default) means no server-side filter —
+    /// the filter modal hides the operator field entirely rather than
+    /// offering one that would silently no-op.
+    fn filter_operators(&self) -> &'static [FilterOp] {
+        &[]
+    }
 
     /// QUERY_TEXT capability
     async fn execute(&self, ns: &Namespace, query: &str) -> Result<QueryResult>;

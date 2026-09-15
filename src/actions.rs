@@ -36,7 +36,7 @@ pub async fn open_collection_tab(
     }
     let meta_res = drv.collection_meta(&cref).await;
     let rec_res = drv
-        .records(&cref, Page { offset: 0, limit: page_size })
+        .records(&cref, Page { offset: 0, limit: page_size, filter: None })
         .await
         .map_err(|e| format!("{e:#}"))?;
     let (column_meta, foreign_keys) = meta_res
@@ -735,6 +735,7 @@ pub async fn refresh_table_page(
             let cur_page = Page {
                 offset: t.page.page * t.page.page_size,
                 limit: t.page.page_size,
+                filter: t.row_filter.clone(),
             };
             if let Ok(refreshed) = drv.records(cref, cur_page).await {
                 t.page = refreshed;
