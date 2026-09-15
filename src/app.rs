@@ -1062,16 +1062,19 @@ impl App {
         // Screen S2 (Explorer) Handlers
         if matches!(self.mode, ScreenMode::Connected) {
             if let Some(exp) = &mut self.explorer_state {
-                // If DDL popup is open, Esc closes it and y copies the DDL
-                // text — the schema shown here is often wanted verbatim.
+                // If DDL popup is open, Esc closes it, y copies the DDL
+                // text — the schema shown here is often wanted verbatim —
+                // and j/k (or arrows, PgUp/PgDn) scroll long definitions
+                // that used to clip silently at the popup edge.
                 if exp.ddl_popup.is_some() {
+                    use crate::ui::screens::explorer::ddl_popup_max_scroll;
                     match key.code {
                         KeyCode::Esc => exp.ddl_popup = None,
                         KeyCode::Char('y') => {
                             let res = exp
                                 .ddl_popup
                                 .as_ref()
-                                .map(|(_, ddl)| ClipboardManager::set_text(ddl));
+                                .map(|(_, ddl, _)| ClipboardManager::set_text(ddl));
                             match res {
                                 Some(Ok(_)) => self.toasts.push(
                                     ToastKind::Success,
@@ -1079,6 +1082,28 @@ impl App {
                                 ),
                                 Some(Err(e)) => self.toasts.push(ToastKind::Error, e),
                                 None => {}
+                            }
+                        }
+                        KeyCode::Char('j') | KeyCode::Down => {
+                            if let Some((_, ddl, scroll)) = &mut exp.ddl_popup {
+                                let max = ddl_popup_max_scroll(ddl);
+                                *scroll = (*scroll + 1).min(max);
+                            }
+                        }
+                        KeyCode::Char('k') | KeyCode::Up => {
+                            if let Some((_, _, scroll)) = &mut exp.ddl_popup {
+                                *scroll = scroll.saturating_sub(1);
+                            }
+                        }
+                        KeyCode::PageDown => {
+                            if let Some((_, ddl, scroll)) = &mut exp.ddl_popup {
+                                let max = ddl_popup_max_scroll(ddl);
+                                *scroll = (*scroll + 20).min(max);
+                            }
+                        }
+                        KeyCode::PageUp => {
+                            if let Some((_, _, scroll)) = &mut exp.ddl_popup {
+                                *scroll = scroll.saturating_sub(20);
                             }
                         }
                         _ => {}
@@ -4426,7 +4451,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 }
                                 SearchKind::Routine => {
                                     match drv.routine_definition(&cref).await {
-                                        Ok(ddl) => exp.ddl_popup = Some((cref, ddl)),
+                                        Ok(ddl) => exp.ddl_popup = Some((cref, ddl, 0)),
                                         Err(e) => app.toasts.push(
                                             ToastKind::Error,
                                             format!("failed to fetch routine: {e:#}"),
@@ -4435,7 +4460,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 }
                                 SearchKind::Sequence => {
                                     let stub = format!("SEQUENCE {}.{}", cref.namespace, cref.name);
-                                    exp.ddl_popup = Some((cref, stub));
+                                    exp.ddl_popup = Some((cref, stub, 0));
                                 }
                             }
                         }
@@ -5338,7 +5363,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                             .map_err(|e| format!("{e:#}")),
                                     };
                                     match def {
-                                        Ok(ddl) => exp.ddl_popup = Some((cref, ddl)),
+                                        Ok(ddl) => exp.ddl_popup = Some((cref, ddl, 0)),
                                         Err(e) => {
                                             app.toasts.push(ToastKind::Error, format!("failed to fetch DDL: {e}"));
                                         }

@@ -862,7 +862,7 @@ pub struct ExplorerState {
     pub active_tab_index: usize,
 
     // Modals
-    pub ddl_popup: Option<(CollectionRef, String)>,
+    pub ddl_popup: Option<(CollectionRef, String, u16)>,
     /// Rect of the DDL popup as last painted, used to dismiss it on a click
     /// outside the popup. Only meaningful while `ddl_popup` is `Some`.
     pub ddl_popup_area: Option<Rect>,
@@ -1127,8 +1127,8 @@ pub fn render_explorer(
     }
     render_workspace(f, main_chunks[1], state, theme);
 
-    if let Some((cref, ddl)) = state.ddl_popup.clone() {
-        state.ddl_popup_area = Some(render_ddl_popup(f, area, &cref, &ddl, theme));
+    if let Some((cref, ddl, scroll)) = state.ddl_popup.clone() {
+        state.ddl_popup_area = Some(render_ddl_popup(f, area, &cref, &ddl, scroll, theme));
     }
 
     if let Some(export_modal) = &state.export_modal {
@@ -2825,11 +2825,21 @@ fn value_as_number(v: &crate::driver::Value) -> Option<f64> {
 
 /// Renders the DDL popup and returns its `Rect` so callers can hit-test a
 /// mouse click (click outside → dismiss).
+/// Last scrollable line of the DDL popup body on a normal terminal —
+/// the fixed 24-row frame minus its two border lines. The key handler
+/// clamps against this so scrolling stops at the final line; the render
+/// clamps again against the real inner height for small terminals.
+pub fn ddl_popup_max_scroll(ddl: &str) -> u16 {
+    const INNER_LINES: u16 = 22;
+    (ddl.lines().count() as u16).saturating_sub(INNER_LINES)
+}
+
 fn render_ddl_popup(
     f: &mut Frame,
     area: Rect,
     cref: &CollectionRef,
     ddl: &str,
+    scroll: u16,
     theme: &Theme,
 ) -> Rect {
     let width = 75.min(area.width.saturating_sub(4));
@@ -2844,7 +2854,7 @@ fn render_ddl_popup(
 
     f.render_widget(Clear, popup_area);
 
-    let title = format!(" DDL Schema: {} [y copy · Esc close] ", cref);
+    let title = format!(" DDL Schema: {} [y copy · j/k scroll · Esc close] ", cref);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
@@ -2855,7 +2865,12 @@ fn render_ddl_popup(
     let inner = block.inner(popup_area);
     f.render_widget(block, popup_area);
 
-    let p = Paragraph::new(ddl).style(theme.base());
+    // Long DDL (wide tables, many indexes) overflows the fixed popup.
+    // Clamp the offset so scrolling past the end can never blank it.
+    let max_scroll = (ddl.lines().count() as u16).saturating_sub(inner.height);
+    let p = Paragraph::new(ddl)
+        .style(theme.base())
+        .scroll((scroll.min(max_scroll), 0));
     f.render_widget(p, inner);
 
     popup_area
@@ -3902,5 +3917,26 @@ mod tests {
             m.sql_preview().as_deref(),
             Some("CREATE DATABASE `analytics`;")
         );
+    }
+}
+
+
+#[cfg(test)]
+mod ddl_popup_scroll_tests {
+    use super::ddl_popup_max_scroll;
+
+    #[test]
+    fn short_ddl_never_scrolls() {
+        assert_eq!(ddl_popup_max_scroll("CREATE TABLE t (id int)"), 0);
+    }
+
+    #[test]
+    fn long_ddl_scrolls_to_the_overflow() {
+        let ddl: String = (0..30)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        // 30 lines minus the 22-line viewport leaves 8 scrollable lines.
+        assert_eq!(ddl_popup_max_scroll(&ddl), 8);
     }
 }

@@ -546,7 +546,7 @@ pub async fn open_tree_node(
                 let drv_clone = drv.clone();
                 match drv_clone.routine_definition(&cref_clone).await {
                     Ok(ddl) => {
-                        exp.ddl_popup = Some((cref_clone, ddl));
+                        exp.ddl_popup = Some((cref_clone, ddl, 0));
                     }
                     Err(e) => {
                         toasts.push(ToastKind::Error, format!("failed to fetch routine: {e:#}"));
@@ -559,6 +559,7 @@ pub async fn open_tree_node(
                 exp.ddl_popup = Some((
                     cref.clone(),
                     format!("SEQUENCE {}.{}", cref.namespace, cref.name),
+                    0,
                 ));
             }
             // A section divider is a label; there
@@ -657,7 +658,7 @@ pub async fn run_erd_menu_action(
     match selected {
         // View DDL
         0 => match drv.definition(&cref).await {
-            Ok(ddl) => exp.ddl_popup = Some((cref, ddl)),
+            Ok(ddl) => exp.ddl_popup = Some((cref, ddl, 0)),
             Err(e) => toasts.push(ToastKind::Error, format!("failed to fetch DDL: {e:#}")),
         },
         // Open table (list rows)

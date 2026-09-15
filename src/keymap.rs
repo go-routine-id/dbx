@@ -82,7 +82,7 @@ pub const PICKER_HELP_BINDINGS: [(&str, &str); 7] = [
     ("Esc", "close popup / back"),
 ];
 
-pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 62] = [
+pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 63] = [
     ("Tab", "toggle focus between Explorer tree & Workspace / subpane"),
     ("c", "open new SQL Query Console tab"),
     ("g", "open In-Terminal ERD diagram for selected database"),
@@ -143,6 +143,7 @@ pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 62] = [
     ("i", "open INSERT-row modal — fill fields, server applies DEFAULT for skipped"),
     ("F1", "view table DDL schema popup"),
     ("y (in DDL popup)", "copy the shown DDL to the clipboard"),
+    ("j/k · ↑/↓ (in DDL popup)", "scroll the DDL (PgUp/PgDn jump a screenful)"),
     ("n / p", "next / previous page in data grid"),
     ("w", "close active workspace tab"),
 ];
@@ -150,6 +151,13 @@ pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 62] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_bindings_mention_ddl_popup_scroll() {
+        assert!(EXPLORER_HELP_BINDINGS
+            .iter()
+            .any(|(k, _)| k.contains("DDL popup") && k.contains('j')));
+    }
 
     #[test]
     fn status_hints_follow_context() {
