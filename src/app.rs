@@ -464,6 +464,10 @@ impl App {
                             e.active_tab(),
                             Some(WorkspaceTab::Console(c)) if !c.autocomplete.is_empty()
                         )
+                        || matches!(
+                            e.active_tab(),
+                            Some(WorkspaceTab::Table(t)) if t.filter_modal.is_some()
+                        )
                 })
                 .unwrap_or(false);
             if modal_open {
@@ -513,23 +517,11 @@ impl App {
                                 && mouse.row >= area.y
                                 && mouse.row < area.y + area.height
                             {
-                                // Bound against the *displayed* (filtered) rows.
-                                let visible = t
-                                    .filter
-                                    .as_ref()
-                                    .map(|f| {
-                                        t.page
-                                            .records
-                                            .iter()
-                                            .filter(|r| {
-                                                crate::ui::screens::explorer::record_matches_filter(
-                                                    r, f,
-                                                )
-                                            })
-                                            .count()
-                                    })
-                                    .unwrap_or(t.page.records.len());
-                                step_selection(&mut t.selected_row, visible, up);
+                                // Filtering is server-side now, so every
+                                // loaded row is already "displayed" — no
+                                // local count to bound against beyond the
+                                // page itself.
+                                step_selection(&mut t.selected_row, t.page.records.len(), up);
                                 focus_workspace = true;
                             }
                         }
@@ -792,6 +784,7 @@ impl App {
             || exp.create_object_modal.is_some()
             || exp.create_db_modal.is_some()
             || exp.create_table_modal.is_some()
+            || matches!(exp.active_tab(), Some(WorkspaceTab::Table(t)) if t.filter_modal.is_some())
         {
             return Ok(());
         }
@@ -902,19 +895,9 @@ impl App {
                     // Table header (1) + bottom_margin (1) = 2 rows before data.
                     if rel_row >= 2 {
                         let data_row = (rel_row - 2) as usize;
-                        // Bound against the *displayed* (filtered) rows.
-                        let visible = t
-                            .filter
-                            .as_ref()
-                            .map(|f| {
-                                t.page
-                                    .records
-                                    .iter()
-                                    .filter(|r| crate::ui::screens::explorer::record_matches_filter(r, f))
-                                    .count()
-                            })
-                            .unwrap_or(t.page.records.len());
-                        if data_row < visible {
+                        // Filtering is server-side now, so every loaded row
+                        // is already "displayed".
+                        if data_row < t.page.records.len() {
                             t.selected_row = data_row;
                         }
                     }
@@ -1150,6 +1133,81 @@ impl App {
                         _ => {}
                     }
                     return;
+                }
+
+                // If the filter modal is open, route keys — everything except
+                // Enter and Ctrl+X, which need `drv.records().await` to
+                // re-fetch the filtered page and so are handled in the async
+                // event loop instead (see "3b. Filter modal apply" there).
+                if let Some(WorkspaceTab::Table(t)) = exp.active_tab_mut() {
+                    if let Some(modal) = &mut t.filter_modal {
+                        use crate::ui::screens::explorer::FilterModalField;
+                        let value_shown = modal
+                            .operators
+                            .get(modal.op_idx)
+                            .map(|op| op.needs_value())
+                            .unwrap_or(true);
+                        match key.code {
+                            KeyCode::Esc => {
+                                t.filter_modal = None;
+                            }
+                            KeyCode::Tab => {
+                                modal.field = match modal.field {
+                                    FilterModalField::Column => FilterModalField::Operator,
+                                    FilterModalField::Operator if value_shown => FilterModalField::Value,
+                                    FilterModalField::Operator => FilterModalField::Column,
+                                    FilterModalField::Value => FilterModalField::Column,
+                                };
+                            }
+                            KeyCode::Up | KeyCode::Char('k')
+                                if modal.field == FilterModalField::Column =>
+                            {
+                                modal.column_idx = if modal.column_idx == 0 {
+                                    modal.columns.len().saturating_sub(1)
+                                } else {
+                                    modal.column_idx - 1
+                                };
+                            }
+                            KeyCode::Down | KeyCode::Char('j')
+                                if modal.field == FilterModalField::Column =>
+                            {
+                                modal.column_idx = if modal.column_idx + 1 >= modal.columns.len() {
+                                    0
+                                } else {
+                                    modal.column_idx + 1
+                                };
+                            }
+                            KeyCode::Up | KeyCode::Char('k')
+                                if modal.field == FilterModalField::Operator =>
+                            {
+                                modal.op_idx = if modal.op_idx == 0 {
+                                    modal.operators.len().saturating_sub(1)
+                                } else {
+                                    modal.op_idx - 1
+                                };
+                            }
+                            KeyCode::Down | KeyCode::Char('j')
+                                if modal.field == FilterModalField::Operator =>
+                            {
+                                modal.op_idx = if modal.op_idx + 1 >= modal.operators.len() {
+                                    0
+                                } else {
+                                    modal.op_idx + 1
+                                };
+                            }
+                            KeyCode::Backspace if modal.field == FilterModalField::Value => {
+                                modal.value.pop();
+                            }
+                            KeyCode::Char(c)
+                                if modal.field == FilterModalField::Value
+                                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+                            {
+                                modal.value.push(c);
+                            }
+                            _ => {}
+                        }
+                        return;
+                    }
                 }
 
                 // If Cell edit modal is open, route keys.
@@ -1832,7 +1890,7 @@ impl App {
                 // every input mode is cancelled.
                 let typing_into_a_field = key.code != KeyCode::Esc
                     && exp.active_tab().is_some_and(|t| match t {
-                        WorkspaceTab::Table(t) => t.search_editing || t.filter_editing,
+                        WorkspaceTab::Table(t) => t.search_editing,
                         WorkspaceTab::Console(c) => c.search_editing,
                         WorkspaceTab::Erd(_) => false,
                     });
@@ -1846,10 +1904,6 @@ impl App {
                         let focused_pane = exp.focused_pane;
                         if let Some(tab) = exp.active_tab_mut() {
                             match tab {
-                                WorkspaceTab::Table(t) if t.filter_editing => {
-                                    t.filter_editing = false;
-                                    return;
-                                }
                                 WorkspaceTab::Console(c) if c.popup.is_some() => {
                                     c.popup = None;
                                     return;
@@ -2194,30 +2248,6 @@ impl App {
                                             }
                                             _ => {}
                                         }
-                                    } else if t.filter_editing {
-                                        // Filter input mode: every key feeds the
-                                        // filter buffer until Enter/Esc.
-                                        match key.code {
-                                            KeyCode::Esc => t.filter_editing = false,
-                                            KeyCode::Enter => {
-                                                t.filter =
-                                                    crate::ui::screens::explorer::parse_filter(
-                                                        &t.filter_buffer,
-                                                        &t.page.columns,
-                                                    );
-                                                t.filter_editing = false;
-                                            }
-                                            KeyCode::Backspace => {
-                                                t.filter_buffer.pop();
-                                            }
-                                            KeyCode::Char(c)
-                                                if !key.modifiers
-                                                    .contains(KeyModifiers::CONTROL) =>
-                                            {
-                                                t.filter_buffer.push(c);
-                                            }
-                                            _ => {}
-                                        }
                                     } else {
                                         match key.code {
                                         // [ / ] switch workspace tabs (free in a table grid).
@@ -2265,19 +2295,41 @@ impl App {
                                         t.row_detail = true;
                                         t.row_detail_scroll = 0;
                                     }
-                                    // Ctrl+F: free-text search across all cells
-                                    // (complements `/`, which filters by column).
+                                    // Ctrl+F: open the server-side filter modal
+                                    // (same as `/`) — pre-filled from the
+                                    // active filter, if any, so re-opening to
+                                    // tweak it doesn't start from blank.
                                     KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                                        t.search_editing = true;
-                                        t.search_buffer = t.search_query.clone();
+                                        let ops = self
+                                            .active_driver
+                                            .as_ref()
+                                            .map(|d| d.filter_operators())
+                                            .unwrap_or(&[]);
+                                        match crate::ui::screens::explorer::build_filter_modal(ops, t) {
+                                            Some(modal) => t.filter_modal = Some(modal),
+                                            None => self.toasts.push(
+                                                ToastKind::Info,
+                                                "this connection does not support server-side filtering".to_string(),
+                                            ),
+                                        }
                                     }
-                                    // Ctrl+G: jump to the next match, wrapping.
+                                    // Ctrl+G now does both halves of the old
+                                    // Ctrl+F/Ctrl+G pair: no active search opens
+                                    // the search input (what Ctrl+F used to
+                                    // do), an active one jumps to the next
+                                    // match (Ctrl+G's old behavior) — freeing
+                                    // Ctrl+F for the filter modal above.
                                     KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                                        if t.search_query.is_empty() {
+                                            t.search_editing = true;
+                                            t.search_buffer = t.search_query.clone();
+                                            return;
+                                        }
                                         let hits = crate::ui::screens::explorer::search_matches(t);
                                         if hits.is_empty() {
                                             self.toasts.push(
                                                 ToastKind::Info,
-                                                "no matches — press Ctrl+F to search".to_string(),
+                                                "no matches — press Ctrl+G to search".to_string(),
                                             );
                                         } else {
                                             let cur = (t.selected_row, t.selected_col);
@@ -2381,21 +2433,9 @@ impl App {
                                     // PageUp/PageDown scroll one viewport (rows visible
                                     // in the grid) at a time.
                                     KeyCode::PageDown => {
-                                        let visible = t
-                                            .filter
-                                            .as_ref()
-                                            .map(|f| {
-                                                t.page
-                                                    .records
-                                                    .iter()
-                                                    .filter(|r| {
-                                                        crate::ui::screens::explorer::record_matches_filter(
-                                                            r, f,
-                                                        )
-                                                    })
-                                                    .count()
-                                            })
-                                            .unwrap_or(t.page.records.len());
+                                        // Filtering is server-side now, so
+                                        // every loaded row is "displayed".
+                                        let visible = t.page.records.len();
                                         if visible > 0 {
                                             let page_rows = t
                                                 .grid_hit_area
@@ -2521,14 +2561,21 @@ impl App {
                                         }
                                     }
                                     KeyCode::Char('/') => {
-                                        // Enter filter-editing mode; pre-fill the
-                                        // current filter so it can be tweaked.
-                                        t.filter_editing = true;
-                                        t.filter_buffer = t
-                                            .filter
+                                        // Open the filter modal (same as
+                                        // Ctrl+F) — pre-filled from the active
+                                        // filter, if any.
+                                        let ops = self
+                                            .active_driver
                                             .as_ref()
-                                            .map(|f| f.display())
-                                            .unwrap_or_default();
+                                            .map(|d| d.filter_operators())
+                                            .unwrap_or(&[]);
+                                        match crate::ui::screens::explorer::build_filter_modal(ops, t) {
+                                            Some(modal) => t.filter_modal = Some(modal),
+                                            None => self.toasts.push(
+                                                ToastKind::Info,
+                                                "this connection does not support server-side filtering".to_string(),
+                                            ),
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -3930,6 +3977,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 || e.create_db_modal.is_some()
                                 || e.create_table_modal.is_some()
                                 || e.ddl_popup.is_some()
+                                || matches!(e.active_tab(), Some(WorkspaceTab::Table(t)) if t.filter_modal.is_some())
                         })
                         .unwrap_or(false);
                     if busy {
@@ -4354,6 +4402,86 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                 Some(e) => {
                                     app.toasts.push(ToastKind::Error, format!("UPDATE failed: {e}"));
                                     exp.sql_confirm_modal = None;
+                                }
+                            }
+                            continue;
+                        }
+                    }
+
+                    // 3b. Filter modal apply (Enter) / clear the active filter
+                    // (Ctrl+X, a normal table-tab shortcut available whether
+                    // or not the modal is open). Both re-fetch page 0 against
+                    // the new (or now-absent) WHERE clause via
+                    // `drv.records().await`, so they can't live in sync
+                    // `handle_key` like the rest of the modal's key routing
+                    // does. Gated so a DIFFERENT modal keeps owning Enter /
+                    // Ctrl+X while it's open.
+                    let no_other_modal = exp.ddl_popup.is_none()
+                        && exp.export_modal.is_none()
+                        && exp.cell_edit_modal.is_none()
+                        && exp.insert_row_modal.is_none()
+                        && exp.sql_confirm_modal.is_none()
+                        && exp.import_csv_modal.is_none()
+                        && exp.schema_edit_modal.is_none()
+                        && exp.create_object_modal.is_none()
+                        && exp.create_db_modal.is_none()
+                        && exp.create_table_modal.is_none();
+                    if no_other_modal
+                        && let Some(WorkspaceTab::Table(tab)) = exp.active_tab_mut()
+                    {
+                        let is_ctrl_x = key.code == KeyCode::Char('x')
+                            && key.modifiers.contains(KeyModifiers::CONTROL);
+                        let apply_filter = if key.code == KeyCode::Enter {
+                            tab.filter_modal.as_ref().and_then(|modal| {
+                                Some(crate::driver::RowFilter {
+                                    column: modal.columns.get(modal.column_idx)?.clone(),
+                                    op: *modal.operators.get(modal.op_idx)?,
+                                    value: modal.value.clone(),
+                                })
+                            })
+                        } else {
+                            None
+                        };
+                        if let Some(new_filter) = apply_filter {
+                            let cref = tab.collection.clone();
+                            let limit = tab.page.page_size;
+                            let page = Page { offset: 0, limit, filter: Some(new_filter.clone()) };
+                            match drv.records(&cref, page).await {
+                                Ok(refreshed) => {
+                                    tab.row_filter = Some(new_filter);
+                                    tab.filter_modal = None;
+                                    tab.page = refreshed;
+                                    tab.selected_row = 0;
+                                }
+                                Err(e) => {
+                                    app.toasts.push(ToastKind::Error, format!("filter failed: {e:#}"));
+                                }
+                            }
+                            continue;
+                        }
+                        if is_ctrl_x {
+                            // Consume Ctrl+X unconditionally so it never falls
+                            // through to the modifier-blind `x`/`X` delete-row
+                            // shortcut below — "do nothing" for an already-
+                            // clear filter still means "not a delete".
+                            if tab.row_filter.is_some() {
+                                let cref = tab.collection.clone();
+                                let limit = tab.page.page_size;
+                                let page = Page { offset: 0, limit, filter: None };
+                                match drv.records(&cref, page).await {
+                                    Ok(refreshed) => {
+                                        tab.row_filter = None;
+                                        tab.filter_modal = None;
+                                        tab.page = refreshed;
+                                        tab.selected_row = 0;
+                                        app.toasts.push(ToastKind::Info, "filter cleared".to_string());
+                                    }
+                                    Err(e) => {
+                                        app.toasts.push(
+                                            ToastKind::Error,
+                                            format!("failed to clear filter: {e:#}"),
+                                        );
+                                    }
                                 }
                             }
                             continue;
@@ -5578,7 +5706,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                             // delete dialog.
                             let table_input_mode = exp.active_tab().is_some_and(|t| match t {
                                 WorkspaceTab::Table(t) => {
-                                    t.search_editing || t.filter_editing || t.row_detail
+                                    t.search_editing || t.filter_modal.is_some() || t.row_detail
                                 }
                                 // The console's result pane has the same two
                                 // modes now, and the same reason: typing a
@@ -5909,6 +6037,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                     if let Some(WorkspaceTab::Table(tab)) = exp.active_tab_mut() {
                                         let mut next_page = Page::default();
                                         next_page.offset = (tab.page.page + 1) * tab.page.page_size;
+                                        next_page.filter = tab.row_filter.clone();
                                         let drv_clone = drv.clone();
                                         let cref_clone = tab.collection.clone();
                                         if let Ok(new_rec_page) = drv_clone.records(&cref_clone, next_page).await {
@@ -5923,6 +6052,7 @@ pub async fn run(cli_config: Option<PathBuf>) -> anyhow::Result<()> {
                                     if let Some(WorkspaceTab::Table(tab)) = exp.active_tab_mut() && tab.page.page > 0 {
                                         let mut prev_page = Page::default();
                                         prev_page.offset = (tab.page.page - 1) * tab.page.page_size;
+                                        prev_page.filter = tab.row_filter.clone();
                                         let drv_clone = drv.clone();
                                         let cref_clone = tab.collection.clone();
                                         if let Ok(new_rec_page) = drv_clone.records(&cref_clone, prev_page).await {

@@ -752,6 +752,9 @@ impl Driver for RedisDriver {
         })
     }
 
+    /// `page.filter` is intentionally ignored: Redis has no server-side row
+    /// filter, and `filter_operators()` returns empty so the UI never offers
+    /// one for this driver.
     async fn records(&self, c: &CollectionRef, page: Page) -> Result<RecordPage> {
         let db = parse_db(&c.namespace)?;
         let pattern = if c.name == ROOT_COLLECTION {

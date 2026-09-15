@@ -22,7 +22,7 @@ use async_trait::async_trait;
 
 use super::{
     Capabilities, Collection, CollectionMeta, CollectionRef, ColumnMeta, Driver, DriverInfo,
-    Namespace, Page, QueryResult, Record, RecordPage, Value,
+    FilterOp, Namespace, Page, QueryResult, Record, RecordPage, RowFilter, Value,
 };
 use crate::config::{ConnectionConfig, SslMode};
 
@@ -216,6 +216,37 @@ fn escape_ident(ident: &str) -> String {
 /// so a literal backslash must be doubled before quoting quotes.
 fn escape_literal(s: &str) -> String {
     format!("'{}'", s.replace('\\', "\\\\").replace('\'', "\\'"))
+}
+
+/// Build a ` WHERE ...` clause for a `RowFilter`. There is no bind-parameter
+/// API over ClickHouse's HTTP interface, so the value is turned into a safe
+/// SQL literal via `escape_literal` and spliced into the query text — the
+/// same approach already used elsewhere in this file for literal values.
+/// `IsNull`/`IsNotNull` need no literal at all. Every other `FilterOp`
+/// variant is rejected — `filter_operators()` never offers them, so this
+/// only fires if that contract is violated upstream.
+fn filter_clause(filter: &RowFilter) -> Result<String> {
+    let col = escape_ident(&filter.column);
+    let lit = || escape_literal(&filter.value);
+    let cond = match filter.op {
+        FilterOp::Eq => format!("{col} = {}", lit()),
+        FilterOp::Ne => format!("{col} != {}", lit()),
+        FilterOp::Gt => format!("{col} > {}", lit()),
+        FilterOp::Gte => format!("{col} >= {}", lit()),
+        FilterOp::Lt => format!("{col} < {}", lit()),
+        FilterOp::Lte => format!("{col} <= {}", lit()),
+        FilterOp::Like => format!("{col} LIKE {}", lit()),
+        FilterOp::NotLike => format!("{col} NOT LIKE {}", lit()),
+        FilterOp::IsNull => format!("{col} IS NULL"),
+        FilterOp::IsNotNull => format!("{col} IS NOT NULL"),
+        other => {
+            return Err(anyhow!(
+                "ClickHouse driver does not support filter operator '{}'",
+                other.label()
+            ));
+        }
+    };
+    Ok(format!(" WHERE {cond}"))
 }
 
 /// The FORMAT JSON wire shape: `meta` (name+type per column) plus `data`.
@@ -697,11 +728,15 @@ impl Driver for ClickHouseDriver {
 
     async fn records(&self, c: &CollectionRef, page: Page) -> Result<RecordPage> {
         let table = format!("{}.{}", escape_ident(&c.namespace.0), escape_ident(&c.name));
+        let where_clause = match &page.filter {
+            Some(f) => filter_clause(f)?,
+            None => String::new(),
+        };
 
         // count() on MergeTree is served from metadata — cheap enough to run
         // per page, unlike the OLTP drivers' full COUNT(*).
         let total_records = self
-            .run_json(&format!("SELECT count() AS n FROM {table}"), None)
+            .run_json(&format!("SELECT count() AS n FROM {table}{where_clause}"), None)
             .await
             .ok()
             .and_then(|(_, r)| r.into_iter().next())
@@ -715,7 +750,7 @@ impl Driver for ClickHouseDriver {
         let (columns, records) = self
             .run_json(
                 &format!(
-                    "SELECT * FROM {table} LIMIT {} OFFSET {}",
+                    "SELECT * FROM {table}{where_clause} LIMIT {} OFFSET {}",
                     page.limit, page.offset
                 ),
                 None,
@@ -823,6 +858,24 @@ impl Driver for ClickHouseDriver {
             rows_affected: 0,
             execution_time: start.elapsed(),
         })
+    }
+
+    /// The ANSI 10, kept consistent with mysql/sqlite/mssql — ClickHouse's
+    /// own ILIKE is left out of scope, and Regex/Exists/NotExists have no
+    /// clean mapping over this HTTP interface.
+    fn filter_operators(&self) -> &'static [FilterOp] {
+        &[
+            FilterOp::Eq,
+            FilterOp::Ne,
+            FilterOp::Gt,
+            FilterOp::Gte,
+            FilterOp::Lt,
+            FilterOp::Lte,
+            FilterOp::Like,
+            FilterOp::NotLike,
+            FilterOp::IsNull,
+            FilterOp::IsNotNull,
+        ]
     }
 
     async fn kill_process(&self, id: &str) -> Result<()> {

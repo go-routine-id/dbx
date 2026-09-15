@@ -9,7 +9,7 @@ use sqlx::{Column, Row, TypeInfo, ValueRef, AssertSqlSafe};
 
 use super::{
     Capabilities, Collection, CollectionMeta, CollectionRef, ColumnMeta, Driver, DriverInfo,
-    ForeignKeyMeta, IndexMeta, Namespace, Page, QueryResult, Record, RecordPage, Value,
+    FilterOp, ForeignKeyMeta, IndexMeta, Namespace, Page, QueryResult, Record, RecordPage, Value,
 };
 use crate::config::ConnectionConfig;
 
@@ -456,24 +456,63 @@ impl Driver for PostgresDriver {
         })
     }
 
+    fn filter_operators(&self) -> &'static [FilterOp] {
+        &[
+            FilterOp::Eq,
+            FilterOp::Ne,
+            FilterOp::Gt,
+            FilterOp::Gte,
+            FilterOp::Lt,
+            FilterOp::Lte,
+            FilterOp::Like,
+            FilterOp::NotLike,
+            FilterOp::ILike,
+            FilterOp::IsNull,
+            FilterOp::IsNotNull,
+        ]
+    }
+
     async fn records(&self, c: &CollectionRef, page: Page) -> Result<RecordPage> {
         let ns_esc = escape_ident(&c.namespace.0);
         let name_esc = escape_ident(&c.name);
 
-        let count_sql = format!("SELECT COUNT(*) FROM {}.{}", ns_esc, name_esc);
-        let total_records: Option<u64> = sqlx::query_as::<_, (i64,)>(AssertSqlSafe(count_sql.as_str()))
+        // `$1` is used independently in the COUNT and SELECT statements below
+        // — each is its own prepared statement, so both start their own
+        // positional-parameter numbering at $1.
+        let (where_clause, bind_value): (String, Option<String>) = match &page.filter {
+            Some(f) => {
+                let col_esc = escape_ident(&f.column);
+                if f.op.needs_value() {
+                    (format!(" WHERE {} {} $1", col_esc, f.op.label()), Some(f.value.clone()))
+                } else {
+                    (format!(" WHERE {} {}", col_esc, f.op.label()), None)
+                }
+            }
+            None => (String::new(), None),
+        };
+
+        let count_sql = format!("SELECT COUNT(*) FROM {}.{}{}", ns_esc, name_esc, where_clause);
+        let mut count_query = sqlx::query_as::<_, (i64,)>(AssertSqlSafe(count_sql.as_str()));
+        if let Some(v) = &bind_value {
+            count_query = count_query.bind(v);
+        }
+        let total_records: Option<u64> = count_query
             .fetch_one(&self.pool)
             .await
             .ok()
             .map(|(count,)| count.max(0) as u64);
 
         let query = format!(
-            "SELECT * FROM {}.{} LIMIT {} OFFSET {}",
-            ns_esc, name_esc, page.limit, page.offset
+            "SELECT * FROM {}.{}{} LIMIT {} OFFSET {}",
+            ns_esc, name_esc, where_clause, page.limit, page.offset
         );
 
         let start = Instant::now();
-        let rows = sqlx::query(AssertSqlSafe(query.as_str()))
+        let mut select_query = sqlx::query(AssertSqlSafe(query.as_str()));
+        if let Some(v) = &bind_value {
+            select_query = select_query.bind(v);
+        }
+        let rows = select_query
             .fetch_all(&self.pool)
             .await
             .with_context(|| format!("failed to fetch records for {}", c))?;

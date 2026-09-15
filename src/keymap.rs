@@ -47,6 +47,8 @@ pub fn explorer_status_hints(
             hints.push(("x", "delete"));
             hints.push(("i", "insert"));
             hints.push(("Ctrl+E", "export"));
+            hints.push(("Ctrl+F", "filter rows"));
+            hints.push(("Ctrl+G", "search cells"));
             if erd_capable {
                 hints.push(("g", "erd"));
             }
@@ -117,7 +119,7 @@ pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 63] = [
     ("Enter", "open table in workspace grid"),
     ("s", "sort data grid by active column (asc → desc → off)"),
     ("< / > (in table tab)", "shrink / grow the focused column's width (or Alt+drag a header separator)"),
-    ("/", "filter data grid rows (col op value, e.g. status = paid)"),
+    ("/ / Ctrl+F (in table tab)", "open the filter modal: column → operator → value, Enter applies, Ctrl+X clears"),
     ("y / c", "copy active cell value to system clipboard"),
     ("Y / Ctrl+Y", "copy active row (Y: JSON · Ctrl+Y: TSV)"),
     ("y / c (in row detail)", "copy the highlighted column's value"),
@@ -130,7 +132,7 @@ pub const EXPLORER_HELP_BINDINGS: [(&str, &str); 63] = [
     ("Ctrl+O (on tree table)", "context menu: view DDL / open rows / edit schema / delete table"),
     ("x", "delete selected row (shows safe SQL confirmation)"),
     ("v (in table tab)", "expand the selected row vertically (wide tables)"),
-    ("Ctrl+F / Ctrl+G", "search all cells / jump to the next match"),
+    ("Ctrl+G (in table tab)", "search all cells (opens search) / jump to the next match (search active)"),
     ("E (in ERD tab)", "export the diagram as ~/dbx_erd_<schema>.svg + .mmd"),
     ("Ctrl+W (in console)", "cycle auto re-run: off / 1s / 5s / 15s / 60s"),
     ("Ctrl+T (in console)", "toggle autocommit — off = each run opens a transaction"),
@@ -175,6 +177,20 @@ mod tests {
 
         let erd = explorer_status_hints(HintContext::Erd, true);
         assert!(erd.contains(&("E", "export svg")));
+    }
+
+    #[test]
+    fn status_hints_table_ctx_uses_ctrl_f_for_filter() {
+        let table = explorer_status_hints(HintContext::Table, true);
+        assert!(table.iter().any(|(k, v)| *k == "Ctrl+F" && v.contains("filter")));
+        assert!(!table.iter().any(|(k, v)| *k == "/" && v.contains("filter")));
+    }
+
+    #[test]
+    fn help_bindings_mention_ctrl_f_filter_modal() {
+        assert!(EXPLORER_HELP_BINDINGS
+            .iter()
+            .any(|(k, v)| k.contains("Ctrl+F") && v.to_lowercase().contains("filter")));
     }
 
     #[test]
